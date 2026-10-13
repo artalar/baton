@@ -10,7 +10,7 @@ import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseModelRef } from "./config.ts";
-import { addCost, type Call, type CostRow, DEFAULT_SWITCH, decideTurn, gateCall, initialSwitchState, isHelper, MSG, type Msg, type Result, shapeContext, type SwitchConfig, type SwitchState, capReasoning, capMaxTokens } from "./switch-core.ts";
+import { addCost, type Call, type CostRow, DEFAULT_SWITCH, decideTurn, gateCall, initialSwitchState, isHelper, MSG, type Msg, type Result, shapeContext, type SwitchConfig, type SwitchState, capReasoning, capMaxTokens, anchorCache } from "./switch-core.ts";
 
 export function loadSwitchConfig(cwd: string): SwitchConfig & { journalDir: string } {
 	let over: Partial<SwitchConfig> = {};
@@ -37,6 +37,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	let dir = "";
 	let turn = 0;
 	let started = 0;
+	let prevLeadLen = 0;
 
 	const leadId = () => parseModelRef(cfg!.lead)!.id;
 	const log = (kind: string, data: Record<string, unknown>) => {
@@ -122,6 +123,12 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		const p = e.payload as { model?: string } | undefined;
 		if (!p?.model || !String(p.model).includes(leadId())) return undefined;
 		let out = capMaxTokens(e.payload, cfg!.leadMaxTokens);
+		const len = Array.isArray((p as { messages?: unknown[] }).messages) ? (p as { messages: unknown[] }).messages.length : 0;
+		if (prevLeadLen && len - prevLeadLen > 3) {
+			out = anchorCache(out, prevLeadLen);
+			log("cache_anchor", { at: prevLeadLen, len });
+		}
+		prevLeadLen = len;
 		if (st.planningLeft <= 0 && cfg!.thinkingCap) out = capReasoning(out, cfg!.thinkingCap);
 		return out;
 	});

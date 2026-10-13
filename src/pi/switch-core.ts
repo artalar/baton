@@ -68,7 +68,7 @@ export interface Result {
 }
 
 const READ_TOOLS = new Set(["read", "grep", "find", "ls", "glob"]);
-const READ_CMD = /^(ls|cat|head|tail|wc|tree|find|grep|rg|fd|file|stat|pwd|echo|nl|less|more|sort|uniq|cut|awk|jq|du|sed\s+-n|git\s+(status|log|diff|show|ls-files|branch|rev-parse)|npm\s+(ls|view|info)|node\s+(-v|--version)|npx\s+tsc\s+--version)\b/;
+const READ_CMD = /^(ls|cat|head|tail|wc|tree|find|grep|rg|fd|file|stat|pwd|echo|nl|less|more|sort|uniq|cut|awk|jq|du|sed\s+-n|git\s+(-C\s+\S+\s+)?(status|log|diff|show|ls-files|branch|rev-parse)|npm\s+(ls|view|info)|node\s+(-v|--version)|npx\s+tsc\s+--version)\b/;
 
 /** Pure: a read-only tool call (read/grep/find/ls, or a bash pipeline of read commands without redirects). */
 export function isReadOnly(c: Pick<Call, "name" | "args">): boolean {
@@ -130,6 +130,8 @@ export interface SwitchState {
 	blocked: string[];
 	/** Read calls seen: id → normalised path (for dedup at compaction). */
 	reads: [string, string][];
+	/** Read calls of the current helper stretch (only these may be compacted: older content is in the lead's prompt cache). */
+	stretchReads: string[];
 	/** Verify calls in the current helper stretch. */
 	stretchVerifies: string[];
 	/** Frozen compaction: toolCallId → stub text. Grows only at handoffs to the lead. */
@@ -157,6 +159,7 @@ export function initialSwitchState(now: number): SwitchState {
 		planningLeft: 0,
 		blocked: [],
 		reads: [],
+		stretchReads: [],
 		stretchVerifies: [],
 		stubs: {},
 		clips: {},
@@ -206,16 +209,20 @@ function stub(why: string): string {
 export function compactAtHandoff(s: SwitchState, from: Phase, cfg: SwitchConfig): { stubbed: number; clipped: number } {
 	let stubbed = 0;
 	let clipped = 0;
-	// duplicate reads of one path: keep the latest
+	// Only the stretch being handed over is compacted: everything older was already sent to the lead and
+	// sits in its prompt cache — rewriting it would break the cached prefix (observed: a $0.50 cache miss).
+	const fresh = new Set(s.stretchReads);
+	const reads = s.reads.filter(([id]) => fresh.has(id));
+	// duplicate reads of one path within the stretch: keep the latest
 	const last = new Map<string, string>();
-	for (const [id, p] of s.reads) last.set(p, id);
-	for (const [id, p] of s.reads) {
+	for (const [id, p] of reads) last.set(p, id);
+	for (const [id, p] of reads) {
 		if (last.get(p) !== id && !s.stubs[id]) {
 			s.stubs[id] = stub(`superseded by a later read of ${p}`);
 			stubbed++;
 		}
 	}
-	for (const [id] of s.reads) {
+	for (const [id] of reads) {
 		if (!s.stubs[id] && s.clips[id] === undefined) {
 			s.clips[id] = cfg.clipChars;
 			clipped++;
@@ -276,6 +283,7 @@ function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: Sw
 	s.leadEditsInStretch = 0;
 	s.helperEditsInStretch = 0;
 	s.stretchVerifies = [];
+	s.stretchReads = [];
 	s.wantLead = undefined;
 	s.editedSinceVerify = false;
 	if (next === "debug") s.red = { sig: "", same: 0, total: 0 };
@@ -296,7 +304,10 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 	const real = inp.calls.filter((c) => !blocked.has(c.id));
 	for (const c of real) {
 		const p = readPath(c);
-		if (p) s.reads.push([c.id, p]);
+		if (p) {
+			s.reads.push([c.id, p]);
+			if (isHelper(s.phase)) s.stretchReads.push(c.id);
+		}
 	}
 	s.stretchCalls += real.length;
 	const helper = isHelper(s.phase);
@@ -525,4 +536,36 @@ export function capMaxTokens(payload: unknown, cap: number): unknown {
 	for (const k of ["max_tokens", "max_completion_tokens"]) if (typeof p[k] === "number" && (p[k] as number) > cap) p[k] = cap;
 	if (p.max_tokens === undefined && p.max_completion_tokens === undefined) p.max_tokens = cap;
 	return p;
+}
+
+/**
+ * Pure: add a 4th Anthropic cache breakpoint at the end of the prefix the lead saw in its previous request.
+ * pi marks system, last tool and the last message; after a long helper stretch the new last message is more
+ * than ~20 blocks past the previous breakpoint, so Anthropic's automatic lookback misses the cached prefix
+ * (observed in arm D: one lead turn re-wrote 82k tokens, $0.50). Marking the old end keeps the cache hit.
+ */
+export function anchorCache(payload: unknown, prevLen: number): unknown {
+	if (!payload || typeof payload !== "object" || prevLen <= 1) return payload;
+	const p = payload as { messages?: { role: string; content?: unknown }[] };
+	if (!Array.isArray(p.messages) || p.messages.length <= prevLen) return payload;
+	const messages = p.messages.map((m) => ({ ...m }));
+	for (let i = prevLen - 1; i > 0 && i >= prevLen - 4; i--) {
+		const m = messages[i]!;
+		if (m.role === "system") break;
+		if (typeof m.content === "string" && m.content.length) {
+			m.content = [{ type: "text", text: m.content, cache_control: { type: "ephemeral" } }];
+			return { ...p, messages };
+		}
+		if (Array.isArray(m.content)) {
+			const parts = m.content.map((x) => ({ ...(x as object) })) as { type?: string; cache_control?: unknown }[];
+			for (let j = parts.length - 1; j >= 0; j--) {
+				if (parts[j]!.type === "text") {
+					parts[j]!.cache_control = { type: "ephemeral" };
+					m.content = parts;
+					return { ...p, messages };
+				}
+			}
+		}
+	}
+	return payload;
 }

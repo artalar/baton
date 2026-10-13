@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capMaxTokens, capReasoning, DEFAULT_SWITCH, decideTurn, failSignature, gateCall, initialSwitchState, isReadOnly, isVerify, shapeContext, type Call, type TurnInput } from "../src/pi/switch-core.ts";
+import { anchorCache, capMaxTokens, capReasoning, DEFAULT_SWITCH, decideTurn, failSignature, gateCall, initialSwitchState, isReadOnly, isVerify, shapeContext, type Call, type TurnInput } from "../src/pi/switch-core.ts";
 
 const cfg = { ...DEFAULT_SWITCH };
 const c = (id: string, name: string, args: Record<string, unknown> = {}): Call => ({ id, name, args });
@@ -11,6 +11,7 @@ describe("classifiers", () => {
 		expect(isReadOnly(c("1", "read", { path: "a" }))).toBe(true);
 		expect(isReadOnly(c("1", "bash", { command: "ls -la && cat package.json | head -20" }))).toBe(true);
 		expect(isReadOnly(c("1", "bash", { command: "cd .agents && rg atom" }))).toBe(true);
+		expect(isReadOnly(c("1", "bash", { command: 'cat a b; echo "---"; ls node_modules 2>/dev/null | head; npm ls --prefix /x 2>/dev/null | head; git -C /x log --oneline | head -5' }))).toBe(true);
 		expect(isReadOnly(c("1", "bash", { command: "cat a > b" }))).toBe(false);
 		expect(isReadOnly(c("1", "bash", { command: "npm install" }))).toBe(false);
 		expect(isReadOnly(c("1", "edit", {}))).toBe(false);
@@ -118,6 +119,20 @@ describe("state machine", () => {
 	});
 });
 
+describe("cache safety", () => {
+	it("compaction never touches content the lead has already seen", () => {
+		const s = initialSwitchState(0);
+		s.phase = "lead";
+		decideTurn(s, turn({ calls: [c("o1", "read", { path: "a.ts" })] }), cfg); // lead read: cached
+		s.phase = "debug";
+		decideTurn(s, turn({ calls: [c("h1", "read", { path: "a.ts" }), c("h2", "read", { path: "a.ts" })] }), cfg);
+		decideTurn(s, turn({ text: "GREEN" }), cfg);
+		expect(Object.keys(s.stubs)).toEqual(["h1"]);
+		expect(s.clips.o1).toBeUndefined();
+		expect(s.clips.h2).toBe(cfg.clipChars);
+	});
+});
+
 describe("shapeContext", () => {
 	const lead = "anthropic/claude-opus-5.5";
 	const msgs = [
@@ -141,6 +156,13 @@ describe("shapeContext", () => {
 		const out = shapeContext(msgs, { stubs: { g1: "STUB" }, clips: {}, blocked: ["g2"] }, false, lead);
 		expect(out).toHaveLength(7);
 		expect((out[3]!.content as { text: string }[])[0]!.text).toBe("STUB");
+	});
+	it("anchors a cache breakpoint at the end of the lead's previous prefix", () => {
+		const msgs = [{ role: "system", content: "s" }, { role: "user", content: "task" }, { role: "assistant", content: null }, { role: "tool", content: "out" }, { role: "assistant", content: null }, { role: "tool", content: "x" }, { role: "tool", content: "y" }];
+		const out = anchorCache({ messages: msgs }, 4) as { messages: { content: unknown }[] };
+		expect(out.messages[3]!.content).toEqual([{ type: "text", text: "out", cache_control: { type: "ephemeral" } }]);
+		expect(msgs[3]!.content).toBe("out");
+		expect(anchorCache({ messages: msgs }, 7)).toEqual({ messages: msgs });
 	});
 	it("caps lead max tokens", () => {
 		expect(capMaxTokens({ max_tokens: 128000 }, 16000)).toEqual({ max_tokens: 16000 });
