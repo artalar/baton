@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.0
+
+**`baton_edit`: the lead changes files through a Baton tool (switch, default on)**
+- New lead-only tool `baton_edit({request})`. `request` is free text: what to change and why; it does not have to spell out every change. The lead's system prompt asks it to ALWAYS use `baton_edit` instead of write/edit (`LEAD_EDIT_TOOL_NOTE`). write/edit stay available as the fallback.
+- The helper performs the request in the **same session**: it sees the same history as the lead, so this is neither a separate subagent nor a strict structured tool call. The implement path applies: guardrails, Jev's weakens/tampers block, the fs guard, then the Baton auto-check, with the debug loop when red.
+- When the helper hands back, the lead sees **the `baton_edit` tool result**, not the helper's calls. It reads either `DONE` plus the interruption summary (files, definitions, compressed diff, checks) or `NOT DONE — … make this edit yourself with write/edit`. The placeholder result was never sent to the lead, so the swap does not break the lead's prompt cache. The lead also gets a one-line "baton_edit finished" message.
+- `BATON_EDIT=tool` is the default: the `baton_edit` tool plus edit intents. `BATON_EDIT=intent` keeps only the 0.11.1 `<edit-intent>` protocol; `BATON_EDIT=off` lets the lead edit itself. Config fields: `editTool`, `editIntents`. Journal and metrics: `editTool {calls, ok, failed}`.
+- Offline estimate: the same as for edit intents. If all Opus writes in J / J2 / I had gone through `baton_edit`, Opus would have spent ≈ $0.13 / $0.30 / $0.15 less (≈ 15 / 17 / 11 %). Not yet measured in a paid run.
+
 ## 0.11.1
 
 **Edit intents (switch): the lead specifies, GLM edits**

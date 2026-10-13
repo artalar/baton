@@ -15,7 +15,7 @@ import { openRouterComplete, openRouterModelId } from "../core/openrouter.ts";
 import { parseModelRef } from "./config.ts";
 import { buildState, buildSummary, CALL_QUESTIONS, callSummary, gateFromAnswers, recordCall, summaryPrompt, TURN_QUESTIONS, turnJevFromAnswers, type TurnJev } from "./jev-policy.ts";
 import { classifyEffects, diffSnaps, revertTo, type Snap, snapshot } from "./fsguard.ts";
-import { addCost, anchorCache, applyJevGate, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
+import { addCost, anchorCache, applyJevGate, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_EDIT_TOOL_NOTE, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
 
 /** Test files under cwd (skips node_modules, dot dirs, dist). */
 export function hasTestFiles(dir: string, depth = 5): boolean {
@@ -82,6 +82,11 @@ export function loadSwitchConfig(cwd: string): SwitchConfig & { journalDir: stri
 	const jev = { ...DEFAULT_SWITCH.jev, ...jevOver, thr: { ...DEFAULT_SWITCH.jev.thr, ...(jevOver.thr ?? {}) } };
 	if (process.env.BATON_JEV === "0" || process.env.BATON_JEV === "off") jev.enabled = false;
 	if (process.env.BATON_JEV_MODEL) jev.model = process.env.BATON_JEV_MODEL;
+	// 0.12: BATON_EDIT=tool (default: baton_edit tool + intents) | intent (only <edit-intent>) | off (lead edits itself)
+	const be = process.env.BATON_EDIT;
+	if (be === "intent") Object.assign(over, { editTool: false, editIntents: true });
+	else if (be === "off" || be === "0") Object.assign(over, { editTool: false, editIntents: false });
+	else if (be === "tool") Object.assign(over, { editTool: true });
 	return { ...DEFAULT_SWITCH, ...over, jev, journalDir };
 }
 
@@ -206,11 +211,11 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			st.phase = "lead";
 			await setModelFor(ctx, "lead");
 			log("switch", { from: "-", to: "lead", reason: "resume: BATON_SWITCH_START=lead" });
-			return { systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE };
+			return { systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE + (cfg!.editTool ? LEAD_EDIT_TOOL_NOTE : "") };
 		}
 		await setModelFor(ctx, "read");
 		log("switch", { from: "-", to: "read", reason: "session start: helper reads first" });
-		return { message: { customType: "baton-switch-helper", content: MSG.read, display: true }, systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE };
+		return { message: { customType: "baton-switch-helper", content: MSG.read, display: true }, systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE + (cfg!.editTool ? LEAD_EDIT_TOOL_NOTE : "") };
 	});
 
 	pi.on("tool_call", async (e, ctx) => {
@@ -493,6 +498,17 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			if (params.kind === "reads") return delegateReads(params.instruction ?? "");
 			if (params.kind === "implement") return { content: [{ type: "text" as const, text: "The helper implements the spec now; checks run automatically and you get the diff for review." }], details: {} };
 			return { content: [{ type: "text" as const, text: "The helper takes over the verify/fix loop now." }], details: {} };
+		},
+	});
+	pi.registerTool({
+		name: "baton_edit",
+		label: "Baton edit",
+		description:
+			"Change files through the cheaper helper model (same session, same context). request = free text: what to change and why. Baton runs typecheck+tests and the fix loop; the result lists changed files/definitions, a compressed diff and the check status, or says the helper failed (then edit yourself).",
+		parameters: Type.Object({ request: Type.String({ description: "What to change and why, in your own words (files, behaviour, important names, tests)." }) }),
+		async execute() {
+			// placeholder: replaced in the lead's view by the outcome when the helper hands back (st.stubs)
+			return { content: [{ type: "text" as const, text: "baton_edit: the helper is making the edit…" }], details: {} };
 		},
 	});
 	pi.registerTool({

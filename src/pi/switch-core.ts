@@ -25,6 +25,8 @@ export interface SwitchConfig {
 	maxImplementMs: number;
 	/** 0.11.1: hand the lead's <edit-intent> blocks to the helper. */
 	editIntents: boolean;
+	/** 0.12: the lead edits through the baton_edit tool (BATON_EDIT=tool, default in switch). */
+	editTool: boolean;
 	/** 0.11.1: after this many failed intents the lead edits itself. */
 	maxIntentFailures: number;
 	/** Replay the lead payload (max_tokens 1) when the lead was idle this long during a helper stretch (ms, 0 = off). */
@@ -78,6 +80,7 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	maxHelperMs: 270_000,
 	maxImplementMs: 0,
 	editIntents: true,
+	editTool: true,
 	maxIntentFailures: 2,
 	cacheKeepaliveMs: 230_000,
 	cacheKeepaliveCostUsd: 0.06,
@@ -299,6 +302,10 @@ export interface SwitchState {
 	implements: number;
 	/** 0.11.1 edit intents: handed to the helper / failed (the lead then edits itself). */
 	intents?: { handed: number; failed: number; fromIntent: boolean; selfNext: boolean };
+	/** 0.12: the open baton_edit call (its tool result is replaced by the outcome when the helper hands back). */
+	pendingEdit?: { id: string; request: string };
+	/** 0.12: baton_edit stats. */
+	editTool?: { calls: number; ok: number; failed: number };
 	/** 0.9: Jev rolling summary inputs (ring buffer of recent calls, counters, helper-written note). */
 	track: JevTrack;
 	jev: JevStats;
@@ -372,7 +379,7 @@ export function initialSwitchState(now: number): SwitchState {
 	};
 }
 
-export const BATON_TOOLS = ["delegate_reads", "baton_delegate", "baton_optimize"] as const;
+export const BATON_TOOLS = ["delegate_reads", "baton_delegate", "baton_optimize", "baton_edit"] as const;
 
 /** Short, neutral description of the harness tools for the lead's system prompt (no instruction to use them). */
 export const LEAD_SYSTEM_NOTE = `
@@ -386,6 +393,10 @@ change: <what exactly: exports, signatures, behaviour, tests>
 why: <one line>
 </edit-intent>
 Baton hands the intent to the helper, runs the checks and gives you an "[Baton harness] interruption summary" (files, definitions, compressed diff, check status). Edit files yourself only when Baton says the helper failed on that intent, or for a one-line fix.`;
+
+/** 0.12: appended to the lead's system prompt when the baton_edit tool is on (BATON_EDIT=tool, default). */
+export const LEAD_EDIT_TOOL_NOTE = `
+To change files, ALWAYS call baton_edit({request}) instead of write/edit. request = free text: what to change and why (files, behaviour, names/signatures that matter, tests to add); no need to spell out every line. The helper model makes the edit in this same session (it sees everything you see), Baton runs typecheck+tests and the fix loop, and the tool result tells you what changed (files, definitions, compressed diff, check status) or that the helper failed — then do it yourself with write/edit. Batch related changes into one baton_edit.`;
 
 export const MSG = {
 	read: "[baton switch → helper: reading] You are the reader for the lead model, which will plan and write the code for the user's task above. Read, in full, everything it needs: the repository layout and package.json, EVERY SKILL.md and REFERENCE.md of the project skills (.agents/skills, .pi/skills, .claude/skills — read whole files, use offset/limit for long ones until the end), and any docs/examples of the APIs the task uses. Prefer the skills over node_modules sources: they match the installed versions. Your tool outputs are handed to the lead verbatim, so read the actual text — do not summarise. Use read/ls/grep/find/cat; any change to project files is detected and reverted. Do NOT write code, edit files or explain. Make at least 6 tool calls; when everything relevant is read, reply only: READ DONE.",
@@ -808,12 +819,30 @@ function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: Sw
 			reason = `${reason} — the helper did NOT finish your edit intent: make that edit yourself now (no new intent needed)`;
 		}
 	}
+	const pe = s.pendingEdit;
+	if (pe && next === "lead" && isHelper(from)) {
+		s.pendingEdit = undefined;
+		s.editTool ??= { calls: 0, ok: 0, failed: 0 };
+		const ok = !!s.lastVerifyGreen && !/did NOT finish/.test(reason);
+		if (ok) s.editTool.ok++;
+		else s.editTool.failed++;
+		s.stubs[pe.id] = editToolResult(ok, reason, report);
+		return { to: next, reason, message: { audience: "lead", text: `[baton switch → lead] baton_edit finished (${ok ? "done, checks green" : "NOT done"}) — its tool result has the details.` }, compacted, report: reportInfo, continue: inp.calls.length === 0 };
+	}
 	if (next === "lead") message = { audience: "lead", text: MSG.lead(reason, report) };
 	if (next === "debug") message = { audience: "helper", text: MSG.debug };
 	if (next === "implement") message = { audience: "helper", text: MSG.implement(inp.text) };
 	if (next === "review") message = { audience: "helper", text: MSG.review };
 	if (next === "final") message = { audience: "lead", text: MSG.final(report || `[Baton harness] Review notes: ${inp.text.slice(0, 1500)}`) };
 	return { to: next, reason, message, compacted, report: reportInfo, continue: inp.calls.length === 0 && next !== "done" };
+}
+
+/** Pure (0.12): the baton_edit tool result the lead sees. */
+export function editToolResult(ok: boolean, reason: string, report: string): string {
+	const head = ok
+		? "baton_edit: DONE — the helper made the edit and Baton's checks are green."
+		: `baton_edit: NOT DONE — ${reason}. Make this edit yourself with write/edit (or call baton_edit again with a clearer request).`;
+	return `${head}\n\n${report || "(no report)"}`;
 }
 
 /** Pure (0.11.1): the lead's `<edit-intent>…</edit-intent>` block, trimmed; undefined when absent or empty. */
@@ -997,6 +1026,21 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 			if (inp.lengthStop && !real.length) {
 				s.metrics.lengthStops++;
 				return { to: s.phase, reason: "lead hit the output cap", message: { audience: "lead", text: MSG.lengthStop }, continue: true };
+			}
+			// 0.12: baton_edit tool call → the helper performs the request in this same session
+			const be = cfg.editTool ? real.find((c) => c.name === "baton_edit") : undefined;
+			if (be) {
+				s.editTool ??= { calls: 0, ok: 0, failed: 0 };
+				s.editTool.calls++;
+				s.implements++;
+				const request = String(be.args.request ?? "").trim() || text;
+				s.pendingEdit = { id: be.id, request };
+				s.intents ??= { handed: 0, failed: 0, fromIntent: false, selfNext: false };
+				s.intents.fromIntent = true;
+				const d = to(s, inp, "implement", `baton_edit #${s.editTool.calls} → helper edits`, cfg);
+				d.message = { audience: "helper", text: MSG.implement(`${request}\n\n(The lead asked for this edit via baton_edit; change only what the request needs.)`) };
+				d.continue = true;
+				return d;
 			}
 			// 0.11.1: an edit intent without edits in the same turn → the helper performs it as a spec
 			s.intents ??= { handed: 0, failed: 0, fromIntent: false, selfNext: false };
