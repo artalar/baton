@@ -43,7 +43,7 @@ function replay(calls: Call[], c = cfg) {
 
 describe("loop config", () => {
 	it("has calibrated defaults and merges overrides", () => {
-		expect(cfg).toMatchObject({ enabled: true, windowCalls: 30, maxHops: 6, hopGapCalls: 30, readRepeatThreshold: 8, cutContext: true, blockDeferredEdits: true });
+		expect(cfg).toMatchObject({ enabled: true, windowCalls: 30, maxHops: 6, hopGapCalls: 30, readRepeatThreshold: 8, cutContext: true, forceHandoff: true, blockDeferredEdits: true });
 		const m = deepMerge(DEFAULT_CONFIG, { loop: { maxHops: 4 } });
 		expect(m.loop.maxHops).toBe(4);
 		expect(m.loop.windowCalls).toBe(30);

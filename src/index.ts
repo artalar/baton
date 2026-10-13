@@ -11,17 +11,17 @@ import { Journal, type JournalEvent, eventLine, normPath } from "./journal.ts";
 import { filterEvents, type JudgeProvider } from "./judge.ts";
 import { jevJudge } from "./judge-jev.ts";
 import { cutLoops, type DeferredItem, deferFire, deferredEditGate, initialLoopState, type LoopState, loopKeys, loopNote, observeLoop, renderDeferred, resolveDeferred } from "./loop.ts";
-import { maskMessages, type MsgLike, pinPlan } from "./mask.ts";
+import { applyHandoff, type HandoffSnapshot, handoffSnapshot, maskMessages, type MsgLike, pinPlan } from "./mask.ts";
 import { type AdvisorKind, buildPack, type PackInput, type VerbatimCall } from "./pack.ts";
-import { autoCompactSummary, pickFirstKept, resetSummary } from "./reset.ts";
+import { autoCompactSummary, pickFirstKept, pickFirstKeptForCalls, resetSummary } from "./reset.ts";
 import { changedFiles, type Exec, git, packDiff, packExcludes, readAgentsMd, repoMap } from "./repo.ts";
 import { discoverSkills, selectSkills } from "./skills.ts";
 import { type AdvisorReply, renderPlan } from "./schema.ts";
 import { callFacts, commitGate, evaluate, initialTriggerState, onAdvisor, onToolResult, planGate, type TriggerState } from "./triggers.ts";
 import { clip } from "./util.ts";
 
-export const SYSTEM_SNIPPET = `Baton is active. Tool outputs you have already seen are replaced by stubs like "[baton: output masked. evt#12 …]"; call baton_recall({"evt":12}) when you need the full text again.
-Use the advisor tools (a stronger model, one call each, costly — do not spam):
+export const SYSTEM_SNIPPET = `Baton is active. Your context is not rewritten while you work. Only at a handoff (an advisor call: baton_review/help/plan, or an automatic one on a loop or a full context) is it reset to task + plan + advisor reply + your last calls; older tool outputs become stubs like "[baton: output masked. evt#12 …]"; call baton_recall({"evt":12}) when you need the full text again.
+Use the advisor tools (a stronger model, one call each, costly — do not spam). Each call is a handoff that resets your context:
 - baton_plan: after a short exploration (read the project skills and the repo first), before writing code; again when the context is getting long. The plan is pinned into every request; follow it.
 - baton_step: mark a plan step done/blocked with evidence (command + result). Cheap, no advisor call.
 - baton_help: when stuck — the same error twice, or you do not understand a failure. Give your hypothesis, what you tried, and important evt numbers. Resets your context to task + plan.
@@ -49,6 +49,10 @@ interface Runtime {
 	maskStats: { masked: number; deduped: number; stale: number; charsSaved: number };
 	loop: LoopState;
 	deferred: DeferredItem[];
+	/** Frozen view applied to every request since the last handoff (handoff mode). */
+	handoff?: HandoffSnapshot;
+	/** An automatic handoff to run at the end of the current turn. */
+	pendingHandoff?: { kind: AdvisorKind; reason: string; question: string };
 }
 
 /** Pure: the text pinned into every request (plan with progress, then deferred items). */
@@ -80,6 +84,8 @@ export default function baton(pi: ExtensionAPI) {
 		};
 		const snap = [...rt.journal.events].reverse().find((e) => e.kind === "note" && (e.data as { deferred?: unknown } | undefined)?.deferred);
 		if (snap) rt.deferred = (snap.data as { deferred: DeferredItem[] }).deferred;
+		const ho = [...rt.journal.events].reverse().find((e) => e.kind === "note" && (e.data as { handoff?: unknown } | undefined)?.handoff);
+		if (ho) rt.handoff = (ho.data as { handoff: HandoffSnapshot }).handoff;
 		rt.userPrompts = rt.journal.events.filter((e) => e.kind === "user_prompt").map((e) => ({ evt: e.evt, text: e.text ?? "" }));
 		return rt;
 	};
@@ -153,7 +159,11 @@ export default function baton(pi: ExtensionAPI) {
 		const ratio = usage && usage.tokens !== null && usage.contextWindow ? usage.tokens / usage.contextWindow : null;
 		const { nudge, state } = evaluate(r.triggers, r.cfg.triggers, ratio);
 		r.triggers = state;
-		if (nudge) r.pendingNudge = nudge.message;
+		const handoffMode = r.cfg.mask.mode !== "continuous";
+		if (nudge?.kind === "context" && handoffMode) {
+			// context pressure: hand off to the advisor (review) instead of silent masking
+			r.pendingHandoff ??= { kind: "review", reason: "auto:context", question: `Context is at ${Math.round((ratio ?? 0) * 100)}% of the window. Review the work so far and give the plan for the rest; the executor's context is reset after your reply.` };
+		} else if (nudge) r.pendingNudge = nudge.message;
 		if (e.toolCallId && !e.toolName.startsWith("baton_")) {
 			const keys = loopKeys({ toolCallId: e.toolCallId, tool: e.toolName, input: e.input as Record<string, unknown>, output: textOf(e.content), isError: e.isError }, ctx.cwd, r.cfg.loop.ignoreReadPaths);
 			const lr = observeLoop(r.loop, e.toolCallId, keys, r.cfg.loop);
@@ -162,39 +172,64 @@ export default function baton(pi: ExtensionAPI) {
 				const { list, item } = deferFire(r.deferred, lr.fire);
 				r.deferred = list;
 				saveDeferred(r, `loop detected: ${item.id} ${item.target}, ${lr.fire.count} calls${item.sig ? `, ${item.sig}` : ""}`, { loop: lr.fire });
-				if (!r.cfg.loop.cutContext) r.pendingNudge = loopNote(item, lr.fire.count);
-				else r.pendingNudge = undefined; // the note replaces the looping calls in the context
+				if (handoffMode && r.cfg.loop.forceHandoff) {
+					// no on-the-fly cut: force a handoff; the cut happens in that handoff's compaction
+					r.pendingHandoff = { kind: "help", reason: "auto:loop", question: loopNote(item, lr.fire.count) };
+					r.pendingNudge = undefined;
+				} else if (!r.cfg.loop.cutContext || handoffMode) r.pendingNudge = loopNote(item, lr.fire.count);
+				else r.pendingNudge = undefined; // continuous mode: the note replaces the looping calls in the context
 			}
 		}
 		return undefined;
 	});
 
-	// Mask outputs in the outgoing request only (session stays complete).
+	// Outgoing request only (session stays complete). Handoff mode: apply the frozen snapshot of the
+	// last handoff; everything since then is passed through untouched. Continuous (legacy): mask every request.
 	pi.on("context", (e, ctx) => {
 		const r = init(ctx);
-		const { messages, stats } = maskMessages(e.messages as unknown as MsgLike[], (id) => r.journal.forCall(id), { ...r.cfg.mask, cwd: ctx.cwd });
-		r.maskStats = stats;
-		const cut = r.cfg.loop.cutContext ? cutLoops(messages, r.deferred).messages : messages;
+		const lookup = (id: string) => r.journal.forCall(id);
+		const opts = { ...r.cfg.mask, cwd: ctx.cwd };
+		let cut: MsgLike[];
+		if (r.cfg.mask.mode === "continuous") {
+			const { messages, stats } = maskMessages(e.messages as unknown as MsgLike[], lookup, opts);
+			r.maskStats = stats;
+			cut = r.cfg.loop.cutContext ? cutLoops(messages, r.deferred).messages : messages;
+		} else {
+			const { messages, stats } = applyHandoff(e.messages as unknown as MsgLike[], r.handoff, lookup, opts);
+			r.maskStats = stats;
+			cut = r.handoff?.cut.length ? cutLoops(messages, r.handoff.cut).messages : messages;
+		}
 		const pin = r.cfg.pack.pinPlan ? pinnedBlock(r.pinned, r.stepStatus, r.deferred) : undefined;
 		const out = pin ? pinPlan(cut, pin) : cut;
 		return { messages: out as unknown as typeof e.messages };
 	});
 
 	// Turn boundary: apply a pending reset (compaction entry) or deliver a nudge.
-	pi.on("turn_end", (e, ctx) => {
+	pi.on("turn_end", async (e, ctx) => {
 		const r = init(ctx);
 		const entries: SessionBoundaryDraft[] = [];
+		let handoffMsg: string | undefined;
+		if (r.pendingHandoff && !r.pendingReset) {
+			const h = r.pendingHandoff;
+			r.pendingHandoff = undefined;
+			const extra: Partial<PackInput> =
+				h.kind === "help" ? { hypothesis: `(automatic) ${h.question}`, attempts: [], question: "The executor is looping on this item. Rule on it (deferred_rulings) and give the plan to continue.", reason: h.reason } : { question: h.question, reason: h.reason };
+			const out = await handoff(h.kind, extra, ctx);
+			handoffMsg = `Baton automatic handoff (${h.reason}) → baton_${h.kind}:\n${out.text}`;
+		}
 		if (r.pendingReset) {
-			const all = e.context.contextEntries.map((p) => p.sourceEntry) as unknown as { id: string; type: string; message?: { role?: string } }[];
+			const all = e.context.contextEntries.map((p) => p.sourceEntry) as unknown as { id: string; type: string; message?: { role?: string; content?: unknown } }[];
+			const keepIds = r.handoff ? keptCalls(r) : [];
 			entries.push({
 				type: "compaction",
 				summary: r.pendingReset.summary,
-				firstKeptEntryId: pickFirstKept(all, r.cfg.reset.keepTurns) ?? e.messageEntryId,
+				firstKeptEntryId: pickFirstKeptForCalls(all, keepIds, pickFirstKept(all, r.cfg.reset.keepTurns)) ?? e.messageEntryId,
 				details: { baton: true, kind: r.pendingReset.kind },
 			});
 			r.journal.record("reset", r.turn, `context reset after baton_${r.pendingReset.kind}`);
 			r.pendingReset = undefined;
 		}
+		if (handoffMsg) entries.push({ type: "custom_message", customType: "baton-handoff", content: handoffMsg, display: true });
 		if (r.pendingNudge) {
 			entries.push({ type: "custom_message", customType: "baton-nudge", content: r.pendingNudge, display: true });
 			r.pendingNudge = undefined;
@@ -203,7 +238,7 @@ export default function baton(pi: ExtensionAPI) {
 	});
 
 	// Replace pi's LLM compaction with Baton's deterministic summary (or a pending reset).
-	pi.on("session_before_compact", (e, ctx) => {
+	pi.on("session_before_compact", async (e, ctx) => {
 		const r = init(ctx);
 		const { firstKeptEntryId, tokensBefore } = e.preparation;
 		if (r.pendingReset) {
@@ -212,6 +247,15 @@ export default function baton(pi: ExtensionAPI) {
 			return { compaction: { summary, firstKeptEntryId, tokensBefore, details: { baton: true } } };
 		}
 		if (e.reason === "manual" || !r.cfg.replaceAutoCompact) return undefined;
+		if (r.cfg.mask.mode !== "continuous") {
+			// pi's auto-compaction is routed through a handoff: advisor review, then Baton's reset
+			r.pendingHandoff = undefined;
+			const out = await handoff("review", { question: `pi auto-compaction (${e.reason}): the context is full. Review the work so far and give the plan for the rest.`, reason: `auto:compact:${e.reason}` }, ctx, e.signal);
+			if (!out.ok) takeSnapshot(r, "review", `auto-compaction (${e.reason}), advisor failed`);
+			const summary = (r.pendingReset as Runtime["pendingReset"])?.summary ?? autoCompactSummary(r.userPrompts[0]?.text ?? "", r.userPrompts.map((p) => p.text), r.lastPlan, r.journal.events.filter((x) => (x.importance ?? 0) >= 2).slice(-80));
+			r.pendingReset = undefined;
+			return { compaction: { summary, firstKeptEntryId, tokensBefore, details: { baton: true, auto: e.reason, handoff: true } } };
+		}
 		const task = r.userPrompts[0]?.text ?? "";
 		const timeline = r.journal.events.filter((x) => (x.importance ?? 0) >= 2).slice(-80);
 		const summary = autoCompactSummary(task, r.userPrompts.map((p) => p.text), r.lastPlan, timeline);
@@ -363,6 +407,55 @@ export default function baton(pi: ExtensionAPI) {
 		return { r, pack, res };
 	}
 
+	/** toolCallIds of the executor's own (non-Baton) tool calls, in order. */
+	const executorCalls = (r: Runtime) => r.journal.toolEvents().flatMap((e) => (e.toolCallId && !(e.tool ?? "").startsWith("baton_") ? [e.toolCallId] : []));
+	const keepFor = (r: Runtime, kind: AdvisorKind) => (kind === "help" ? r.cfg.help.lastCalls : r.cfg.reset.keepCalls);
+	const keptCalls = (r: Runtime) => {
+		const stubbed = new Set(r.handoff?.stub ?? []);
+		return executorCalls(r).filter((id) => !stubbed.has(id));
+	};
+
+	/** Freeze the executor's view at a handoff: older outputs → stubs, deferred loops → cut. */
+	function takeSnapshot(r: Runtime, kind: AdvisorKind, why: string) {
+		r.handoff = handoffSnapshot((r.handoff?.n ?? 0) + 1, executorCalls(r), keepFor(r, kind), r.cfg.loop.cutContext ? r.deferred : []);
+		r.journal.record("note", r.turn, `handoff #${r.handoff.n} (baton_${kind}, ${why}): ${r.handoff.stub.length} outputs → stubs, ${r.handoff.cut.length} loop(s) cut`, { handoff: r.handoff });
+	}
+
+	/** One advisor call (a handoff). In handoff mode a successful call also resets the executor's context. */
+	async function handoff(kind: AdvisorKind, extra: Partial<PackInput> & { importantEvts?: number[] }, ctx: ExtensionContext, signal?: AbortSignal) {
+		const { r, pack, res } = await runAdvisor(kind, extra, ctx, signal);
+		if (!res.ok || !res.reply) {
+			r.journal.record("advisor", r.turn, `baton_${kind} failed: ${(res.errors ?? []).join("; ")}`, { raw: res.raw, usage: res.usage, attempts: res.attempts });
+			const fallback = res.raw ? `\nRaw advisor reply (unvalidated):\n${clip(res.raw, 8000)}` : "";
+			return { ok: false, text: `Baton ${kind}: advisor call failed (${(res.errors ?? ["unknown"]).join("; ")}).${fallback}`, details: { ok: false, packTokens: pack.tokens, attempts: res.attempts, usage: res.usage }, usage: res.usage };
+		}
+		const plan = renderPlan(res.reply, `baton_${kind}`, res.truncated);
+		r.lastPlan = plan;
+		r.journal.record("advisor", r.turn, `baton_${kind}: ${res.reply.verdict}`, { ...res.reply, usage: res.usage, attempts: res.attempts, packTokens: pack.tokens, reason: extra.reason });
+		r.triggers = onAdvisor(r.triggers, kind, res.reply.verdict, res.reply.plan.length);
+		if (res.reply.deferred_rulings?.length && r.deferred.length) {
+			r.deferred = resolveDeferred(r.deferred, res.reply.deferred_rulings, "reviewer");
+			saveDeferred(r, `deferred rulings from baton_${kind}: ${res.reply.deferred_rulings.map((d) => `${d.id}=${d.ruling}`).join(", ")}`);
+		}
+		if (res.reply.plan.length && res.reply.verdict !== "done") {
+			r.pinned = { reply: res.reply, label: `baton_${kind}` };
+			r.stepStatus = {};
+		}
+		const handoffMode = r.cfg.mask.mode !== "continuous";
+		let tail = "";
+		if (kind === "review") tail = r.triggers.reviewPassed ? "\nReview passed: git commit is allowed." : "\nReview did not pass: fix the steps above, then call baton_review again.";
+		if (handoffMode || kind !== "review") {
+			const diffStat = (await git(exec, ["diff", "--stat", "HEAD"])) ?? undefined;
+			r.pendingReset = { kind, summary: resetSummary({ task: r.userPrompts[0]?.text ?? "", userPrompts: r.userPrompts.map((p) => p.text), plan, diffStat, note: renderDeferred(r.deferred) || undefined }) };
+			if (handoffMode) takeSnapshot(r, kind, String(extra.reason ?? `self:${kind}`));
+			const keep = keepFor(r, kind);
+			tail += handoffMode
+				? `\nYour context will now be reset to the task + this plan${keep ? ` + your last ${keep} tool outputs` : ""}; older outputs become evt# stubs (baton_recall). Until the next advisor call nothing is rewritten. Continue with the next step.`
+				: "\nYour context will now be reset to the task + this plan + the last turns. Continue with step 1.";
+		}
+		return { ok: true, text: `${plan}${tail}`, details: { ok: true, verdict: res.reply.verdict, packTokens: pack.tokens, model: res.model, attempts: res.attempts, usage: res.usage }, usage: res.usage };
+	}
+
 	const advisorParams = {
 		review: Type.Object({
 			note: Type.Optional(Type.String({ description: "Optional: what you think is done (the reviewer does not trust it)" })),
@@ -380,7 +473,7 @@ export default function baton(pi: ExtensionAPI) {
 
 	const descriptions: Record<AdvisorKind, string> = {
 		review: "Ask the stronger advisor model to review the current work (task, user prompts, git diff, changed files, last test run). Required before git commit. Appends the advisor's plan.",
-		help: "Ask the stronger advisor model for help when stuck (same error repeated, unclear failure). Sends your last tool calls verbatim plus your hypothesis and attempts. Afterwards your context is reset to task + plan + last turns.",
+		help: "Ask the stronger advisor model for help when stuck (same error repeated, unclear failure). Sends your last tool calls verbatim plus your hypothesis and attempts. Afterwards your context is reset to task + plan + your last calls; older outputs become evt# stubs.",
 		plan: "Ask the stronger advisor model for a plan (task, project skills, AGENTS.md, repo map, your exploration findings). Call it after exploring and before writing code. The plan is pinned into every request; afterwards your context is reset to task + plan + last turns.",
 	};
 
@@ -396,41 +489,8 @@ export default function baton(pi: ExtensionAPI) {
 					kind === "help"
 						? { hypothesis: params.hypothesis, attempts: params.attempts, importantEvts: params.importantEvts, question: params.question, reason: "self:stuck" }
 						: { question: params.question ?? params.note, reason: `self:${kind}` };
-				const { r, pack, res } = await runAdvisor(kind, extra, ctx, signal);
-				if (!res.ok || !res.reply) {
-					r.journal.record("advisor", r.turn, `baton_${kind} failed: ${(res.errors ?? []).join("; ")}`, { raw: res.raw, usage: res.usage, attempts: res.attempts });
-					const fallback = res.raw ? `\nRaw advisor reply (unvalidated):\n${clip(res.raw, 8000)}` : "";
-					return {
-						content: [{ type: "text", text: `Baton ${kind}: advisor call failed (${(res.errors ?? ["unknown"]).join("; ")}).${fallback}` }],
-						details: { ok: false, packTokens: pack.tokens, attempts: res.attempts, usage: res.usage },
-						usage: res.usage as any,
-					};
-				}
-				const plan = renderPlan(res.reply, `baton_${kind}`, res.truncated);
-				r.lastPlan = plan;
-				r.journal.record("advisor", r.turn, `baton_${kind}: ${res.reply.verdict}`, { ...res.reply, usage: res.usage, attempts: res.attempts, packTokens: pack.tokens });
-				r.triggers = onAdvisor(r.triggers, kind, res.reply.verdict, res.reply.plan.length);
-				if (res.reply.deferred_rulings?.length && r.deferred.length) {
-					r.deferred = resolveDeferred(r.deferred, res.reply.deferred_rulings, "reviewer");
-					saveDeferred(r, `deferred rulings from baton_${kind}: ${res.reply.deferred_rulings.map((d) => `${d.id}=${d.ruling}`).join(", ")}`);
-				}
-				if (res.reply.plan.length && res.reply.verdict !== "done") {
-					r.pinned = { reply: res.reply, label: `baton_${kind}` };
-					r.stepStatus = {};
-				}
-				let tail = "";
-				if (kind !== "review") {
-					const diffStat = (await git(exec, ["diff", "--stat", "HEAD"])) ?? undefined;
-					r.pendingReset = { kind, summary: resetSummary({ task: r.userPrompts[0]?.text ?? "", userPrompts: r.userPrompts.map((p) => p.text), plan, diffStat }) };
-					tail = "\nYour context will now be reset to the task + this plan + the last turns. Continue with step 1.";
-				} else {
-					tail = r.triggers.reviewPassed ? "\nReview passed: git commit is allowed." : "\nReview did not pass: fix the steps above, then call baton_review again.";
-				}
-				return {
-					content: [{ type: "text", text: `${plan}${tail}` }],
-					details: { ok: true, verdict: res.reply.verdict, packTokens: pack.tokens, model: res.model, attempts: res.attempts, usage: res.usage },
-					usage: res.usage as any,
-				};
+				const out = await handoff(kind, extra, ctx, signal);
+				return { content: [{ type: "text", text: out.text }], details: out.details, usage: out.usage as any };
 			},
 		});
 	}
@@ -461,7 +521,7 @@ export default function baton(pi: ExtensionAPI) {
 				[
 					`Baton: ${r.journal.events.length} events in ${r.cfg.journalDir}`,
 					`tool calls ${t.toolCalls}, since advisor ${t.toolCalls - t.lastAdvisorAt}, review passed: ${t.reviewPassed}`,
-					`last request: masked ${s.masked}, duplicate ${s.deduped}, stale ${s.stale}, ~${Math.round(s.charsSaved / 2.4)} tok saved`,
+					`mode ${r.cfg.mask.mode}, handoffs ${r.handoff?.n ?? 0}; last request: stubbed ${s.masked}, duplicate ${s.deduped}, stale ${s.stale}, ~${Math.round(s.charsSaved / 2.4)} tok saved`,
 					`plan: ${r.pinned ? `${r.pinned.label}, ${Object.values(r.stepStatus).filter((x) => x === "done").length}/${r.pinned.reply.plan.length} steps done` : "none"}`,
 					`deferred: ${r.deferred.length ? r.deferred.map((d) => `${d.id} ${d.status} (${d.target})`).join("; ") : "none"}`,
 					`advisor ${r.cfg.advisor}, judge ${r.cfg.judge.enabled ? r.cfg.judge.model : "off"}`,

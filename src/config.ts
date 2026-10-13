@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { LoopConfig } from "./loop.ts";
 
 export interface TriggerConfig {
-	/** Nudge when context usage reaches this fraction of the window. */
+	/** At this fraction of the context window, force a handoff (auto baton_review + reset); a nudge in continuous mode. */
 	contextRatio: number;
 	/** Nudge baton_help when the same error signature is seen this many times. */
 	sameErrorCount: number;
@@ -52,6 +52,12 @@ export interface BatonConfig {
 	loop: LoopConfig;
 	mask: {
 		enabled: boolean;
+		/**
+		 * "handoff" (default): the executor's context is never rewritten between advisor calls; old tool
+		 * outputs become evt# stubs only at a handoff (baton_review/help/plan, auto loop/context handoff).
+		 * "continuous": legacy v0.3 behaviour, masks answered outputs on every request.
+		 */
+		mode: "handoff" | "continuous";
 		/** Tool names whose output is never masked. */
 		exemptTools: string[];
 		dedupReads: boolean;
@@ -60,7 +66,8 @@ export interface BatonConfig {
 		neverMaskPaths: string[];
 	};
 	help: { lastCalls: number };
-	reset: { keepTurns: number };
+	/** keepTurns: assistant turns kept after a handoff reset; keepCalls: tool outputs kept verbatim after a review/plan handoff (help keeps help.lastCalls). */
+	reset: { keepTurns: number; keepCalls: number };
 	/** Replace pi's LLM auto-compaction (threshold/overflow) with Baton's deterministic summary. */
 	replaceAutoCompact: boolean;
 	journalDir: string;
@@ -113,11 +120,13 @@ export const DEFAULT_CONFIG: BatonConfig = {
 		hopGapCalls: 30,
 		readRepeatThreshold: 8,
 		cutContext: true,
+		forceHandoff: true,
 		blockDeferredEdits: true,
 		ignoreReadPaths: ["**/node_modules/**", "**/SKILL.md", "**/REFERENCE.md", "**/README.md", "**/AGENTS.md", ".agents/**", ".pi/**", "docs/**"],
 	},
 	mask: {
 		enabled: true,
+		mode: "handoff",
 		exemptTools: ["baton_review", "baton_help", "baton_plan", "baton_step"],
 		dedupReads: true,
 		staleReads: true,
@@ -135,7 +144,7 @@ export const DEFAULT_CONFIG: BatonConfig = {
 		],
 	},
 	help: { lastCalls: 8 },
-	reset: { keepTurns: 2 },
+	reset: { keepTurns: 2, keepCalls: 2 },
 	replaceAutoCompact: true,
 	journalDir: ".pi/baton",
 };

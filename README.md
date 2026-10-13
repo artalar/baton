@@ -5,7 +5,7 @@ A [pi](https://github.com/earendil-works/pi) extension that lets a cheap executo
 ## What it does
 
 - **Journal.** Every tool call is written to `.pi/baton/events.jsonl`. Each record has `evt#`, `ts`, `tool`, an args digest (write/edit bodies are hashed, not stored), the exit code, the head and tail of the output, an error signature, files read and written, a test summary, and a `rawRef` to the full output in `.pi/baton/raw/<evt>.txt`.
-- **Masking.** In every request to the model (pi's `context` event; the session file itself stays complete), every tool output the model has already answered is replaced by a stub such as `[baton: output masked. evt#12 bash command=npm test → exit 1, 830 tok …]`. Earlier reads of a file that was read again are dropped as duplicates. Reads of a file that was edited afterwards are dropped as stale. `baton_recall({evt})` returns the full output. Reads of skills and reference docs (`SKILL.md`, `.agents/skills/**`, `.pi/skills/**`, `AGENTS.md`, `README.md`, `REFERENCE.md`, `docs/**/*.md`; configurable via `mask.neverMaskPaths`) are never masked, deduplicated or marked stale.
+- **Compaction only at handoffs** (`mask.mode: "handoff"`, default). Between advisor calls the executor's context is **never rewritten**: no masking, no duplicate/stale read removal, no loop cuts. Compaction happens only at a handoff, i.e. a `baton_review`/`baton_help`/`baton_plan` call or an automatic one (loop detector, context pressure, pi auto-compaction). After the advisor answers, Baton freezes a snapshot: the context becomes system prompt + task + pinned plan (with deferred items) + advisor reply + the last N tool calls verbatim (`help.lastCalls` = 8 for help, `reset.keepCalls` = 2 for review/plan); older tool outputs become stubs such as `[baton: output masked. evt#12 bash command=npm test → exit 1, 830 tok …]`, recallable with `baton_recall({evt})`. That view is applied unchanged to every request until the next handoff, so everything since the handoff stays verbatim and the request prefix is stable. Reads of skills and reference docs (`mask.neverMaskPaths`) are never stubbed. The session file itself stays complete. The legacy per-request masking of v0.3 (dedup, stale reads, answered outputs) is still available as `mask.mode: "continuous"`.
 - **Advisor tools.** Each one builds a pack (≈40k token budget, estimated conservatively as chars/2.4 with non-ASCII counted twice, calibrated on real Opus usage), calls the advisor once with prompt caching disabled, and validates the JSON reply against a schema (`verdict`, `facts_corrected`, `plan[]` steps with `done_when`, `do_not_retry`, `test_cmd`). An invalid reply gets one retry.
   - The advisor has **no tools**. Every pack says so explicitly ("everything you need is below; do not ask for files") and presents the executor's work in the third person, as a junior's work to check, never as the advisor's own turns. Executor statements are labelled unverified.
   - Packs are ordered for long context: role, project skills, `AGENTS.md`, pinned plan, task and prompts, artefacts, executor claims, and the instructions plus reply schema last.
@@ -15,18 +15,18 @@ A [pi](https://github.com/earendil-works/pi) extension that lets a cheap executo
   - `baton_help`: the pack holds the last N (default 8) tool calls verbatim, earlier calls with the same error signature, the executor's hypothesis and attempts, and the evt#s it marked as important.
   - `baton_plan`: the pack holds the task, the relevant skills, `AGENTS.md`, a repo map and the exploration findings from the journal. The reply adds `invariants` (architecture decisions), `rules` (skill rules to follow) and `checkpoints` (steps after which to call review).
   - **Pinned plan.** The latest plan, with progress marks, is appended to the first user message of every request (a stable position, so it never gets masked and the executor's prompt cache only breaks when the plan changes). `baton_step({id, status, evidence})` marks steps; finishing a checkpoint step asks for `baton_review`.
-  - After help or plan, the executor's context is **reset** to task + plan + the last 2 turns. Baton does this by appending a `compaction` entry at `turn_end`.
+  - After every advisor call (handoff mode; in continuous mode only help and plan), the executor's context is **reset** to task + plan + deferred items + the last turns and kept calls. Baton does this by appending a `compaction` entry at `turn_end` and applying the handoff snapshot in the `context` event.
 - **Safety triggers.** These are deterministic `Baton:` nudge messages:
-  - context ≥60%;
+  - context ≥60% → a forced handoff: automatic `baton_review` + reset (handoff mode; a nudge in continuous mode);
   - the same error signature 3×;
   - exploration done without a plan (8 read-only calls) → call `baton_plan`; the first `write`/`edit` without a plan is blocked **once** (retrying passes);
   - the first milestone after edits (tests green or a build/typecheck exits 0) → early `baton_review`;
   - 20 tool calls without `baton_step` while a plan is pinned (drift);
   - a reminder after 12 tool calls without an advisor call;
   - a cooldown between nudges.
-- **Loop detector.** This is deterministic and needs no LLM. It fires after 6 hops on the same failing test or build error, where one hop is edit/write → run (test/build) → the same failure again. It also fires on the same file re-read 8× without a write within 30 calls. The looping calls are then cut out of the request and replaced by one `⚠ Loop detected … DEFERRED` note. The item is added to the deferred list, which is pinned and journaled. Edits of its failing test file are soft-blocked. `baton_review` sees the deferred items and rules on them (`deferred_rulings`: unblock with guidance, drop, or keep). The user can unblock or drop them with `/baton unblock D1 [guidance]` or `/baton drop D1`. The executor can defer a step itself with `baton_step` status `deferred`. Calibration on the C v2 transcript (509 calls): the first fire is at call 324 with 8 hops, 21 calls after the first failure of the lock-delay test. Before that loop the hop count never exceeded 1.
+- **Loop detector.** This is deterministic and needs no LLM. It fires after 6 hops on the same failing test or build error, where one hop is edit/write → run (test/build) → the same failure again. It also fires on the same file re-read 8× without a write within 30 calls. It does not cut the context on the fly: it forces a handoff (an automatic `baton_help` at the end of the turn, with the loop as the reason, `loop.forceHandoff`), and that handoff's compaction cuts the looping calls and replaces them with one `⚠ Loop detected … DEFERRED` note. The advisor reply arrives as a `baton-handoff` message. The item is added to the deferred list, which is pinned and journaled. Edits of its failing test file are soft-blocked. `baton_review` sees the deferred items and rules on them (`deferred_rulings`: unblock with guidance, drop, or keep). The user can unblock or drop them with `/baton unblock D1 [guidance]` or `/baton drop D1`. The executor can defer a step itself with `baton_step` status `deferred`. Calibration on the C v2 transcript (509 calls): the first fire is at call 324 with 8 hops, 21 calls after the first failure of the lock-delay test. Before that loop the hop count never exceeded 1.
   - `git commit` is **blocked** until `baton_review` returns `on_track` or `done`. New edits revoke the pass.
-- **Auto-compaction.** pi's threshold and overflow compaction is replaced by a deterministic, no-LLM Baton summary (task, prompts, last plan, timeline). This is configurable.
+- **Auto-compaction.** pi's threshold and overflow compaction is routed through a handoff: Baton runs an automatic `baton_review` and compacts to task + prompts + the new plan (falling back to a deterministic summary with the last plan and timeline if the advisor fails). In continuous mode the deterministic, no-LLM summary is used. `replaceAutoCompact: false` leaves pi's own compaction.
 - **Optional judge** (off by default). A Jev-format classifier (`typesafe/jev-latest` via pi's `modelRegistry.classify`) decides include/drop only for medium-importance events in the help pack. Heuristics are the fallback.
 - **Skill** `baton` and prompt `/baton-plan` tell the executor when to call which tool. The same guidance goes into the system prompt as tool guidelines. Commands: `/baton` (status), `/baton reset`, `/baton unblock <D1|all> [guidance]` and `/baton drop <D1|all>`.
 
@@ -61,7 +61,9 @@ See [`baton.example.json`](baton.example.json) for all options with their defaul
 | `triggers.reviewBeforeCommit` | `true` |
 | `loop.maxHops` / `hopGapCalls` | `6` / `30` |
 | `loop.windowCalls` / `readRepeatThreshold` | `30` / `8` |
-| `loop.enabled` / `cutContext` / `blockDeferredEdits` | `true` / `true` / `true` |
+| `loop.enabled` / `cutContext` / `forceHandoff` / `blockDeferredEdits` | `true` / `true` / `true` / `true` |
+| `mask.mode` | `"handoff"` (or legacy `"continuous"`) |
+| `reset.keepTurns` / `reset.keepCalls` / `help.lastCalls` | `2` / `2` / `8` |
 | `judge.enabled` | `false` |
 | `replaceAutoCompact` | `true` |
 
@@ -74,7 +76,7 @@ Add `.pi/baton/` to your project's `.gitignore`: the journal stores raw tool out
 | Feature | pi API |
 |---|---|
 | Journal | `tool_result` (exit code from bash `structuredContent.exit_code`), `before_agent_start` for user prompts |
-| Masking, dedup, stale reads | `context` (request-only) |
+| Handoff snapshot (stubs, loop cuts), pinned plan; legacy continuous masking | `context` (request-only) |
 | Tools | `pi.registerTool` (TypeBox params), `promptGuidelines` |
 | Advisor call | `ctx.modelRegistry.find` + `complete(model, ctx, { cacheRetention: "none" })` |
 | Judge | `ctx.modelRegistry.findOfType("classifier", …)` + `classify()` |
@@ -87,10 +89,10 @@ Development: `npm install && npm run check` runs `tsc --noEmit` against the real
 
 ## Status / limitations
 
-0.3.0 is an early version. The type-checked code, the unit tests and the extension loading in pi's real loader are verified. End-to-end sessions with GLM-5.3-Flash and Opus 5.5 via OpenRouter were run on a Tetris-on-Reatom task.
+0.4.0 is an early version. The handoff-only compaction is covered by unit tests; it has not yet been run end-to-end with GLM and Opus. The type-checked code, the unit tests and the extension loading in pi's real loader are verified. End-to-end sessions with GLM-5.3-Flash and Opus 5.5 via OpenRouter were run on a Tetris-on-Reatom task.
 
 - Token counts are conservative estimates (chars/2.4, non-ASCII ×2; calibrated on real Opus input tokens, where chars/3.2 still under-counted by 23–32%); pi has no public tokenizer. Real advisor usage is recorded in the journal (`advisor` events: `usage`, `attempts`, `packTokens`).
-- Masking rewrites the prefix of the request, which breaks prompt caching. That is cheap for GLM but would be costly for Anthropic executors. Stubs are stable, so the prefix only changes once per batch.
+- A handoff rewrites the prefix of the request once (prompt cache breaks once per advisor call); between handoffs the prefix is stable except for the pinned plan's progress marks. An automatic handoff costs one advisor call.
 - Test-summary parsing is regex based (vitest/jest/pytest/cargo/go). Other runners only get exit codes.
 - The reset relies on `turn_end` compaction entries. If pi rejects the entry, use `/baton reset`.
 - The Jev judge only covers the help-pack timeline. Its question format follows pi's `ClassifierContext` types, but it has not been run against the TypeSafe API.

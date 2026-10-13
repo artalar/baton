@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 — 2026-10-13
+
+- **Compaction only at handoffs** (`mask.mode: "handoff"`, the new default). The executor's context is no longer masked on every request: between advisor calls nothing is rewritten (no masking, no duplicate/stale read removal, no loop cuts). In experiment C v3 the per-turn masking made GLM re-read `pieces.ts` 8 times and call `baton_recall` (evt 59–76).
+- A handoff is any `baton_review`/`baton_help`/`baton_plan` call or an automatic one. After the advisor answers, Baton takes a snapshot (journaled, restored after restart) and resets the context: system + task + pinned plan + deferred items + advisor reply + the last N tool calls verbatim (help: `help.lastCalls` = 8; review/plan: new `reset.keepCalls` = 2); older outputs become `evt#` stubs (`baton_recall`). The snapshot is applied unchanged until the next handoff. `baton_review` now resets the context too.
+- **Loop detector** keeps detection, deferred items and blocked edits, but no longer cuts on the fly: it forces a handoff (automatic `baton_help` at the end of the turn, the loop as reason; `loop.forceHandoff`), and that handoff's compaction cuts the looping calls.
+- **Context pressure** (`triggers.contextRatio`) forces a handoff (automatic `baton_review`) instead of a nudge; pi's auto-compaction (`session_before_compact`) also runs a `baton_review` handoff, with the deterministic summary as fallback.
+- Legacy per-request masking is kept as `mask.mode: "continuous"`.
+
 ## 0.3.0 — 2026-10-13
 
 - **Loop detector** (`src/loop.ts`, config `loop`). Deterministic. It counts **hops** per failure signature: one hop is an edit/write (including bash `cat >`, `sed -i`, `rm` and similar), then a run (a test or build command), then the **same** failing test or the same set of build errors again. It fires after `loop.maxHops` (6) hops; a chain breaks when two failures of the signature are more than `hopGapCalls` (30) calls apart, and a changed failure starts a new chain. A second rule fires on the same source file re-read `readRepeatThreshold` (8) times without a write within `windowCalls` (30). Grep-filtered test runs that fail without naming the test are attributed to the test the command greps for. Reference docs and `node_modules` reads do not count. Calibrated on experiment C v2: it fires at call 324 with 8 confirmed hops (the 6th hop happened between the failures at calls 315 and 324), 21 calls after the first failure at call 303. In the 302 calls before that loop, the largest hop count on any signature was 1, so there are no false positives.

@@ -1,3 +1,4 @@
+import type { DeferredItem } from "./loop.ts";
 import { type JournalEvent, eventLine, normPath } from "./journal.ts";
 import { matchesAny } from "./util.ts";
 
@@ -166,6 +167,60 @@ export function maskMessages<T extends MsgLike>(messages: readonly T[], lookup: 
 			return m;
 		}
 		stats.charsSaved += Math.max(0, before - stub.length);
+		return { ...m, content: [{ type: "text", text: stub }] } as T;
+	});
+	return { messages: out, stats };
+}
+
+/**
+ * Snapshot taken at a handoff (advisor call). Everything the executor saw before it is frozen:
+ * tool outputs in `stub` are replaced by evt# stubs, deferred loop calls in `cut` are cut out.
+ * Messages after the handoff are never touched until the next handoff.
+ */
+export interface HandoffSnapshot {
+	/** Monotonic handoff number (1, 2, …). */
+	n: number;
+	/** toolCallIds whose outputs are replaced by stubs. */
+	stub: string[];
+	/** Deferred items whose looping calls are cut (only calls already in `stub`/before the handoff). */
+	cut: DeferredItem[];
+}
+
+/**
+ * Pure: the snapshot for a handoff. `calls` are the toolCallIds of all non-Baton tool calls so far,
+ * in order; the last `keepLast` stay verbatim (help keeps its last N calls), all older ones get stubs.
+ */
+export function handoffSnapshot(n: number, calls: readonly string[], keepLast: number, deferred: readonly DeferredItem[]): HandoffSnapshot {
+	const keep = Math.max(0, keepLast);
+	const stub = keep > 0 ? calls.slice(0, Math.max(0, calls.length - keep)) : [...calls];
+	const before = new Set(calls);
+	return { n, stub, cut: deferred.filter((d) => d.status === "deferred").map((d) => ({ ...d, cut: d.cut.filter((id) => before.has(id)) })).filter((d) => d.cut.length) };
+}
+
+/**
+ * Pure: apply a handoff snapshot to the outgoing messages. Deterministic and depends only on the
+ * snapshot, so the request prefix stays identical between handoffs (no on-the-fly masking).
+ * Exempt tools and reference reads (skills, docs) are never stubbed; tiny outputs are kept.
+ */
+export function applyHandoff<T extends MsgLike>(messages: readonly T[], snap: HandoffSnapshot | undefined, lookup: Lookup, opts: MaskOptions): { messages: T[]; stats: MaskStats } {
+	const stats: MaskStats = { masked: 0, deduped: 0, stale: 0, charsSaved: 0 };
+	if (!snap || !opts.enabled) return { messages: [...messages], stats };
+	const ids = new Set(snap.stub);
+	const args = new Map<string, Record<string, unknown>>();
+	for (const m of messages) {
+		if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+		for (const c of m.content as Array<Record<string, unknown>>) if (c?.type === "toolCall" && typeof c.id === "string") args.set(c.id, (c.arguments as Record<string, unknown>) ?? {});
+	}
+	const out = messages.map((m) => {
+		if (m.role !== "toolResult" || !m.toolCallId || !ids.has(m.toolCallId)) return m;
+		const name = m.toolName ?? "tool";
+		if (opts.exemptTools.includes(name)) return m;
+		if (isReferenceRead(name, args.get(m.toolCallId), opts.cwd, opts.neverMaskPaths)) return m;
+		const stub = stubText("masked", name, lookup(m.toolCallId));
+		const before = textOf(m.content).length;
+		if (before <= stub.length) return m;
+		stats.masked++;
+		stats.charsSaved += before - stub.length;
 		return { ...m, content: [{ type: "text", text: stub }] } as T;
 	});
 	return { messages: out, stats };

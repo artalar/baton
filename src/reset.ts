@@ -5,7 +5,20 @@ import { clip } from "./util.ts";
 export interface EntryLike {
 	id: string;
 	type: string;
-	message?: { role?: string };
+	message?: { role?: string; content?: unknown };
+}
+
+/**
+ * Pure: like pickFirstKept, but also keeps the assistant entry that issued the earliest of `callIds`
+ * (so those tool calls survive the reset verbatim). Returns the earlier of the two entry ids.
+ */
+export function pickFirstKeptForCalls(entries: readonly EntryLike[], callIds: readonly string[], byTurns: string | null): string | null {
+	if (!callIds.length) return byTurns;
+	const ids = new Set(callIds);
+	const i = entries.findIndex((e) => e.type === "message" && e.message?.role === "assistant" && Array.isArray(e.message.content) && (e.message.content as Array<{ type?: string; id?: string }>).some((c) => c?.type === "toolCall" && !!c.id && ids.has(c.id)));
+	if (i < 0) return byTurns;
+	const j = byTurns === null ? -1 : entries.findIndex((e) => e.id === byTurns);
+	return j >= 0 && j < i ? byTurns : entries[i]!.id;
 }
 
 /**

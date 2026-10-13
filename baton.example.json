@@ -57,6 +57,7 @@
     "hopGapCalls": 30,
     "readRepeatThreshold": 8,
     "cutContext": true,
+    "forceHandoff": true,
     "blockDeferredEdits": true,
     "ignoreReadPaths": [
       "**/node_modules/**",
@@ -71,6 +72,7 @@
   },
   "mask": {
     "enabled": true,
+    "mode": "handoff",
     "exemptTools": [
       "baton_review",
       "baton_help",
@@ -96,7 +98,8 @@
     "lastCalls": 8
   },
   "reset": {
-    "keepTurns": 2
+    "keepTurns": 2,
+    "keepCalls": 2
   },
   "replaceAutoCompact": true,
   "journalDir": ".pi/baton"

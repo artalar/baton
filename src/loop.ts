@@ -21,8 +21,10 @@ export interface LoopConfig {
 	hopGapCalls: number;
 	/** Same file re-read this many times inside the window without a write to it → loop (0 = off). */
 	readRepeatThreshold: number;
-	/** Cut the looping calls/results out of the request and replace them with one note. */
+	/** Cut the looping calls/results out of the context (at the handoff the loop forces; on the fly only in mask.mode "continuous") and replace them with one note. */
 	cutContext: boolean;
+	/** On firing, force a handoff (auto baton_help with the loop as reason) instead of only a nudge. Handoff mode only. */
+	forceHandoff: boolean;
 	/** Block edit/write of files tied to a deferred item until the reviewer or user unblocks it. */
 	blockDeferredEdits: boolean;
 	/** Reads of these paths never count (reference docs, dependencies). */
