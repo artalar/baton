@@ -1,7 +1,7 @@
 {
   "name": "pi-baton",
   "version": "0.13.1",
-  "description": "Baton: speculative execution for pi — a cheap helper model continues the expensive lead model's tool calls in the same session, and the harness tells the lead exactly what happened",
+  "description": "Baton: speculative execution for pi — a cheap helper model continues the expensive lead model's work in the same session; the lead gets a factual note and keeps, fixes or undoes it",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -37,6 +37,9 @@
     "coverage": "vitest run --coverage",
     "smoke": "bash scripts/smoke-pack.sh",
     "prepublishOnly": "bun run check && bun run build"
+  },
+  "dependencies": {
+    "diff": "^8.0.4"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=1.2.0",

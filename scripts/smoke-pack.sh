@@ -40,7 +40,7 @@ const tools = [];
 const events = new Set();
 extension({ on: (event) => { events.add(event); return () => {}; }, registerTool: (tool) => tools.push(tool.name), setModel: async () => true });
 for (const event of ['before_agent_start', 'turn_end', 'context', 'tool_call', 'message_end']) if (!events.has(event)) throw new Error('missing handler: ' + event);
-if (!tools.includes('baton_rollback')) throw new Error('baton_rollback is not registered');
+if (!tools.includes('baton_undo')) throw new Error('baton_undo is not registered');
 "
 )
 

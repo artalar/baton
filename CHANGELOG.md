@@ -4,33 +4,29 @@ This file follows [Keep a Changelog](https://keepachangelog.com/). Development n
 
 ## [Unreleased]
 
-Baton is now one thing: speculative execution of the lead model's work by a cheap helper in the same pi session, with explicit harness notes for the lead. This release folds in the 0.14.0 experiment changes and fixes the six causes found after run L.
+Baton is now one small thing: speculative execution of the lead model's work by a cheap helper in the same pi session. The harness only hands over, records facts and offers an undo; the lead decides whether to keep, fix or undo each run.
 
 ### Removed
 
 - Advisor mode (`baton_plan`, `baton_review`, `baton_help`, `baton_step`, `baton_recall`, `/baton`, review gating, loop detector, compaction), the pack library, and the `baton-pack` / `baton-review` CLIs, skill and prompt.
 - Phased switch mode (helper reading, implement/debug/review phases, `baton_read`, `baton_edit`, `baton_delegate`, `baton_optimize`, edit intents, the file-system guard, lead-cache keepalive).
-- Speculation controls that cut useful runs or were noisy: the phase rule, the out-of-plan edit stop, the stop on the first tool error, the Jev step gate and step estimate, and the adaptive ceiling (`BATON_SPEC_GATE`, `BATON_SPEC_STOPS`, `BATON_SPEC_EST`, `BATON_SPEC_PHASE`, `BATON_SPEC_ADAPT`, `BATON_SPEC_V2`).
-- The unreleased advisor and switch-mode changes made after 0.13.1 (advisor keepalive, switch caps, file-system guard hardening) are gone along with those modes. The `dist/` build, `bun run smoke`, and CI on Node.js 22 and 24 stay.
+- Jev and every speculation heuristic: step gate, step estimate, adaptive ceiling, phase rule, out-of-plan edit stop, stop on tool error, cooldown, repeat detector (`BATON_JEV*`, `BATON_SPEC_GATE`, `BATON_SPEC_STOPS`, `BATON_SPEC_EST`, `BATON_SPEC_PHASE`, `BATON_SPEC_ADAPT`, `BATON_SPEC_V2`).
+- The process-wide USD budget (`BATON_BUDGET_USD`). Costs per model are still in the journal.
+- The unreleased advisor and switch-mode changes made after 0.13.1 are gone with those modes. The `dist/` build, `bun run smoke`, and CI on Node.js 22 and 24 stay.
 
 ### Added
 
-- The lead's system prompt explains speculative runs, rollback, and that final verification is the lead's job.
-- Every run note is built from facts: each helper call with an honest outcome (`ok`, `ERROR`, or `UNRELIABLE` when a piped check exits 0 but reports errors), read outputs verbatim, the run's diff from a git checkpoint, and typecheck/test/build results the harness ran itself. The helper's prose is never included.
-- A git checkpoint before each run (a tree object in a temporary index; the user's index, `HEAD` and refs are untouched) and the lead-only `baton_rollback({run})` tool, which reverts only the files the run changed and keeps files changed after it.
-- Final checks: when the lead gives its final answer after files changed, the harness runs typecheck, tests and build, and sends the lead back while they fail (at most 2 rounds).
-- Helper guardrails during runs: no overwriting existing files, no removed or skipped tests, no deleted test files, no `--passWithNoTests`, no new `as unknown as`, no dependency downgrades, no history-changing git commands. A block ends the run.
-- `transcript: "full"` (`BATON_TRANSCRIPT=full`): every helper output verbatim.
-- Jev sees the task and the last 4 turns of both models. Without Jev, a run starts after any lead turn with tool calls.
-- An unfinished run is closed and reported when a new prompt arrives.
+- The lead's system prompt explains speculative runs, the note, keep / fix / undo, steering the helper with "Helper: …" in a reply, and that verification is the lead's job.
+- A run note built from facts only: the helper's calls in order with their status, read outputs verbatim and deduplicated, output tails of other calls, and the diff of files changed with edit/write. The helper's text is never included.
+- `baton_undo({run, paths?})`: restores files a run changed with edit/write from originals saved before the helper's first edit, and deletes files it created. Files changed after the run are left alone and listed. No git needed.
+- A run ends when the helper stops calling tools, its request fails, the user sends a message, or at a safety cap of 40 turns (`maxHelperTurns`, `BATON_MAX_TURNS`). An unfinished run is closed and reported when a new prompt arrives.
 
 ### Changed
 
-- Speculation is on by default (`BATON_SPEC=0` turns it off).
-- The budget counts provider-reported helper cost (`helperCostFactor` default 1, was 2.3). When what is left only covers the lead's wrap-up, runs stop and the lead is told to finish and verify; the abort happens only at the budget itself.
+- Speculation is on by default (`BATON_SPEC=0` turns it off) and starts after every lead turn with tool calls, except one that called `baton_undo`.
 - The helper sees the lead's view plus its current run, not earlier runs.
-- One entry point: `pi -e ./dist/index.js`. Configuration keys are flat (`steps`, `transcript`, `checks`, `jev`, `budget`); see the README.
-- The journal is per session: `<journalDir>/sessions/<id>/events.jsonl` and `summary.json`.
+- One entry point: `pi -e ./dist/index.js`. Six configuration keys: `lead`, `helper`, `speculate`, `maxHelperTurns`, `noteChars`, `journalDir`.
+- The journal is per session: `<journalDir>/sessions/<id>/events.jsonl` and `summary.json`, with per-request usage including cache writes.
 
 ## [0.13.1] - 2026-10-13
 

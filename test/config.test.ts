@@ -16,31 +16,33 @@ function dirs(user?: object, project?: object) {
 }
 
 describe("config", () => {
-	it("defaults: speculation on, facts transcript, guardrails, checkpoints and harness checks on, no helper cost inflation", () => {
+	it("defaults to speculation on with a generous turn cap", () => {
 		const { cwd, env } = dirs();
-		const config = loadConfig(cwd, () => {}, env);
-		expect(config).toEqual(DEFAULT_CONFIG);
-		expect(config).toMatchObject({ speculate: true, transcript: "facts", guardrails: true, checkpoints: true, checks: { afterRun: true, final: true }, budget: { helperCostFactor: 1 } });
+		expect(loadConfig(cwd, () => {}, env)).toEqual(DEFAULT_CONFIG);
+		expect(DEFAULT_CONFIG).toMatchObject({ speculate: true, maxHelperTurns: 40 });
 	});
 
-	it("a project file cannot choose models, budget or journal; the user file can", () => {
+	it("a project file cannot choose models or the journal; the user file can", () => {
 		const warnings: string[] = [];
-		const { cwd, env } = dirs({ helper: "openrouter/x/cheap", budget: { usd: 3 } }, { lead: "openrouter/evil/costly", steps: 4, jev: { model: "evil", threshold: 0.9 } });
+		const { cwd, env } = dirs({ helper: "openrouter/x/cheap" }, { lead: "openrouter/evil/costly", maxHelperTurns: 10 });
 		const config = loadConfig(cwd, (message) => warnings.push(message), env);
-		expect(config.lead).toBe(DEFAULT_CONFIG.lead);
-		expect(config.helper).toBe("openrouter/x/cheap");
-		expect(config.budget.usd).toBe(3);
-		expect(config.steps).toBe(4);
-		expect(config.jev).toMatchObject({ model: DEFAULT_CONFIG.jev.model, threshold: 0.9 });
-		expect(warnings.join("\n")).toMatch(/ignoring lead[\s\S]*ignoring jev\.model/);
+		expect(config).toMatchObject({ lead: DEFAULT_CONFIG.lead, helper: "openrouter/x/cheap", maxHelperTurns: 10 });
+		expect(warnings.join("\n")).toMatch(/ignoring lead/);
 	});
 
 	it("environment variables override files", () => {
-		const { cwd, env } = dirs();
+		const { cwd, env } = dirs({ maxHelperTurns: 5 });
 		const warnings: string[] = [];
-		const config = loadConfig(cwd, (message) => warnings.push(message), { ...env, BATON_SPEC: "off", BATON_STEPS: "4", BATON_TRANSCRIPT: "full", BATON_CHECKS: "0", BATON_JEV: "no", BATON_BUDGET_USD: "abc", BATON_JOURNAL_DIR: "/tmp/elsewhere" });
-		expect(config).toMatchObject({ speculate: false, steps: 4, transcript: "full", checks: { afterRun: false, final: false }, jev: { enabled: false }, budget: { usd: 0 }, journalDir: ".pi/baton" });
-		expect(warnings.join("\n")).toMatch(/BATON_BUDGET_USD=abc[\s\S]*outside the working directory/);
+		const config = loadConfig(cwd, (message) => warnings.push(message), { ...env, BATON_SPEC: "off", BATON_MAX_TURNS: "12", BATON_JOURNAL_DIR: "/tmp/elsewhere" });
+		expect(config).toMatchObject({ speculate: false, maxHelperTurns: 12, journalDir: ".pi/baton" });
+		expect(warnings.join("\n")).toMatch(/outside the working directory/);
+	});
+
+	it("turns speculation off when lead and helper are the same model", () => {
+		const { cwd, env } = dirs({ helper: "anthropic/claude-opus-5.5" });
+		const warnings: string[] = [];
+		expect(loadConfig(cwd, (message) => warnings.push(message), env).speculate).toBe(false);
+		expect(warnings.join("\n")).toMatch(/same model/);
 	});
 
 	it("helpers", () => {

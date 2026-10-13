@@ -1,79 +1,83 @@
 # Baton
 
-Baton is an extension for the [pi](https://github.com/earendil-works/pi-coding-agent) coding agent that runs **speculative execution** inside one session. An expensive lead model (Opus by default) plans, writes and verifies. After a lead turn with tool calls, a cheap helper model (GLM by default) continues the lead's own plan for a few steps in the same session, with the same context. Then the lead takes over again and gets a `[Baton harness]` note that says exactly what happened.
+Baton is an extension for the [pi](https://github.com/earendil-works/pi-coding-agent) coding agent that runs **speculative execution** inside one session. An expensive lead model (Opus by default) owns the task. After each lead turn that ends with tool calls, a cheap helper model (GLM by default) continues the lead's current plan in the same session, with the same context, until it reaches a point that needs the lead. Then the lead takes over and gets a `[Baton]` note with the facts of the run. **The lead decides** what to do with it: keep it, fix it, or undo it.
 
-The lead is never misled about authorship: it knows from its system prompt that speculation exists, every run is reported as the helper's work, the report contains facts collected by the harness (not the helper's claims), and every run can be rolled back.
+The harness makes no decisions about quality: it does not run checks, does not judge the helper's commands, and has no heuristics about when speculation pays off. It only hands over, records facts, and offers an undo.
 
-## How a run works
+## How it works
 
 ```mermaid
 flowchart TD
-  leadTurn["Lead turn with tool calls"] --> decide{"Start a run? Cooldown, budget, Jev P(more calls)"}
-  decide -- no --> leadTurn
-  decide -- yes --> checkpoint["Git checkpoint of the working tree"]
-  checkpoint --> helper["Helper continues the plan for up to N turns, guardrails on"]
-  helper --> stop{"Helper stopped, step or time limit, guardrail block, repeat, budget"}
-  stop -- no --> helper
-  stop -- yes --> facts["Harness collects facts: calls and outcomes, read outputs, the run's diff, typecheck/test/build results"]
-  facts --> note["Run note appended for the lead, with baton_rollback hint"]
-  note --> leadTurn
-  leadTurn -- "final answer, no tool calls" --> final{"Harness runs final checks"}
-  final -- "red, up to 2 rounds" --> leadTurn
-  final -- green --> done["Done"]
+  prompt["User prompt"] --> lead["Lead turn"]
+  lead -- "final answer, error or abort" --> done["Agent ends"]
+  lead -- "called baton_undo" --> lead
+  lead -- "tool calls" --> start["Run N: switch to the helper, append the helper instruction"]
+  start --> helper["Helper turn: real tool calls; before its first edit/write of a file, the harness saves the original"]
+  helper -- "more tool calls" --> helper
+  helper -- "no tool calls, request error, user message, or 40-turn safety cap" --> note["Note from facts: calls, read outputs, output tails, diff against the originals"]
+  note --> lead
 ```
 
-- **Start.** After every lead turn with tool calls, outside the cooldown (1 lead turn after a run) and while the budget allows. With Jev on, Jev must also estimate P(the lead makes more tool calls) ≥ 0.8; it sees the task and the last 4 turns of both models. Without Jev, or when Jev fails, a run starts on any lead turn with tool calls.
-- **Run.** The helper gets a short instruction (hidden from the lead): continue the lead's plan, batch independent calls, don't redesign, don't rewrite or delete existing files and tests, stop when the next step needs a decision. It sees the lead's view plus its current run, not older runs.
-- **Stop.** The helper stops calling tools, the step limit (6 turns) or time limit (150 s, below the lead's 5-minute cache TTL) is reached, a guardrail blocks a call, the same call returns the same output 3 times, or the budget enters wrap-up. A red test is not a stop: fixing it is part of the plan.
-- **Report.** The lead never sees the helper's messages. It gets one note appended at the end of its context (old messages are not rewritten, so its prompt cache stays valid).
+- **One session, two views.** The lead never sees helper turns or the helper instruction, only the notes appended at the end of its context, so its prompt cache stays valid. The helper sees the lead's view plus its current run.
+- **Real work, kept by default.** The helper edits files and runs commands for real, so it can run tests and fix what they report. Keeping the run costs the lead nothing; reviewing a diff costs input tokens, which are much cheaper than writing the same change itself.
+- **Natural stop.** A run ends when the helper stops calling tools (the step is done or needs a decision), when its request fails, when the user sends a message, or at a generous safety cap (40 turns). There is no time limit; for long runs set `PI_CACHE_RETENTION=long` so the lead's cache outlives them.
+- **No predictor.** A run starts after every lead turn with tool calls, except a turn that called `baton_undo`. A useless run costs one cheap request and a two-line note.
 
 ### What the lead reads after a run
 
 ```text
-[Baton harness] Speculative run #3 — performed by the helper model (glm-5.3-flash), not by you.
+[Baton] Speculative run #3 by the helper model (glm-5.3-flash), not by you. Its file changes are already on disk.
+It stopped because the helper ended its turn without tool calls: 4 turn(s), 7 tool call(s).
 
-After your last tool call the harness let the helper continue your work in this session: 4 turn(s), 6 tool call(s). It stopped because the helper stopped calling tools. ...
+Tool calls:
+1. read src/game/pieces.ts → ok (output below)
+2. grep "clearRows" → ok (output below)
+3. edit src/game/board.ts → ok
+4. write src/game/board.test.ts → ok
+5. bash `npm test -- board` → error
+   FAIL src/game/board.test.ts > clears full rows
+   Tests: 1 failed, 5 passed
+6. edit src/game/board.ts → ok
+7. bash `npm test -- board` → ok
+   Tests: 6 passed
 
-Checkpoint: the working tree before the run is saved as git tree 4b1c…. To undo this run, call baton_rollback({run: 3}). To inspect it: `git diff 4b1c… 9e02…`.
+Files changed with edit/write (undo: baton_undo({run: 3}) or baton_undo({run: 3, paths: [...]})):
+- modified src/game/board.ts (+14 −3)
+- created src/game/board.test.ts (+41 −0)
+Bash commands above may also have changed files; such changes are not in this diff.
 
-Tool calls of the helper:
-1. read src/model.ts → ok (output below)
-2. edit vite.config.ts → ok
-3. bash `npm test 2>&1 | tail -3` → UNRELIABLE — exit 0 comes from the last command of a pipe, but the output reports errors: FAIL src/game.test.ts
-
-Files changed by the run (1):
-- modified vite.config.ts
-
-Diff of the run (checkpoint → end of run):
+Diff (before the run → now):
 ...
-
-Checks run by the harness after the run (SOME FAILED):
-- test: `npm test --silent` → PASS
-- build: `npm run -s build` → FAIL (exit 1)
-    error: JSX syntax extension is not enabled
 
 Read outputs (verbatim):
---- read src/model.ts ---
+--- read src/game/pieces.ts ---
 ...
 
-Continue the task from here. You are responsible for this work: review the diff, fix what is wrong or roll the run back, and make sure typecheck, tests and the build pass before you finish.
+Continue from here: keep the run, fix it, or undo it.
 ```
 
-- **Outcomes are honest.** A tool error is `ERROR`. A check command that exits 0 while its output reports errors is `UNRELIABLE`: with a pipe, the exit status belongs to the last command (`npm test | tail`).
-- **Checks are run by the harness.** After a run that changed files, Baton runs the project's typecheck, tests and production build itself (from `package.json`: the `typecheck` script or `tsc --noEmit`, then `test`, then `build`; override with `checks.commands`).
-- **Reads are not lost.** Read-only outputs (`read`, `grep`, `ls`, read-only `bash`) go to the lead verbatim, deduplicated, up to 40 000 characters per note, so the lead does not re-read the files.
-- **No helper prose.** The helper's text is not included, so a claim like "all green" never reaches the lead.
-- **Full transcript mode.** `BATON_TRANSCRIPT=full` passes every helper output verbatim (up to `noteChars`), for when the lead should judge the whole batch and either keep it or roll it back.
+- Statuses come only from the tool's own error flag. Commands are shown with the tail of their output (2000 characters), so the lead judges a piped `npm test | tail` itself.
+- Read outputs are passed verbatim and deduplicated, so the lead does not re-read the files.
+- The helper's own text is never included: a claim like "all green" never reaches the lead.
+- The note is capped at `noteChars`. Read outputs are omitted first (with a marker), then the diff is clipped per file.
 
 ### What the lead is told up front
 
-Baton appends a section to the system prompt: a helper may continue its work between turns; runs are reported as `[Baton harness] Speculative run #N`; that work is the helper's, so review the diff, continue from where it stopped, or call `baton_rollback`; and **the lead owns the final verification** (typecheck, tests, build).
+A section appended to the system prompt explains speculative runs, the note, and the three options:
 
-When the lead gives its final answer and files changed since the task started, the harness runs the checks again. If any fails, the lead gets a `[Baton harness] Final checks` note and continues, at most 2 rounds per task.
+- **Keep:** continue from where the run stopped, without redoing or re-reading what the note shows. Doing nothing means keeping.
+- **Fix:** ordinary edits.
+- **Undo:** `baton_undo({run, paths?})`, which can be batched with other calls in the same turn.
+
+It also says that the helper reads the lead's messages (so "Helper: do not touch the tests" in a reply steers later runs), and that verification is the lead's job: the harness runs no checks.
+
+### Undo
+
+Before the helper's first `edit` or `write` of a file in a run, the harness saves the file's content (or notes that it did not exist). The same originals produce the diff. `baton_undo` writes them back and deletes files the run created, but only for files that are still exactly as the run left them. Files changed after the run are left alone and listed. Changes made through `bash` are not covered; the helper is told to change files only with `edit`/`write`. No git is involved, so it works in any directory.
 
 ## Quick start
 
-Requires Node.js 22 or newer and `OPENROUTER_API_KEY` for the default models and Jev.
+Requires Node.js 22 or newer, and `OPENROUTER_API_KEY` for the default models.
 
 ```sh
 bun install
@@ -83,76 +87,37 @@ pi -e ./dist/index.js
 # or, after the build: pi install .
 ```
 
-The npm name `pi-baton` is not published yet. `BATON_SPEC=0` keeps the lead working alone with the same harness checks, which is the baseline for comparing runs.
-
-## Safety
-
-- **Guardrails.** During a run the helper may read, run checks, create files and make targeted edits. These calls are blocked and end the run: overwriting an existing file with `write`, removing or skipping test cases, deleting test files, `--passWithNoTests`, a new `as unknown as` cast, dependency downgrades or pinned installs, git commands that change history or discard work (`commit`, `reset`, `checkout`, `restore`, `stash`, `clean`, …), and `baton_rollback`.
-- **Checkpoints.** Before each run, Baton stores the working tree (tracked and untracked files, `.gitignore` respected) as a git tree object built in a temporary index. Your index, `HEAD` and refs are not touched. Outside a git repository there are no checkpoints, and the note says so.
-- **Rollback.** `baton_rollback({run})` (lead only) restores every file the run changed to the checkpoint and deletes files the run created. Files changed again after the run are left as they are and listed.
-- **Budget.** `BATON_BUDGET_USD` (or `budget.usd`) caps spend for the pi process: provider-reported lead and helper costs (helper × `helperCostFactor`, default 1) plus Jev calls. When what is left only covers the lead's wrap-up (the larger of `reserveUsd` 0.25 and twice the largest lead turn), runs stop and the lead is told to finish and verify. At the budget itself the run is aborted, and later prompts in the process are refused.
+The npm name `pi-baton` is not published yet. `BATON_SPEC=0` keeps the lead working alone, which is the baseline for comparing runs.
 
 ## Configuration
 
-User file `~/.pi/agent/baton.json` (or `$PI_CODING_AGENT_DIR/baton.json`), then the project file `.pi/baton.json`, then environment variables. `lead`, `helper`, `budget`, `journalDir`, `jev.model` and `jev.fallbackModel` are ignored in the project file (with a warning): a repository cannot choose your models, spend or file locations. Defaults are `DEFAULT_CONFIG` in [`src/config.ts`](src/config.ts).
+User file `~/.pi/agent/baton.json` (or `$PI_CODING_AGENT_DIR/baton.json`), then the project file `.pi/baton.json`, then environment variables. `lead`, `helper` and `journalDir` are ignored in the project file (with a warning): a repository cannot choose your models or file locations.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `lead` | `openrouter/anthropic/claude-opus-5.5` | Lead model, `provider/id` in pi's registry |
-| `helper` | `openrouter/z-ai/glm-5.3-flash` | Helper model |
-| `speculate` | `true` | Speculative runs on or off |
-| `steps` | `6` | Helper turns per run |
-| `maxRunMs` | `150000` | Wall-clock cap of a run |
-| `cooldown` | `1` | Lead turns after a run before the next one |
-| `repeatLimit` | `3` | Identical call with identical output this many times ends the run |
-| `transcript` | `"facts"` | `"facts"` or `"full"` |
-| `readChars`, `diffChars`, `commandTailChars`, `noteChars` | 40000, 16000, 1500, 120000 | Note size budgets |
-| `guardrails`, `checkpoints` | `true`, `true` | |
-| `checks` | `{ afterRun: true, final: true, maxFinalRounds: 2, timeoutMs: 120000 }` | Harness checks; `commands` overrides detection |
-| `jev` | `{ enabled: true, model: "typesafe/jev-1.13", fallbackModel: "microsoft/microsoft-decision-1", timeoutMs: 800, threshold: 0.8, recentTurns: 4 }` | Start decision |
-| `budget` | `{ usd: 0, helperCostFactor: 1, reserveUsd: 0.25 }` | `usd` 0 = no budget |
-| `journalDir` | `.pi/baton` | Must stay inside the working directory |
+| Key | Default | Environment | Meaning |
+|---|---|---|---|
+| `lead` | `openrouter/anthropic/claude-opus-5.5` | `BATON_LEAD` | Lead model, `provider/id` in pi's registry |
+| `helper` | `openrouter/z-ai/glm-5.3-flash` | `BATON_HELPER` | Helper model |
+| `speculate` | `true` | `BATON_SPEC` | Speculative runs on or off; off when lead and helper are the same model |
+| `maxHelperTurns` | `40` | `BATON_MAX_TURNS` | Safety cap of helper turns per run |
+| `noteChars` | `80000` | | Size cap of one note |
+| `journalDir` | `.pi/baton` | `BATON_JOURNAL_DIR` | Must stay inside the working directory |
 
 On/off variables accept `1`/`on`/`true`/`yes` and `0`/`off`/`false`/`no`.
 
-| Variable | Effect |
-|---|---|
-| `OPENROUTER_API_KEY` | OpenRouter models and Jev. Never read from config files. |
-| `BATON_LEAD`, `BATON_HELPER` | Models |
-| `BATON_SPEC` | Speculation on or off |
-| `BATON_STEPS` | Helper turns per run |
-| `BATON_TRANSCRIPT` | `facts` or `full` |
-| `BATON_CHECKS` | Harness checks after runs and at the final answer |
-| `BATON_JEV`, `BATON_JEV_MODEL`, `BATON_JEV_FALLBACK_MODEL` | Jev on or off, and its models |
-| `BATON_BUDGET_USD` | Process-wide budget |
-| `BATON_JOURNAL_DIR` | Journal directory |
-| `PI_CODING_AGENT_DIR` | Location of the user config file |
-
 ## Journal
 
-Per pi session: `<journalDir>/sessions/<session id>/events.jsonl` (tasks, Jev answers, start decisions, runs, blocked calls, usage, final checks, rollbacks) and `summary.json` (spend, costs per model, run stats, stop reasons, every run with its checkpoint trees). The journal directory gets a `.gitignore` of `*`, which also keeps it out of checkpoints.
-
-## Privacy
-
-The lead and helper providers receive the session as pi sends it. With Jev on, OpenRouter's decisions endpoint (`https://openrouter.ai/api/alpha/decisions`) receives the task text and short summaries of the last turns' tool calls and outputs. `BATON_JEV=0` turns that off.
+Per pi session: `<journalDir>/sessions/<session id>/events.jsonl` (prompts, run starts and ends, per-request usage including the lead's cache writes, undos) and `summary.json` (costs per model, run stats, stop reasons, every run with its changed and undone files). The journal directory gets a `.gitignore` of `*`.
 
 ## Architecture
 
-All files are in `src/`. Everything except `extension.ts`, `git.ts`, `checks.ts` and `journal.ts` is pure.
-
 | File | Role |
 |---|---|
-| `extension.ts` | pi wiring: model switches, run lifecycle, notes, final checks, budget, `baton_rollback` |
-| `run.ts` | Run state, start decision, stop rules |
-| `notes.ts` | Every text the models read: lead system note, helper instruction, run note, final checks, budget, rollback |
-| `context.ts` | Lead and helper views of the transcript |
-| `calls.ts` | Tool-call classification and honest outcomes |
-| `guard.ts` | Helper guardrails |
-| `decision.ts`, `jev.ts` | Jev state and question; decisions API client |
-| `git.ts` | Checkpoints, run diffs, rollback |
-| `checks.ts` | Detecting and running typecheck, tests and build |
-| `budget.ts` | Spend and budget levels |
-| `config.ts`, `journal.ts` | Configuration; journal |
+| `src/extension.ts` | pi wiring: hand-over, stop rules, notes, usage, `baton_undo` |
+| `src/run.ts` | Run state, saved originals, changes, undo |
+| `src/notes.ts` | Every text the models read: lead system section, helper instruction, run note, undo result |
+| `src/context.ts` | Lead and helper views of the transcript |
+| `src/config.ts` | Configuration |
+| `src/journal.ts` | Journal |
 
 ## Development
 
@@ -163,7 +128,7 @@ bun run build     # tsc -p tsconfig.build.json → dist/
 bun run smoke     # npm pack, install the tarball, load the extension
 ```
 
-GitHub Actions runs check, build and smoke on Node.js 22 and 24. The experiment log of earlier versions (advisor mode, phased switch mode, measurements) is in [docs/history.md](docs/history.md).
+GitHub Actions runs check, build and smoke on Node.js 22 and 24. The experiment log of earlier versions is in [docs/history.md](docs/history.md).
 
 ## License
 

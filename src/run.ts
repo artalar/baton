@@ -1,106 +1,115 @@
-import type { BudgetLevel } from "./budget.ts";
-import { type CallOutcome, callOutcome, callSignature, type ToolCall, type ToolOutput } from "./calls.ts";
-import type { BatonConfig } from "./config.ts";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, relative, resolve } from "node:path";
 
 export interface RunCall {
-	call: ToolCall;
-	output?: ToolOutput;
-	outcome: CallOutcome;
-	blockedReason?: string;
+	id: string;
+	name: string;
+	args: Record<string, unknown>;
+	isError?: boolean;
+	output?: string;
 }
 
-export interface Checkpoint {
-	tree?: string;
-	unavailableReason?: string;
+/** `undefined` content means the file did not exist. */
+export interface FileChange {
+	path: string;
+	before: Buffer | undefined;
+	after: Buffer | undefined;
 }
 
-export interface SpeculativeRun {
+export interface ActiveRun {
 	number: number;
 	startedAt: number;
-	maxSteps: number;
-	steps: number;
+	turns: number;
 	calls: RunCall[];
-	checkpoint: Checkpoint;
-	startProbability?: number;
-	forcedStopReason?: string;
+	/** Content of each file before the helper first touched it with edit/write, by absolute path. */
+	originals: Map<string, Buffer | undefined>;
+	stopRequested?: string;
 }
 
 export interface FinishedRun {
 	number: number;
-	startTree?: string;
-	endTree?: string;
 	stopReason: string;
-	steps: number;
+	turns: number;
 	callCount: number;
-	changedFiles: string[];
-	rolledBack?: boolean;
+	changes: FileChange[];
+	undone: Set<string>;
 }
 
-export function startRun(number: number, now: number, config: Pick<BatonConfig, "steps">, checkpoint: Checkpoint, startProbability?: number): SpeculativeRun {
-	return { number, startedAt: now, maxSteps: config.steps, steps: 0, calls: [], checkpoint, startProbability };
+export interface UndoResult {
+	restored: string[];
+	deleted: string[];
+	changedLater: string[];
+	alreadyUndone: string[];
+	notInRun: string[];
 }
 
-export function recordHelperTurn(run: SpeculativeRun, calls: ToolCall[], outputs: ToolOutput[], blockedReasons: ReadonlyMap<string, string>): void {
-	run.steps++;
-	const outputById = new Map(outputs.map((output) => [output.id, output]));
-	for (const call of calls) {
-		const blockedReason = blockedReasons.get(call.id);
-		const output = outputById.get(call.id);
-		const outcome: CallOutcome = blockedReason ? { status: "error", detail: `blocked by Baton: ${blockedReason}` } : callOutcome(call, output);
-		run.calls.push({ call, output, outcome, blockedReason });
-		if (blockedReason) run.forcedStopReason ??= `guardrail blocked ${call.name}: ${blockedReason}`;
+export const FILE_TOOLS = new Set(["edit", "write"]);
+
+export const startRun = (number: number, startedAt: number): ActiveRun => ({ number, startedAt, turns: 0, calls: [], originals: new Map() });
+
+/** Mirrors pi's path handling: a leading `@` is dropped, `~` is the home directory, relative paths start at cwd. */
+export function resolveToolPath(cwd: string, rawPath: string): string {
+	const withoutAt = rawPath.startsWith("@") ? rawPath.slice(1) : rawPath;
+	const expanded = withoutAt === "~" || withoutAt.startsWith("~/") ? homedir() + withoutAt.slice(1) : withoutAt;
+	return resolve(cwd, expanded);
+}
+
+function readContent(absolutePath: string): Buffer | undefined {
+	try {
+		return statSync(absolutePath).isFile() ? readFileSync(absolutePath) : undefined;
+	} catch {
+		return undefined;
 	}
 }
 
-function repeatedCallCount(run: SpeculativeRun): number {
-	const last = run.calls.at(-1);
-	if (!last) return 0;
-	const signature = callSignature(last.call);
-	let count = 0;
-	for (let index = run.calls.length - 1; index >= 0; index--) {
-		const previous = run.calls[index]!;
-		if (callSignature(previous.call) !== signature || previous.output?.text !== last.output?.text) break;
-		count++;
+export function rememberOriginal(run: ActiveRun, cwd: string, call: Pick<RunCall, "name" | "args">): void {
+	if (!FILE_TOOLS.has(call.name) || typeof call.args.path !== "string") return;
+	const absolutePath = resolveToolPath(cwd, call.args.path);
+	if (!run.originals.has(absolutePath)) run.originals.set(absolutePath, readContent(absolutePath));
+}
+
+export function recordTurn(run: ActiveRun, calls: RunCall[]): void {
+	run.turns++;
+	run.calls.push(...calls);
+}
+
+const sameContent = (left: Buffer | undefined, right: Buffer | undefined) => (left === undefined || right === undefined ? left === right : left.equals(right));
+
+export function collectChanges(run: ActiveRun, cwd: string): FileChange[] {
+	const changes: FileChange[] = [];
+	for (const [absolutePath, before] of run.originals) {
+		const after = readContent(absolutePath);
+		if (!sameContent(before, after)) changes.push({ path: relative(cwd, absolutePath) || absolutePath, before, after });
 	}
-	return count;
+	return changes;
 }
 
-export interface StopInput {
-	now: number;
-	turnHadToolCalls: boolean;
-	turnFailed?: string;
-	budget: BudgetLevel;
-}
-
-export function runStopReason(run: SpeculativeRun, config: Pick<BatonConfig, "maxRunMs" | "repeatLimit">, input: StopInput): string | undefined {
-	if (input.turnFailed) return `the helper's request failed (${input.turnFailed})`;
-	if (run.forcedStopReason) return run.forcedStopReason;
-	if (input.budget === "wrapUp" || input.budget === "exhausted") return "the budget is nearly spent";
-	if (!input.turnHadToolCalls) return "the helper stopped calling tools";
-	const repeats = repeatedCallCount(run);
-	if (repeats >= config.repeatLimit) return `the helper repeated the same call ${repeats} times with the same result`;
-	if (run.steps >= run.maxSteps) return `step limit (${run.maxSteps}) reached`;
-	if (input.now - run.startedAt >= config.maxRunMs) return `time limit (${Math.round(config.maxRunMs / 1000)} s) reached`;
-	return undefined;
-}
-
-export interface StartInput {
-	leadCalls: ToolCall[];
-	cooldownLeft: number;
-	budget: BudgetLevel;
-	/** Jev's P(the lead makes more tool calls); undefined when Jev is off or failed. */
-	probability?: number;
-}
-
-export type StartDecision = { start: true; reason: string } | { start: false; reason: string };
-
-export function speculationDecision(input: StartInput, config: Pick<BatonConfig, "speculate" | "jev">): StartDecision {
-	if (!config.speculate) return { start: false, reason: "speculation is off" };
-	if (!input.leadCalls.length) return { start: false, reason: "the lead finished its turn without tool calls" };
-	if (input.leadCalls.some((call) => call.name === "baton_rollback")) return { start: false, reason: "the lead is rolling back a run" };
-	if (input.budget === "wrapUp" || input.budget === "exhausted") return { start: false, reason: "the budget is nearly spent" };
-	if (input.cooldownLeft > 0) return { start: false, reason: "cooldown after the previous run" };
-	if (input.probability === undefined) return { start: true, reason: config.jev.enabled ? "Jev unavailable; the lead's turn had tool calls" : "the lead's turn had tool calls" };
-	if (input.probability < config.jev.threshold) return { start: false, reason: `Jev P(more calls) ${input.probability.toFixed(2)} < ${config.jev.threshold}` };
-	return { start: true, reason: `Jev P(more calls) ${input.probability.toFixed(2)}` };
+/** Restores files a run changed with edit/write, but only those still exactly as the run left them. */
+export function undoRun(run: FinishedRun, cwd: string, paths?: string[]): UndoResult {
+	const result: UndoResult = { restored: [], deleted: [], changedLater: [], alreadyUndone: [], notInRun: [] };
+	const requested = paths?.map((path) => relative(cwd, resolveToolPath(cwd, path)));
+	const selected = requested ? run.changes.filter((change) => requested.includes(change.path)) : run.changes;
+	if (requested) result.notInRun = requested.filter((path) => !run.changes.some((change) => change.path === path));
+	for (const change of selected) {
+		if (run.undone.has(change.path)) {
+			result.alreadyUndone.push(change.path);
+			continue;
+		}
+		const absolutePath = resolve(cwd, change.path);
+		if (!sameContent(readContent(absolutePath), change.after)) {
+			result.changedLater.push(change.path);
+			continue;
+		}
+		if (change.before === undefined) {
+			if (existsSync(absolutePath)) rmSync(absolutePath);
+			result.deleted.push(change.path);
+		} else {
+			mkdirSync(dirname(absolutePath), { recursive: true });
+			writeFileSync(absolutePath, change.before);
+			result.restored.push(change.path);
+		}
+		run.undone.add(change.path);
+	}
+	return result;
 }
