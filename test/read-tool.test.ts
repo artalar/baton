@@ -67,3 +67,24 @@ describe("0.12.1 baton_read: the helper reads, the lead gets the outputs verbati
 		expect(decideTurn(s, turn({ calls: [c("b", "baton_read", { request: "x" })] }), { ...cfg, readTool: false }).to).not.toBe("followup");
 	});
 });
+
+describe("0.12.3: the helper works with the lead's full session context", () => {
+	it("helper view keeps the task, the lead's turns and its read outputs; lead view hides helper turns", async () => {
+		const { shapeContext } = await import("../src/pi/switch-core.ts");
+		const s = initialSwitchState(0);
+		const msgs = [
+			{ role: "user", content: [{ type: "text", text: "TASK: add profiles" }] },
+			{ role: "assistant", model: "opus", content: [{ type: "text", text: "Decision: use withLocalStorage" }, { type: "toolCall", id: "r1", name: "read", arguments: { path: "src/game/model.ts" } }] },
+			{ role: "toolResult", toolCallId: "r1", content: [{ type: "text", text: "MODEL SOURCE" }] },
+			{ role: "assistant", model: "opus", content: [{ type: "toolCall", id: "be", name: "baton_edit", arguments: { request: "add profiles" } }] },
+			{ role: "toolResult", toolCallId: "be", content: [{ type: "text", text: "baton_edit: the helper is making the edit…" }] },
+			{ role: "assistant", model: "glm", content: [{ type: "toolCall", id: "w", name: "write", arguments: {} }] },
+			{ role: "toolResult", toolCallId: "w", content: [{ type: "text", text: "ok" }] },
+		] as never[];
+		const helper = JSON.stringify(shapeContext(msgs, s, false, "opus"));
+		for (const x of ["TASK: add profiles", "Decision: use withLocalStorage", "MODEL SOURCE", "add profiles"]) expect(helper).toContain(x);
+		const lead = JSON.stringify(shapeContext(msgs, s, true, "opus"));
+		expect(lead).toContain("MODEL SOURCE");
+		expect(lead).not.toContain('"id":"w"');
+	});
+});

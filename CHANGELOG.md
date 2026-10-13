@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.3
+
+- The lead prompt and the `baton_read` / `baton_edit` descriptions now state the key advantage: both run the helper **inside this session with the lead's full context** (task, files read, decisions, history). A short request is therefore enough, unlike a subagent that starts empty and needs a long brief.
+- Test: the helper's view of the context contains the task, the lead's turns, its decisions and its read outputs. The lead's view hides the helper's turns.
+
 ## 0.12.2
 
 - The lead's system note and the `baton_read` / `baton_edit` tool descriptions now explain why to use them:

@@ -408,7 +408,7 @@ Baton hands the intent to the helper, runs the checks and gives you an "[Baton h
 
 /** 0.12: appended to the lead's system prompt when the baton_edit tool is on (BATON_EDIT=tool, default). */
 export const LEAD_EDIT_TOOL_NOTE = `
-Two Baton tools save budget and time; use them by default:
+Two Baton tools save budget and time; use them by default. Both run the helper inside THIS session with everything you already have (the task, files you read, your decisions, the whole history), so — unlike a subagent that starts empty and needs a long brief — a short request is enough:
 - baton_read({request}) — to study code. Describe in free text what to find out or read (files, APIs, where to look). One call replaces many read turns: each of your turns resends the whole context, a cheap helper does the reading instead. You get the raw tool outputs verbatim in one result (deduplicated, skills in full, no helper commentary), so nothing is lost; call again if you need more.
 - baton_edit({request}) — to change files. Describe in free text what to change and why (files, behaviour, key names/signatures, tests). You stay the author of the solution; the helper does the typing and the mechanical write → typecheck/test → fix loop in this same session. You get one result: changed files and definitions, a compressed diff and the tsc/test status — or a clear "NOT DONE". Batch related changes into one call.
 Plain read/bash and write/edit remain available as a fallback: use them for a one-line fix, or when baton_edit reports NOT DONE.`;

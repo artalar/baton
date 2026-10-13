@@ -506,7 +506,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		name: "baton_read",
 		label: "Baton read",
 		description:
-			"Study code in ONE call instead of many read turns (each of your turns resends the whole context; a cheap helper reads instead). request = free text: what to find out or read and where to look. Returns the helper's raw tool outputs verbatim in one result — deduplicated, skills in full, no helper commentary — so nothing is lost; call again for more.",
+			"Study code in ONE call instead of many read turns. The helper runs in this session with your full context (task, files read, decisions), so a short request is enough — no subagent brief (each of your turns resends the whole context; a cheap helper reads instead). request = free text: what to find out or read and where to look. Returns the helper's raw tool outputs verbatim in one result — deduplicated, skills in full, no helper commentary — so nothing is lost; call again for more.",
 		parameters: Type.Object({ request: Type.String({ description: "What to find out / read and where to look, in your own words." }) }),
 		async execute() {
 			return { content: [{ type: "text" as const, text: "baton_read: the helper is reading…" }], details: {} };
@@ -516,7 +516,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		name: "baton_edit",
 		label: "Baton edit",
 		description:
-			"Change files without typing them yourself: you stay the author, the cheap helper makes the edit in this same session and runs the write → typecheck/test → fix loop. request = free text: what to change and why (files, behaviour, key names, tests). Returns one result: changed files/definitions, compressed diff, tsc/test status — or NOT DONE (then fix it yourself with write/edit).",
+			"Change files without typing them yourself. The helper runs in this session with your full context (task, files read, decisions), so a short request is enough — unlike a subagent that starts empty. You stay the author, the cheap helper makes the edit in this same session and runs the write → typecheck/test → fix loop. request = free text: what to change and why (files, behaviour, key names, tests). Returns one result: changed files/definitions, compressed diff, tsc/test status — or NOT DONE (then fix it yourself with write/edit).",
 		parameters: Type.Object({ request: Type.String({ description: "What to change and why, in your own words (files, behaviour, important names, tests)." }) }),
 		async execute() {
 			// placeholder: replaced in the lead's view by the outcome when the helper hands back (st.stubs)
