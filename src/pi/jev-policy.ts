@@ -5,7 +5,7 @@
  * Prompt and thresholds follow /workspace/jev-eval (prompt.py, final policy: 93% gate accuracy on 1395 calls).
  */
 import { type JevAnswers, type JevQuestions, noul, prob } from "../core/jev.ts";
-import { bashWriteTargets, type Call, isEdit, isVerify } from "./switch-core.ts";
+import { bashWriteTargets, type Call, isVerify } from "./switch-core.ts";
 
 export { DEFAULT_JEV, type JevConfig, type JevThresholds } from "./jev-config.ts";
 import type { JevConfig, JevThresholds } from "./jev-config.ts";
@@ -75,7 +75,6 @@ export function callKind(c: Pick<Call, "name" | "args">): CallKind {
 	if (["read", "grep", "find", "ls", "glob"].includes(c.name)) return "read";
 	return "other";
 }
-export const isWriteCall = (c: Call) => callKind(c) === "write" || isEdit(c);
 
 const ws = (t: string) => t.replace(/\s+/g, " ").trim();
 const q = (s: unknown, n: number) => JSON.stringify(String(s ?? "").slice(0, n));
@@ -200,13 +199,6 @@ import type { TurnJev } from "./jev-config.ts";
 export function turnJevFromAnswers(a: JevAnswers): TurnJev {
 	const p = a.phase?.type === "choice" ? a.phase.choice : undefined;
 	return { routine: noul(a, "routine_ahead"), stuck: noul(a, "stuck"), phase: p };
-}
-
-/** Pure: the turn-boundary switch suggested by Jev for a phase (undefined = keep the rule-based decision). */
-export function switchFromAnswers(j: TurnJev, phase: string, consecutiveNonWrite: number, thr: JevThresholds): { to: "followup" | "lead"; reason: string } | undefined {
-	if (phase === "lead" && j.routine >= thr.routine && consecutiveNonWrite >= thr.minNonWrite) return { to: "followup", reason: `jev: routine ahead ${j.routine.toFixed(2)} after ${consecutiveNonWrite} non-write calls` };
-	if ((phase === "debug" || phase === "review") && j.stuck >= thr.stuck) return { to: "lead", reason: `jev: stuck ${j.stuck.toFixed(2)}` };
-	return undefined;
 }
 
 /** The helper prompt that rewrites the short summary text (one request outside the session context). */

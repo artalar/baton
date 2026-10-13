@@ -21,8 +21,10 @@ export interface SwitchConfig {
 	maxRedTotal: number;
 	/** Helper stretch wall-clock cap (Anthropic prompt cache TTL is 5 min). */
 	maxHelperMs: number;
-	/** Cap for an implement stretch (ms). 0 = no limit (default since 0.10.2); the lead cache is kept warm by keepalive. */
+	/** Cap for an implement stretch (ms). 0 = no time limit; the lead cache is kept warm by keepalive. */
 	maxImplementMs: number;
+	/** Helper tool calls in one implement stretch before handing back. 0 = no call cap. */
+	maxImplementCalls: number;
 	/** 0.11.1: hand the lead's <edit-intent> blocks to the helper. */
 	editIntents: boolean;
 	/** 0.12: the lead edits through the baton_edit tool (BATON_EDIT=tool, default in switch). */
@@ -49,14 +51,22 @@ export interface SwitchConfig {
 	};
 	/** 0.12.1: the lead reads through the baton_read tool. */
 	readTool: boolean;
-	/** 0.12.1: max baton_read calls per session (then the lead reads itself). */
+	/** Max baton_read calls per session (then the lead reads itself). */
 	maxReadTool: number;
+	/** Max baton_edit calls per session (then the lead edits itself). */
+	maxEditTool: number;
 	/** 0.11.1: after this many failed intents the lead edits itself. */
 	maxIntentFailures: number;
-	/** Replay the lead payload (max_tokens 1) when the lead was idle this long during a helper stretch (ms, 0 = off). */
+	/** Replay the lead payload (max_tokens 1, original thinking params) when the lead was idle this long during a helper stretch (ms, 0 = off). */
 	cacheKeepaliveMs: number;
 	/** Budget estimate per keepalive (USD; the aborted stream reports no usage). */
 	cacheKeepaliveCostUsd: number;
+	/** Lead-cache pings allowed in one helper stretch. */
+	cacheKeepaliveMax: number;
+	/** Paths the fs guard will revert in one call. Above this it refuses and hands back. 0 = do not revert. */
+	fsGuardMaxRevert: number;
+	/** Consecutive lead output-cap continuations before the harness stops re-prompting. */
+	maxLengthContinuations: number;
 	/** Tool-call caps per helper stretch. */
 	maxReadCalls: number;
 	maxFollowupCalls: number;
@@ -103,6 +113,7 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	maxRedTotal: 12,
 	maxHelperMs: 270_000,
 	maxImplementMs: 0,
+	maxImplementCalls: 60,
 	editIntents: true,
 	editTool: true,
 	spec: {
@@ -112,9 +123,13 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	},
 	readTool: true,
 	maxReadTool: 8,
+	maxEditTool: 12,
 	maxIntentFailures: 2,
 	cacheKeepaliveMs: 230_000,
 	cacheKeepaliveCostUsd: 0.06,
+	cacheKeepaliveMax: 5,
+	fsGuardMaxRevert: 50,
+	maxLengthContinuations: 3,
 	maxReadCalls: 30,
 	maxFollowupCalls: 12,
 	readTextChars: 300,
@@ -263,6 +278,8 @@ export interface SwitchMetrics {
 	guardBlocks: number;
 	/** Lead turns that hit the output cap (length) and were continued. */
 	lengthStops: number;
+	/** Consecutive length-stop continuations already issued. */
+	lengthContinuations?: number;
 }
 
 export interface SwitchState {
@@ -422,7 +439,7 @@ export function initialSwitchState(now: number): SwitchState {
 		flags: [],
 		helperTouched: [],
 		reverifyOpen: false,
-		metrics: { selfBaton: 0, selfBatonByTool: {}, reverifyRuns: 0, reverifyReads: 0, guardBlocks: 0, lengthStops: 0 },
+		metrics: { selfBaton: 0, selfBatonByTool: {}, reverifyRuns: 0, reverifyReads: 0, guardBlocks: 0, lengthStops: 0, lengthContinuations: 0 },
 		stubs: {},
 		clips: {},
 		switches: [],
@@ -651,9 +668,6 @@ export function guardCheck(c: Call, readFile: (p: string) => string | undefined 
 	return undefined;
 }
 
-/** Pure: the deterministic tool_call gate (0.8.1 rules; always runs first, independent of Jev). */
-export const gateCall = (...a: Parameters<typeof gateCallRules>) => gateCallRules(...a);
-
 /**
  * Pure: apply a Jev gate decision to a helper call that passed the deterministic rules. `block` → blocked and the
  * lead takes over after this turn; `allow_handoff` → the call runs, the lead takes over after this turn.
@@ -681,13 +695,12 @@ export function applyJevGate(s: SwitchState, c: Call, d: { action: "allow" | "al
 }
 
 /** Pure: the tool_call gate — deterministic rules only. */
-export function gateCallRules(s: SwitchState, c: Call, fileExists: (p: string) => boolean, readFile?: (p: string) => string | undefined): { block: true; reason: string } | undefined {
+export function gateCall(s: SwitchState, c: Call, fileExists: (p: string) => boolean, readFile?: (p: string) => string | undefined): { block: true; reason: string } | undefined {
 	if (!isHelper(s.phase)) return undefined;
 	if (s.phase === "spec") return specGate(s, c); // 0.13: not policed; 0.13.1: only the stop rules
 	if ((BATON_TOOLS as readonly string[]).includes(c.name)) return { block: true, reason: `${c.name} is for the lead model only.` };
-	// reading phases: edit tools are blocked up front (arm J2: Jev's "routine ahead" sent the helper to a
-	// follow-up, it started implementing, the fs guard reverted it and ended the stretch 5 times). Bash stays
-	// allowed (tests/builds/tsc are reading); the fs guard reverts real source changes made through bash.
+	// Reading phases block edit tools up front: a follow-up that starts implementing gets reverted by the
+	// fs guard and ends the stretch. Bash stays allowed (tests/builds/tsc); the fs guard reverts source edits.
 	if (s.phase === "read" || s.phase === "followup") {
 		if (c.name === "write" || c.name === "edit") {
 			s.stretchEditBlocks = (s.stretchEditBlocks ?? 0) + 1;
@@ -1193,6 +1206,7 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 		case "implement": {
 			if (s.wantLead) return to(s, inp, "lead", `implementation escalated: ${s.wantLead}`, cfg);
 			if (cfg.maxImplementMs > 0 && elapsed > cfg.maxImplementMs) return to(s, inp, "lead", `implement stretch > ${Math.round(cfg.maxImplementMs / 1000)} s — partial implementation, see diff`, cfg);
+			if (cfg.maxImplementCalls > 0 && s.stretchCalls >= cfg.maxImplementCalls) return to(s, inp, "lead", `implement call cap ${cfg.maxImplementCalls} reached — partial implementation, see diff`, cfg);
 			if (real.length) return { to: s.phase };
 			if (/ESCALATE/.test(text)) return to(s, inp, "lead", `helper escalated the implementation: ${text.slice(0, 300)}`, cfg);
 			// done: Baton runs the checks itself; red → the helper fixes (debug), green → the lead reviews the diff
@@ -1252,8 +1266,11 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 			s.lastLeadLength = !!inp.lengthStop;
 			if (inp.lengthStop && !real.length) {
 				s.metrics.lengthStops++;
+				s.metrics.lengthContinuations = (s.metrics.lengthContinuations ?? 0) + 1;
+				if (s.metrics.lengthContinuations > cfg.maxLengthContinuations) return { to: s.phase, reason: `output cap continuation limit ${cfg.maxLengthContinuations}` };
 				return { to: s.phase, reason: "lead hit the output cap", message: { audience: "lead", text: MSG.lengthStop }, continue: true };
 			}
+			if (!inp.lengthStop) s.metrics.lengthContinuations = 0;
 			// 0.12.1: baton_read tool call → the helper reads in this same session; outputs verbatim in the tool result
 			const br = cfg.readTool ? real.find((c) => c.name === "baton_read") : undefined;
 			if (br && !real.some((c) => c.name === "baton_edit")) {
@@ -1273,6 +1290,10 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 			const be = cfg.editTool ? real.find((c) => c.name === "baton_edit") : undefined;
 			if (be) {
 				s.editTool ??= { calls: 0, ok: 0, failed: 0 };
+				if (s.editTool.calls >= cfg.maxEditTool) {
+					s.stubs[be.id] = `baton_edit: limit of ${cfg.maxEditTool} calls reached — make this edit yourself with write/edit.`;
+					return { to: s.phase, reason: `baton_edit limit ${cfg.maxEditTool}` };
+				}
 				s.editTool.calls++;
 				s.implements++;
 				const request = String(be.args.request ?? "").trim() || text;
@@ -1390,12 +1411,19 @@ export function leadRequestPlan(s: Pick<SwitchState, "phase" | "planningLeft" | 
 	return { planning, capReasoning: !planning && cfg.thinkingCap > 0, maxTokens: capOut ? Math.min(cfg.leadMaxTokens, Math.max(cfg.nonWriteMaxTokens, cfg.thinkingCap + 2048)) : cfg.leadMaxTokens };
 }
 
+/** Lead model identity across a provider prefix (`openrouter/anthropic/x` and `anthropic/x`). */
+export function isLeadModel(model: string | undefined, leadRef: string | undefined): boolean {
+	if (!model || !leadRef) return false;
+	const strip = (s: string) => (s.startsWith("openrouter/") ? s.slice("openrouter/".length) : s);
+	return strip(model) === strip(leadRef);
+}
+
 /** Pure: estimated spend from per-model cost rows (lead exact, helper × factor). */
 export function budgetSpend(rows: Record<string, CostRow>, leadId: string, factor: number): { lead: number; helper: number; estimate: number } {
 	let lead = 0;
 	let helper = 0;
 	for (const r of Object.values(rows)) {
-		if (r.model.includes(leadId) || leadId.includes(r.model)) lead += r.cost;
+		if (isLeadModel(r.model, leadId)) lead += r.cost;
 		else helper += r.cost;
 	}
 	return { lead, helper, estimate: lead + helper * factor };
@@ -1440,7 +1468,7 @@ export function shapeContext<T extends Msg>(messages: readonly T[], s: Pick<Swit
 		if (forLead && m.role === "custom" && m.customType === "baton-switch-helper") continue;
 		// honest handoff: helper turns never reach the lead (neither raw nor disguised as the lead's own calls);
 		// the lead gets a "[Baton harness]" report inside its next instruction instead.
-		if (forLead && m.role === "assistant" && m.model && m.model !== leadModelId) {
+		if (forLead && m.role === "assistant" && m.model && !isLeadModel(String(m.model), leadModelId)) {
 			for (const b of (Array.isArray(m.content) ? m.content : []) as Block[]) if (b.type === "toolCall" && b.id) dropped.add(b.id);
 			continue;
 		}

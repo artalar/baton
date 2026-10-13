@@ -175,4 +175,3 @@ export async function decide(state: unknown, questions: JevQuestions, o: JevOpti
 /** Shorthand accessors (callers have validated answers). */
 export const noul = (a: JevAnswers, id: string): number => (a[id]?.type === "noul" ? (a[id] as { noul: number }).noul : 0);
 export const prob = (a: JevAnswers, id: string, choice: string): number => (a[id]?.type === "choice" ? ((a[id] as { probabilities: Record<string, number> }).probabilities[choice] ?? 0) : 0);
-export const choiceOf = (a: JevAnswers, id: string): string | undefined => (a[id]?.type === "choice" ? (a[id] as { choice: string }).choice : undefined);

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { cacheKey, decide, type JevAnswers, LruCache, validateAnswers } from "../src/core/jev.ts";
-import { buildState, buildSummary, CALL_QUESTIONS, callKind, callSummary, DEFAULT_JEV, gateFromAnswers, initialTrack, recentLine, recordCall, switchFromAnswers, TURN_QUESTIONS } from "../src/pi/jev-policy.ts";
+import { buildState, buildSummary, CALL_QUESTIONS, callKind, callSummary, DEFAULT_JEV, gateFromAnswers, initialTrack, recentLine, recordCall, TURN_QUESTIONS } from "../src/pi/jev-policy.ts";
 import { applyJevGate, type Call, DEFAULT_SWITCH, decideTurn, gateCall, guardCheck, initialSwitchState, type TurnInput } from "../src/pi/switch-core.ts";
 
 const thr = DEFAULT_JEV.thr;
@@ -70,6 +70,15 @@ describe("core/jev.ts client", () => {
 		expect(!r.ok && r.error).toContain("timeout 60 ms");
 		expect(Date.now() - t0).toBeLessThan(1000);
 	});
+	it("does not fetch when the abort signal is already aborted", async () => {
+		const f = vi.fn();
+		const ac = new AbortController();
+		ac.abort();
+		const r = await decide({ e: 1 }, CALL_QUESTIONS, { model: "m", timeoutMs: 800, signal: ac.signal }, { apiKey: KEY, fetch: f as never, cache: new LruCache() });
+		expect(r.ok).toBe(false);
+		expect(!r.ok && r.error).toBe("aborted");
+		expect(f).not.toHaveBeenCalled();
+	});
 	it("no key → error, no request", async () => {
 		const f = okFetch(ans());
 		const old = process.env.OPENROUTER_API_KEY;
@@ -103,13 +112,6 @@ describe("jev-policy: thresholds", () => {
 		[{}, "allow"],
 	] as const)("%o → %s", (o, action) => {
 		expect(gateFromAnswers(ans(o), thr).action).toBe(action);
-	});
-	it("turn-boundary switches", () => {
-		expect(switchFromAnswers({ routine: 0.6, stuck: 0 }, "lead", 2, thr)?.to).toBe("followup");
-		expect(switchFromAnswers({ routine: 0.9, stuck: 0 }, "lead", 1, thr)).toBeUndefined();
-		expect(switchFromAnswers({ routine: 0.59, stuck: 0 }, "lead", 5, thr)).toBeUndefined();
-		expect(switchFromAnswers({ routine: 0, stuck: 0.9 }, "debug", 0, thr)?.to).toBe("lead");
-		expect(switchFromAnswers({ routine: 0, stuck: 0.9 }, "lead", 0, thr)).toBeUndefined();
 	});
 });
 
