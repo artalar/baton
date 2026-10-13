@@ -21,7 +21,7 @@ export interface SwitchConfig {
 	maxRedTotal: number;
 	/** Helper stretch wall-clock cap (Anthropic prompt cache TTL is 5 min). */
 	maxHelperMs: number;
-	/** Cap for an implement stretch (ms); longer than maxHelperMs because the lead cache is kept warm. */
+	/** Cap for an implement stretch (ms). 0 = no limit (default since 0.10.2); the lead cache is kept warm by keepalive. */
 	maxImplementMs: number;
 	/** Replay the lead payload (max_tokens 1) when the lead was idle this long during a helper stretch (ms, 0 = off). */
 	cacheKeepaliveMs: number;
@@ -70,7 +70,7 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	redCycles: 6,
 	maxRedTotal: 12,
 	maxHelperMs: 270_000,
-	maxImplementMs: 480_000,
+	maxImplementMs: 0,
 	cacheKeepaliveMs: 230_000,
 	maxReadCalls: 30,
 	maxFollowupCalls: 12,
@@ -884,7 +884,7 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 		}
 		case "implement": {
 			if (s.wantLead) return to(s, inp, "lead", `implementation escalated: ${s.wantLead}`, cfg);
-			if (elapsed > cfg.maxImplementMs) return to(s, inp, "lead", `implement stretch > ${Math.round(cfg.maxImplementMs / 1000)} s — partial implementation, see diff`, cfg);
+			if (cfg.maxImplementMs > 0 && elapsed > cfg.maxImplementMs) return to(s, inp, "lead", `implement stretch > ${Math.round(cfg.maxImplementMs / 1000)} s — partial implementation, see diff`, cfg);
 			if (real.length) return { to: s.phase };
 			if (/ESCALATE/.test(text)) return to(s, inp, "lead", `helper escalated the implementation: ${text.slice(0, 300)}`, cfg);
 			// done: Baton runs the checks itself; red → the helper fixes (debug), green → the lead reviews the diff

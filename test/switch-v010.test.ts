@@ -85,6 +85,14 @@ describe("0.10 implement: GLM writes the files of the lead's spec", () => {
 		expect(s.wantLead).toBeUndefined();
 		expect(applyJevGate(s, c("w", "write", { path: "a.ts" }), { action: "block", reason: "jev: weakens_checks 0.9" })?.block).toBe(true);
 	});
+	it("0.10.2: implement stretch has no time limit by default; explicit maxImplementMs still caps it", () => {
+		expect(cfg.maxImplementMs).toBe(0);
+		const s = initialSwitchState(0);
+		s.phase = "implement";
+		const late = (): TurnInput => ({ ...turn({ calls: [c("e", "edit", { path: "a.ts" })] }), now: 3_600_000 });
+		expect(decideTurn(s, late(), cfg).to).toBe("implement");
+		expect(decideTurn(s, late(), { ...cfg, maxImplementMs: 60_000 }).to).toBe("lead");
+	});
 	it("lead prompt prescribes the split", () => {
 		expect(MSG.lead("x", "")).toMatch(/baton_delegate\(\{kind:"implement"/);
 	});

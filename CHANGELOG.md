@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.2
+
+- `maxImplementMs` now defaults to **0 = no time limit** on GLM implement stretches; a cap applies only when set explicitly. The lead cache stays warm via the 0.10.1 keepalive.
+
 ## 0.10.1
 
 - **Lead cache keepalive.** Arm I: a 270 s implement stretch let the Opus 5-min prompt cache expire (TTL counts from the lead's request *start*), and the next lead turn rewrote ~80k tokens for $0.41 — ~30 % of the run. During helper phases Baton now replays the last lead payload byte-identically with `max_tokens: 1` once the lead has been idle `cacheKeepaliveMs` (230 s): a cache read (~$0.04) instead of a rewrite. Journal event `cache_keepalive`; its cost counts toward the budget.
