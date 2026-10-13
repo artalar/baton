@@ -148,8 +148,8 @@ OpenRouter client does the same itself (`--no-cache` to disable).
 ## Development
 
 ```sh
-npm install
-npm run check      # tsc --noEmit + vitest
+bun install
+bun run check      # tsc --noEmit + vitest
 ```
 
 No test calls a paid model: transports are faked and the request shape is asserted.
