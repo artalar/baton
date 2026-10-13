@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.1
+
+**Edit intents (switch): the lead specifies, GLM edits**
+- **Lead system note.** Before changing any file, the lead states an `<edit-intent>` (`files:` / `change:` / `why:`) and ends its turn without tool calls.
+- **Hand-off.** Baton hands the intent to the helper as an implement spec ("one focused edit: only the listed files"). The usual path applies: guardrails, Jev's weakens/tampers block, the fs guard, then the Baton auto-check. Red goes to the helper's debug loop; on green, the lead gets the `[Baton harness] interruption summary` (files, definitions, compressed diff, checks). The helper's calls are never shown to the lead verbatim.
+- **Fallback.** If the helper escalates, or the checks are still red after the debug loop, the lead is told "make that edit yourself". Its next intent is not handed over, and it gets a "make the edit yourself now" nudge. After `maxIntentFailures` (2) failed intents, the lead edits itself for the rest of the session.
+- An intent stated together with the lead's own edits in the same turn is not handed over. `editIntents: false` turns the feature off.
+- **Offline estimate on the logs.** Opus wrote 3 / 7 / 2 files in J / J2 / I (17 / 30 / 20k characters, ≈5.4 / 9.5 / 6.2k tokens). Handing them over saves Opus output (≈$20/M versus GLM ≈$1.2/M, minus about 15 % for the intent text), the cache write of that code (×1.25) and its re-reads in later turns (only a summary of about 10 % remains). Estimate: **J ≈ $0.13 (≈15 % of $0.90), J2 ≈ $0.30 (≈17 % of $1.73), I ≈ $0.15 (≈11 % of $1.39)**. Not yet measured in a paid run.
+
 ## 0.11.0
 
 **Switch fs guard**

@@ -23,6 +23,10 @@ export interface SwitchConfig {
 	maxHelperMs: number;
 	/** Cap for an implement stretch (ms). 0 = no limit (default since 0.10.2); the lead cache is kept warm by keepalive. */
 	maxImplementMs: number;
+	/** 0.11.1: hand the lead's <edit-intent> blocks to the helper. */
+	editIntents: boolean;
+	/** 0.11.1: after this many failed intents the lead edits itself. */
+	maxIntentFailures: number;
 	/** Replay the lead payload (max_tokens 1) when the lead was idle this long during a helper stretch (ms, 0 = off). */
 	cacheKeepaliveMs: number;
 	/** Budget estimate per keepalive (USD; the aborted stream reports no usage). */
@@ -73,6 +77,8 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	maxRedTotal: 12,
 	maxHelperMs: 270_000,
 	maxImplementMs: 0,
+	editIntents: true,
+	maxIntentFailures: 2,
 	cacheKeepaliveMs: 230_000,
 	cacheKeepaliveCostUsd: 0.06,
 	maxReadCalls: 30,
@@ -291,6 +297,8 @@ export interface SwitchState {
 	readNudged: boolean;
 	/** 0.10: implement stretches delegated by the lead. */
 	implements: number;
+	/** 0.11.1 edit intents: handed to the helper / failed (the lead then edits itself). */
+	intents?: { handed: number; failed: number; fromIntent: boolean; selfNext: boolean };
 	/** 0.9: Jev rolling summary inputs (ring buffer of recent calls, counters, helper-written note). */
 	track: JevTrack;
 	jev: JevStats;
@@ -370,7 +378,14 @@ export const BATON_TOOLS = ["delegate_reads", "baton_delegate", "baton_optimize"
 export const LEAD_SYSTEM_NOTE = `
 
 # Baton harness
-This session runs under Baton: a cheaper helper model may perform some steps (reading, running checks and small fixes, final review); you will then see an honest "[Baton harness]" report of what it did. Available harness tools: baton_delegate({kind:"reads"|"implement"|"debug", instruction}) hands file reading, the implementation of a precise spec (it may create and edit files), or the verify/fix loop, to the helper; baton_optimize({}) drops superseded read outputs from your context (one cache rewrite). delegate_reads({instruction}) = baton_delegate kind "reads".`;
+This session runs under Baton: a cheaper helper model may perform some steps (reading, running checks and small fixes, final review); you will then see an honest "[Baton harness]" report of what it did. Available harness tools: baton_delegate({kind:"reads"|"implement"|"debug", instruction}) hands file reading, the implementation of a precise spec (it may create and edit files), or the verify/fix loop, to the helper; baton_optimize({}) drops superseded read outputs from your context (one cache rewrite). delegate_reads({instruction}) = baton_delegate kind "reads".
+Edit intents (to save budget): before you change any file, first state the edit as a short spec and end your turn WITHOUT tool calls:
+<edit-intent>
+files: <paths to create/change>
+change: <what exactly: exports, signatures, behaviour, tests>
+why: <one line>
+</edit-intent>
+Baton hands the intent to the helper, runs the checks and gives you an "[Baton harness] interruption summary" (files, definitions, compressed diff, check status). Edit files yourself only when Baton says the helper failed on that intent, or for a one-line fix.`;
 
 export const MSG = {
 	read: "[baton switch → helper: reading] You are the reader for the lead model, which will plan and write the code for the user's task above. Read, in full, everything it needs: the repository layout and package.json, EVERY SKILL.md and REFERENCE.md of the project skills (.agents/skills, .pi/skills, .claude/skills — read whole files, use offset/limit for long ones until the end), and any docs/examples of the APIs the task uses. Prefer the skills over node_modules sources: they match the installed versions. Your tool outputs are handed to the lead verbatim, so read the actual text — do not summarise. Use read/ls/grep/find/cat; any change to project files is detected and reverted. Do NOT write code, edit files or explain. Make at least 6 tool calls; when everything relevant is read, reply only: READ DONE.",
@@ -784,12 +799,34 @@ function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: Sw
 	if (next === "debug") s.red = { sig: "", same: 0, total: 0 };
 	if (next === "lead" && (from === "read" || from === "followup")) s.planningLeft = Math.max(s.planningLeft, cfg.planningTurns);
 	let message: Decision["message"];
+	const it = s.intents;
+	if (it?.fromIntent && next === "lead" && isHelper(from)) {
+		it.fromIntent = false;
+		if (!s.lastVerifyGreen) {
+			it.failed++;
+			it.selfNext = true;
+			reason = `${reason} — the helper did NOT finish your edit intent: make that edit yourself now (no new intent needed)`;
+		}
+	}
 	if (next === "lead") message = { audience: "lead", text: MSG.lead(reason, report) };
 	if (next === "debug") message = { audience: "helper", text: MSG.debug };
 	if (next === "implement") message = { audience: "helper", text: MSG.implement(inp.text) };
 	if (next === "review") message = { audience: "helper", text: MSG.review };
 	if (next === "final") message = { audience: "lead", text: MSG.final(report || `[Baton harness] Review notes: ${inp.text.slice(0, 1500)}`) };
 	return { to: next, reason, message, compacted, report: reportInfo, continue: inp.calls.length === 0 && next !== "done" };
+}
+
+/** Pure (0.11.1): the lead's `<edit-intent>…</edit-intent>` block, trimmed; undefined when absent or empty. */
+export function parseEditIntent(text: string): string | undefined {
+	const m = /<edit-intent>([\s\S]*?)(?:<\/edit-intent>|$)/i.exec(text);
+	const body = m?.[1]?.trim();
+	return body && body.length >= 10 ? body : undefined;
+}
+
+/** Pure (0.11.1): the file paths named on the intent's `files:` line. */
+export function intentFiles(intent: string): string[] {
+	const line = /^\s*files?\s*:\s*(.+)$/im.exec(intent)?.[1] ?? "";
+	return [...new Set(line.split(/[\s,;]+/).map((x) => x.replace(/[`'"()]/g, "")).filter((x) => /[\w-]+\.[\w]+$|\//.test(x)))];
 }
 
 /** Pure: the switch decision at a turn boundary. Mutates `s` (callers own it). */
@@ -961,6 +998,20 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 				s.metrics.lengthStops++;
 				return { to: s.phase, reason: "lead hit the output cap", message: { audience: "lead", text: MSG.lengthStop }, continue: true };
 			}
+			// 0.11.1: an edit intent without edits in the same turn → the helper performs it as a spec
+			s.intents ??= { handed: 0, failed: 0, fromIntent: false, selfNext: false };
+			if (wrote) s.intents.selfNext = false;
+			const intent = !wrote && cfg.editIntents ? parseEditIntent(text) : undefined;
+			if (intent && !s.intents.selfNext && s.intents.failed < cfg.maxIntentFailures && !real.some((c) => (BATON_TOOLS as readonly string[]).includes(c.name))) {
+				s.implements++;
+				s.intents.handed++;
+				s.intents.fromIntent = true;
+				const d = to(s, inp, "implement", `lead edit intent #${s.intents.handed} → helper edits (${intentFiles(intent).join(", ") || "files in the spec"})`, cfg);
+				d.message = { audience: "helper", text: MSG.implement(`${intent}\n\n(This is one focused edit: change only the files listed above.)`) };
+				d.continue = true;
+				return d;
+			}
+			if (intent && !real.length) return { to: s.phase, reason: "edit intent not handed over (helper failed before) — lead edits", message: { audience: "lead", text: "[Baton harness] The helper is not used for this edit (it failed on an earlier intent). Make the edit yourself now with write/edit." }, continue: true };
 			const impl = real.find((c) => c.name === "baton_delegate" && c.args.kind === "implement");
 			if (impl) {
 				s.implements++;
