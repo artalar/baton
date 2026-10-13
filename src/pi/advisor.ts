@@ -33,7 +33,7 @@ export async function callAdvisor(
 ): Promise<AdvisorResult> {
 	const ref = parseModelRef(modelRef);
 	const model = ref && ctx.modelRegistry.find(ref.provider, ref.id);
-	if (!model) return { ok: false, raw: "", errors: [`advisor model ${modelRef} not found in pi's model registry (check /model and baton.json)`], model: modelRef, attempts: 0 };
+	if (!model) return { ok: false, raw: "", errors: [`advisor model ${modelRef} not found in pi's model registry (check /model and baton.json)`], model: modelRef, attempts: 0, usages: [] };
 	const sessionId = uuidv7();
 	const complete: CompleteFn = async (msgs) => {
 		const res = await ctx.modelRegistry.complete(model, toPiContext(msgs) as any, { maxTokens: opts.maxTokens, signal: opts.signal, cacheRetention: opts.cache, sessionId });
