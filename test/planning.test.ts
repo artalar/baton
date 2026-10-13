@@ -2,15 +2,15 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG } from "../src/config.ts";
-import { renderPinned } from "../src/index.ts";
-import { isReferenceRead, maskMessages, pinPlan } from "../src/mask.ts";
-import { buildPack } from "../src/pack.ts";
-import { excludePathspec, packExcludes } from "../src/repo.ts";
-import { parseAdvisorReply } from "../src/schema.ts";
-import { discoverSkills, selectSkills, type SkillDoc } from "../src/skills.ts";
-import { callFacts, evaluate, initialTriggerState, onAdvisor, onToolResult, planGate } from "../src/triggers.ts";
-import { charsForTokens, estimateTokens, globToRegExp, matchesAny } from "../src/util.ts";
+import { DEFAULT_CONFIG } from "../src/pi/config.ts";
+import { renderPinned } from "../src/pi/index.ts";
+import { isReferenceRead, maskMessages, pinPlan } from "../src/pi/mask.ts";
+import { buildPack } from "../src/core/pack/index.ts";
+import { excludePathspec, packExcludes } from "../src/core/repo.ts";
+import { parseAdvisorReply } from "../src/core/schema.ts";
+import { discoverSkills, selectSkills, type SkillDoc } from "../src/core/skills.ts";
+import { callFacts, evaluate, initialTriggerState, onAdvisor, onToolResult, planGate } from "../src/pi/triggers.ts";
+import { charsForTokens, estimateTokens, globToRegExp, matchesAny } from "../src/core/util.ts";
 
 const cfg = DEFAULT_CONFIG.triggers;
 
@@ -48,7 +48,7 @@ describe("pack excludes", () => {
 });
 
 describe("reference reads are never masked", () => {
-	const globs = DEFAULT_CONFIG.mask.neverMaskPaths;
+	const globs = DEFAULT_CONFIG.compact.neverMaskPaths;
 	it("detects read tool and simple bash reads of skills/docs", () => {
 		expect(isReferenceRead("read", { path: ".agents/skills/reatom/SKILL.md" }, "/p", globs)).toBe(true);
 		expect(isReferenceRead("read", { path: "/p/AGENTS.md" }, "/p", globs)).toBe(true);
@@ -68,7 +68,7 @@ describe("reference reads are never masked", () => {
 			{ role: "assistant", content: [{ type: "text", text: "ok" }] },
 		];
 		const base = { enabled: true, exemptTools: [], dedupReads: true, staleReads: true, cwd: "/p" };
-		const on = maskMessages(msgs, () => undefined, { ...base, neverMaskPaths: DEFAULT_CONFIG.mask.neverMaskPaths }).messages;
+		const on = maskMessages(msgs, () => undefined, { ...base, neverMaskPaths: DEFAULT_CONFIG.compact.neverMaskPaths }).messages;
 		expect(JSON.stringify(on[2])).toContain("rule rule");
 		expect(JSON.stringify(on[3])).toContain("baton: output masked");
 		const off = maskMessages(msgs, () => undefined, { ...base, neverMaskPaths: [] }).messages;
@@ -132,7 +132,7 @@ describe("advisor pack framing", () => {
 		);
 		expect(p.text).toContain("junior executor");
 		expect(p.text).toContain("You have NO tools");
-		expect(p.text).toContain("do not ask for files");
+		expect(p.text).toContain("Do not ask for files");
 		expect(p.text).toContain("EXECUTOR CLAIMS (unverified)\nall done, tests pass");
 		expect(p.text).toContain("PINNED PLAN (review against it)");
 		const iSkills = p.text.indexOf("PROJECT SKILLS");

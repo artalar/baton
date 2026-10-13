@@ -1,6 +1,6 @@
-import { type JournalEvent, eventLine } from "./journal.ts";
-import { REPLY_SCHEMA_TEXT } from "./schema.ts";
-import { charsForTokens, clip, estimateTokens } from "./util.ts";
+import { type JournalEvent, eventLine } from "../journal.ts";
+import { REPLY_SCHEMA_TEXT } from "../schema.ts";
+import { charsForTokens, clip, estimateTokens } from "../util.ts";
 
 export type AdvisorKind = "review" | "help" | "plan";
 
@@ -37,6 +37,8 @@ export interface PackInput {
 	previousPlan?: string;
 	/** Deferred (loop-detected) items the reviewer must rule on. */
 	deferred?: string;
+	/** Executor's own claims about its work (always presented as unverified). */
+	claims?: string[];
 }
 
 export interface Section {
@@ -44,6 +46,8 @@ export interface Section {
 	body: string;
 	/** 0 = never cut; higher = cut first. */
 	cut: number;
+	/** Part of the stable, cacheable prefix (role, project skills, AGENTS.md). */
+	stable?: boolean;
 }
 
 export interface Pack {
@@ -55,10 +59,10 @@ export interface Pack {
 }
 
 const NO_TOOLS =
-	"You have NO tools: you cannot read files, list directories or run commands, and nobody will answer follow-up questions. Everything you need is in this message; do not ask for files. If something you would need is missing, say so in `assessment` and lower your confidence instead of guessing.";
+	"You have NO tools and everything you need is below: you cannot read files, list directories or run commands, and nobody will answer follow-up questions. Do not ask for files. If something you would need is missing, say so in `assessment` and lower your confidence instead of guessing.";
 
 const ROLE: Record<AdvisorKind, string> = {
-	review: `You are a senior reviewer. The work below was produced by a junior executor (a different, cheaper model). Review it as a third party: you did not write it, and every claim the executor makes is unverified. Judge only the artefacts (diff, files, test output) against the task, the user's prompts, the pinned plan and the project skill rules. ${NO_TOOLS}`,
+	review: `You are a senior reviewer. Below is a junior's work: it was produced by a junior executor (a different, cheaper model). Review the junior's work as a third party: you did not write it, and every claim the executor makes is unverified. Judge only the artefacts (diff, files, test output) against the task, the user's prompts, the pinned plan and the project skill rules. ${NO_TOOLS}`,
 	help: `You are a senior debugging advisor. A junior executor (a different, cheaper model) is stuck. Below are its last tool calls verbatim, repeated errors, and its own hypothesis and attempts (unverified). Find the real cause, correct wrong beliefs, and give a short concrete plan. ${NO_TOOLS}`,
 	plan: `You are a senior architect. A junior executor (a different, cheaper model) will implement the task below and has explored the repository. Using the project skill rules, the repository map and its findings, produce a short concrete plan with checkable done criteria, the architecture invariants it must keep and the skill rules it must follow. ${NO_TOOLS}`,
 };
@@ -87,19 +91,22 @@ function fmtCall(c: VerbatimCall): string {
  */
 export function packSections(i: PackInput): Section[] {
 	const s: Section[] = [];
-	s.push({ title: "ROLE", cut: 0, body: ROLE[i.kind] });
+	// 1. stable, cacheable prefix: role -> project skills -> AGENTS.md
+	s.push({ title: "ROLE", cut: 0, stable: true, body: ROLE[i.kind] });
 	if (i.skills?.length)
 		s.push({
 			title: "PROJECT SKILLS (rules to check against)",
 			cut: 3,
+			stable: true,
 			body: i.skills.map((k) => `<skill name="${k.name}" path="${k.path}">\n${k.body}\n</skill>`).join("\n\n"),
 		});
-	if (i.agentsMd) s.push({ title: "PROJECT RULES (AGENTS.md)", cut: 3, body: i.agentsMd });
+	if (i.agentsMd) s.push({ title: "PROJECT RULES (AGENTS.md)", cut: 3, stable: true, body: i.agentsMd });
+	// 2. plan (the contract), 3. task
 	if (i.previousPlan) s.push({ title: i.kind === "review" ? "PINNED PLAN (review against it)" : "PREVIOUS ADVISOR PLAN", cut: 3, body: i.previousPlan });
 	s.push({ title: "TASK (verbatim)", cut: 0, body: i.task || "(no task captured)" });
 	if (i.userPrompts.length)
 		s.push({ title: "USER PROMPTS (verbatim)", cut: 0, body: i.userPrompts.map((p) => `${p.evt ? `[evt#${p.evt}] ` : ""}${p.text}`).join("\n\n") });
-
+	// 4. artefacts (long data)
 	if (i.kind === "plan" && i.repoMap) s.push({ title: "REPO MAP", cut: 4, body: i.repoMap });
 	if (i.diffStat) s.push({ title: "GIT DIFF --stat", cut: 0, body: i.diffStat });
 	if (i.kind === "review") {
@@ -113,13 +120,17 @@ export function packSections(i: PackInput): Section[] {
 		if (i.important?.length) s.push({ title: "EVENTS MARKED IMPORTANT BY EXECUTOR", cut: 2, body: i.important.map(fmtCall).join("\n\n") });
 	}
 	if (i.timeline?.length) s.push({ title: i.kind === "plan" ? "EXPLORATION FINDINGS (journal)" : "TIMELINE (importance ≥2)", cut: 3, body: i.timeline.map(eventLine).join("\n") });
+	if (i.deferred)
+		s.push({ title: "DEFERRED ITEMS (Baton loop detector; rule on each in deferred_rulings: unblock with guidance, drop, or keep)", cut: 0, body: i.deferred });
+	// 5. executor claims, always unverified
 	if (i.kind === "help") {
 		if (i.hypothesis) s.push({ title: "EXECUTOR HYPOTHESIS (unverified)", cut: 0, body: i.hypothesis });
 		if (i.attempts?.length) s.push({ title: "EXECUTOR ATTEMPTS (unverified)", cut: 0, body: i.attempts.map((a) => `- ${a}`).join("\n") });
 	}
-	if (i.deferred)
-		s.push({ title: "DEFERRED ITEMS (Baton loop detector; rule on each in deferred_rulings: unblock with guidance, drop, or keep)", cut: 0, body: i.deferred });
-	if (i.question) s.push({ title: i.kind === "review" ? "EXECUTOR CLAIMS (unverified)" : "QUESTION FROM EXECUTOR", cut: 0, body: i.question });
+	const claims = [...(i.claims ?? []), ...(i.kind === "review" && i.question ? [i.question] : [])];
+	if (claims.length) s.push({ title: "EXECUTOR CLAIMS (unverified)", cut: 0, body: claims.length === 1 ? claims[0]! : claims.map((c) => `- ${c}`).join("\n") });
+	if (i.question && i.kind !== "review") s.push({ title: "QUESTION FROM EXECUTOR", cut: 0, body: i.question });
+	// 6. instructions + schema last
 	s.push({
 		title: "INSTRUCTIONS",
 		cut: 0,
@@ -146,16 +157,3 @@ export function fitSections(sections: Section[], budgetTokens: number): { sectio
 	return { sections: out, clipped };
 }
 
-export function buildPack(input: PackInput, budgetTokens: number): Pack {
-	const { sections, clipped } = fitSections(packSections(input), budgetTokens);
-	const body = sections.map((x) => `## ${x.title}\n${x.body}`).join("\n\n");
-	const text = `<baton_pack v="2" kind="${input.kind}"${input.reason ? ` reason="${input.reason}"` : ""}>\n${body}\n</baton_pack>`;
-	const tokens = estimateTokens(text);
-	return {
-		kind: input.kind,
-		text,
-		tokens,
-		sections: sections.map((x) => ({ title: x.title, tokens: estimateTokens(x.body), clipped: clipped.has(x.title) })),
-		overBudget: tokens > budgetTokens,
-	};
-}

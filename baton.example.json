@@ -1,14 +1,11 @@
 {
-  "executor": "openrouter/z-ai/glm-5.3-flash",
-  "advisor": "openrouter/anthropic/claude-opus-5.5",
-  "advisorMaxTokens": 8192,
-  "judge": {
-    "enabled": false,
-    "model": "typesafe/jev-latest",
-    "minConfidence": 0.7
+  "advisor": {
+    "model": "openrouter/anthropic/claude-opus-5.5",
+    "maxTokens": 8192,
+    "cache": "short"
   },
-  "packBudgetTokens": 40000,
   "pack": {
+    "budgetTokens": 40000,
     "excludePaths": [
       ".pi/baton/**",
       "**/node_modules/**",
@@ -37,7 +34,15 @@
         "skills"
       ]
     },
-    "pinPlan": true
+    "pinPlan": true,
+    "helpLastCalls": 8
+  },
+  "review": {
+    "enabled": true,
+    "minDiffLines": 80,
+    "minCalls": 15,
+    "helpMinCalls": 5,
+    "finalizeAfterDone": true
   },
   "triggers": {
     "contextRatio": 0.6,
@@ -50,21 +55,13 @@
     "planBeforeWrite": true,
     "driftCalls": 20
   },
-  "review": {
-    "enabled": true,
-    "minDiffLines": 80,
-    "minCalls": 15,
-    "helpMinCalls": 5,
-    "finalizeAfterDone": true
-  },
   "loop": {
     "enabled": true,
     "windowCalls": 30,
     "maxHops": 6,
     "hopGapCalls": 30,
     "readRepeatThreshold": 8,
-    "cutContext": true,
-    "forceHandoff": true,
+    "action": "help",
     "blockDeferredEdits": true,
     "ignoreReadPaths": [
       "**/node_modules/**",
@@ -77,17 +74,16 @@
       "docs/**"
     ]
   },
-  "mask": {
-    "enabled": true,
-    "mode": "handoff",
+  "compact": {
+    "enabled": false,
+    "keepTurns": 2,
+    "keepCalls": 2,
     "exemptTools": [
       "baton_review",
       "baton_help",
       "baton_plan",
       "baton_step"
     ],
-    "dedupReads": true,
-    "staleReads": true,
     "neverMaskPaths": [
       "**/SKILL.md",
       ".agents/skills/**",
@@ -99,15 +95,8 @@
       "**/README.md",
       "**/REFERENCE.md",
       "docs/**/*.md"
-    ]
+    ],
+    "replaceAutoCompact": true
   },
-  "help": {
-    "lastCalls": 8
-  },
-  "reset": {
-    "keepTurns": 2,
-    "keepCalls": 2
-  },
-  "replaceAutoCompact": true,
   "journalDir": ".pi/baton"
 }

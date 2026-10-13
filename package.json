@@ -1,15 +1,16 @@
 {
   "name": "pi-baton",
-  "version": "0.5.0",
-  "description": "Baton: journal, handoff-only compaction, advisor (review/help/plan) and safety triggers for the pi coding agent",
+  "version": "0.6.0",
+  "description": "Baton: an efficient review agent for pi \u2014 prepares a tool-less, cache-friendly review pack (diff, files, tests, project skills, pinned plan, unverified claims) for an expensive advisor model",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi",
     "pi-extension",
-    "compaction",
-    "context",
-    "advisor"
+    "review",
+    "code-review",
+    "advisor",
+    "context"
   ],
   "license": "MIT",
   "author": "artalar",
@@ -19,6 +20,7 @@
   },
   "files": [
     "src",
+    "bin",
     "skills",
     "prompts",
     "README.md",
@@ -28,7 +30,7 @@
   ],
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./src/pi/index.ts"
     ],
     "skills": [
       "./skills"
@@ -57,5 +59,22 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "bin": {
+    "baton-pack": "./bin/baton-pack.mjs",
+    "baton-review": "./bin/baton-review.mjs"
+  },
+  "exports": {
+    ".": "./src/core/index.ts",
+    "./core": "./src/core/index.ts",
+    "./pi": "./src/pi/index.ts"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    }
   }
 }

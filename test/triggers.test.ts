@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG } from "../src/config.ts";
-import { commitGate, evaluate, initialTriggerState, isGitCommit, onAdvisor, onToolResult, type TriggerState } from "../src/triggers.ts";
+import { DEFAULT_CONFIG } from "../src/pi/config.ts";
+import { commitGate, evaluate, initialTriggerState, isGitCommit, onAdvisor, onToolResult, type TriggerState } from "../src/pi/triggers.ts";
 
 const cfg = DEFAULT_CONFIG.triggers;
 const run = (s: TriggerState, n: number, sig: string | null = null) => {

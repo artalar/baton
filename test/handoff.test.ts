@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG } from "../src/config.ts";
-import type { JournalEvent } from "../src/journal.ts";
-import { cutLoops, type DeferredItem } from "../src/loop.ts";
-import { applyHandoff, handoffSnapshot, type MsgLike } from "../src/mask.ts";
-import { pickFirstKeptForCalls } from "../src/reset.ts";
+import { DEFAULT_CONFIG } from "../src/pi/config.ts";
+import type { JournalEvent } from "../src/core/journal.ts";
+import { cutLoops, type DeferredItem } from "../src/pi/loop.ts";
+import { applyHandoff, handoffSnapshot, type MsgLike } from "../src/pi/mask.ts";
+import { pickFirstKeptForCalls } from "../src/pi/reset.ts";
 
 const big = (t: string) => `${t}:${"x".repeat(2000)}`;
 const call = (id: string, name: string, args: object): MsgLike => ({ role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] });
 const res = (id: string, name: string, text = big(id)): MsgLike => ({ role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text }] });
 const ev = (evt: number, tool: string): JournalEvent => ({ evt, ts: "", turn: 0, kind: "tool_call", tool, argsDigest: "a", exit: 0, outTokens: 500 });
-const opts = { ...DEFAULT_CONFIG.mask, cwd: "/r" };
+const opts = { enabled: true, exemptTools: DEFAULT_CONFIG.compact.exemptTools, neverMaskPaths: DEFAULT_CONFIG.compact.neverMaskPaths, dedupReads: false, staleReads: false, cwd: "/r" };
 const lookup = (id: string) => ev(Number(id.slice(1)), "read");
 const text = (m: MsgLike) => (m.content as { text: string }[])[0]!.text;
 
@@ -19,10 +19,10 @@ function request(msgs: MsgLike[], snap: ReturnType<typeof handoffSnapshot> | und
 	return snap?.cut.length ? cutLoops(m, snap.cut).messages : m;
 }
 
-describe("handoff-only compaction", () => {
-	it("is the default mode", () => {
-		expect(DEFAULT_CONFIG.mask.mode).toBe("handoff");
-		expect(DEFAULT_CONFIG.loop.forceHandoff).toBe(true);
+describe("handoff compaction (compact.enabled)", () => {
+	it("is optional and off by default; the loop detector forces baton_help", () => {
+		expect(DEFAULT_CONFIG.compact.enabled).toBe(false);
+		expect(DEFAULT_CONFIG.loop.action).toBe("help");
 	});
 
 	it("leaves the context untouched between handoffs, compacts it after one, then freezes it", () => {

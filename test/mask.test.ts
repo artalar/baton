@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { JournalEvent } from "../src/journal.ts";
-import { maskMessages, type MsgLike } from "../src/mask.ts";
+import type { JournalEvent } from "../src/core/journal.ts";
+import { maskMessages, type MsgLike } from "../src/pi/mask.ts";
 
 const big = "x".repeat(2000);
 const call = (id: string, name: string, args: object): MsgLike => ({ role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] });

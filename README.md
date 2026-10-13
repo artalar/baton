@@ -1,108 +1,158 @@
-# Baton
+# Baton — an efficient review agent
 
-A [pi](https://github.com/earendil-works/pi) extension that lets a cheap executor model (default GLM-5.3-Flash) do the work, and calls a strong advisor model (default Claude Opus 5.5) only at the moments that matter: to plan, to get unstuck, and to review before a commit. It keeps the executor's context small with a deterministic tool journal and output masking.
+Baton makes running an **expensive reviewer** (e.g. Claude Opus) over a cheap executor's work (e.g. GLM)
+much more effective than a plain "review subagent". The difference is context preparation: instead of
+letting the reviewer spend tokens (and turns) exploring the repo with tools, Baton hands it **one
+prepared, tool-less pack** with exactly what a review needs, ordered for long-context accuracy and
+prompt caching:
 
-## What it does
-
-- **Journal.** Every tool call is written to `.pi/baton/events.jsonl`. Each record has `evt#`, `ts`, `tool`, an args digest (write/edit bodies are hashed, not stored), the exit code, the head and tail of the output, an error signature, files read and written, a test summary, and a `rawRef` to the full output in `.pi/baton/raw/<evt>.txt`.
-- **Compaction only at handoffs** (`mask.mode: "handoff"`, default). Between advisor calls the executor's context is **never rewritten**: no masking, no duplicate/stale read removal, no loop cuts. Compaction happens only at a handoff, i.e. a `baton_review`/`baton_help`/`baton_plan` call or an automatic one (loop detector, context pressure, pi auto-compaction). After the advisor answers, Baton freezes a snapshot: the context becomes system prompt + task + pinned plan (with deferred items) + advisor reply + the last N tool calls verbatim (`help.lastCalls` = 8 for help, `reset.keepCalls` = 2 for review/plan); older tool outputs become stubs such as `[baton: output masked. evt#12 bash command=npm test → exit 1, 830 tok …]`, recallable with `baton_recall({evt})`. That view is applied unchanged to every request until the next handoff, so everything since the handoff stays verbatim and the request prefix is stable. Reads of skills and reference docs (`mask.neverMaskPaths`) are never stubbed. The session file itself stays complete. The legacy per-request masking of v0.3 (dedup, stale reads, answered outputs) is still available as `mask.mode: "continuous"`.
-- **Advisor tools.** Each one builds a pack (≈40k token budget, estimated conservatively as chars/2.4 with non-ASCII counted twice, calibrated on real Opus usage), calls the advisor once with prompt caching disabled, and validates the JSON reply against a schema (`verdict`, `facts_corrected`, `plan[]` steps with `done_when`, `do_not_retry`, `test_cmd`). An invalid reply gets one retry.
-  - The advisor has **no tools**. Every pack says so explicitly ("everything you need is below; do not ask for files") and presents the executor's work in the third person, as a junior's work to check, never as the advisor's own turns. Executor statements are labelled unverified.
-  - Packs are ordered for long context: role, project skills, `AGENTS.md`, pinned plan, task and prompts, artefacts, executor claims, and the instructions plus reply schema last.
-  - **Project skills in packs.** Baton discovers `SKILL.md` files in `.agents/skills`, `.pi/skills`, `.claude/skills` and `skills`, scores them against the task, prompts, diff and changed files (sibling skills of a strongly matching family are included too, review skills are preferred for reviews), and includes up to 4 of them within 35% of the pack budget. The largest one is clipped first.
-  - **Pack diff excludes.** The journal dir, `.pi/baton`, `node_modules`, `dist` and lockfiles are always excluded from the diff and changed files, regardless of `.gitignore` (`pack.excludePaths`).
-  - `baton_review`: the executor's narrative is excluded. The pack holds the task, the user prompts verbatim, the relevant skills, the pinned plan (the review checks done criteria, invariants and skill rules against it), `git diff`, the changed files and the last test run. A review that returns steps becomes the new pinned plan.
-  - `baton_help`: the pack holds the last N (default 8) tool calls verbatim, earlier calls with the same error signature, the executor's hypothesis and attempts, and the evt#s it marked as important.
-  - `baton_plan`: the pack holds the task, the relevant skills, `AGENTS.md`, a repo map and the exploration findings from the journal. The reply adds `invariants` (architecture decisions), `rules` (skill rules to follow) and `checkpoints` (steps after which to call review).
-  - **Pinned plan.** The latest plan, with progress marks, is appended to the first user message of every request (a stable position, so it never gets masked and the executor's prompt cache only breaks when the plan changes). `baton_step({id, status, evidence})` marks steps; finishing a checkpoint step asks for `baton_review`.
-  - After every advisor call (handoff mode; in continuous mode only help and plan), the executor's context is **reset** to task + plan + deferred items + the last turns and kept calls. Baton does this by appending a `compaction` entry at `turn_end` and applying the handoff snapshot in the `context` event.
-- **Safety triggers.** These are deterministic `Baton:` nudge messages:
-  - context ≥60% → a forced handoff: automatic `baton_review` + reset (handoff mode; a nudge in continuous mode);
-  - the same error signature 3×;
-  - exploration done without a plan (8 read-only calls) → call `baton_plan`; the first `write`/`edit` without a plan is blocked **once** (retrying passes);
-  - the first milestone after edits (tests green or a build/typecheck exits 0) → early `baton_review`;
-  - 20 tool calls without `baton_step` while a plan is pinned (drift);
-  - a reminder after 12 tool calls without an advisor call;
-  - a cooldown between nudges.
-- **Loop detector.** This is deterministic and needs no LLM. It fires after 6 hops on the same failing test or build error, where one hop is edit/write → run (test/build) → the same failure again. It also fires on the same file re-read 8× without a write within 30 calls. It does not cut the context on the fly: it forces a handoff (an automatic `baton_help` at the end of the turn, with the loop as the reason, `loop.forceHandoff`), and that handoff's compaction cuts the looping calls and replaces them with one `⚠ Loop detected … DEFERRED` note. The advisor reply arrives as a `baton-handoff` message. The item is added to the deferred list, which is pinned and journaled. Edits of its failing test file are soft-blocked. `baton_review` sees the deferred items and rules on them (`deferred_rulings`: unblock with guidance, drop, or keep). The user can unblock or drop them with `/baton unblock D1 [guidance]` or `/baton drop D1`. The executor can defer a step itself with `baton_step` status `deferred`. Calibration on the C v2 transcript (509 calls): the first fire is at call 324 with 8 hops, 21 calls after the first failure of the lock-delay test. Before that loop the hop count never exceeded 1.
-  - `git commit` is **blocked** until `baton_review` returns `on_track` or `done`. New edits revoke the pass (except in finalize mode, and except when the review's fixes were all `verify: self` and are done).
-- **Review gating** (v0.5, config `review`). Stops review ping-pong (experiment C4: the advisor returned 3-4 tiny steps, the executor did one in 7-13 s and called `baton_review` again; 8 handoffs, ~3 useful). A self-invoked `baton_review` is refused with a short message unless all review-verified steps of the previous review are closed (`baton_step` done/deferred), or `review.minCalls` (15) executor tool calls or `review.minDiffLines` (80) changed lines (`git diff --numstat` between a `git stash create` snapshot taken at the review and now, tracked files) accumulated. Each advisor step has `verify: "self" | "review"`; the advisor is told to prefer `self` for small/mechanical fixes and to batch all fixes into one reply. `self` steps do not count toward requiring or permitting a review; if a review issued only `self` steps, closing them permits `git commit`. After verdict `done` Baton enters **finalize mode**: the first edit/write or non-verification bash is blocked once with "commit now", `baton_review` is refused until a successful `git commit` or a new user message, and the commit gate does not apply. `baton_help` stays available but is refused within `review.helpMinCalls` (5) calls of an advisor reply. Forced handoffs (loop, context pressure, auto-compaction) bypass the gate. In the C4 replay reviews #5, #6 and #8 would be refused (5 of 8 handoffs pass).
-- **Auto-compaction.** pi's threshold and overflow compaction is routed through a handoff: Baton runs an automatic `baton_review` and compacts to task + prompts + the new plan (falling back to a deterministic summary with the last plan and timeline if the advisor fails). In continuous mode the deterministic, no-LLM summary is used. `replaceAutoCompact: false` leaves pi's own compaction.
-- **Optional judge** (off by default). A Jev-format classifier (`typesafe/jev-latest` via pi's `modelRegistry.classify`) decides include/drop only for medium-importance events in the help pack. Heuristics are the fallback.
-- **Skill** `baton` and prompt `/baton-plan` tell the executor when to call which tool. The same guidance goes into the system prompt as tool guidelines. Commands: `/baton` (status), `/baton reset`, `/baton unblock <D1|all> [guidance]` and `/baton drop <D1|all>`.
-
-## Install
-
-Requires pi ≥ 1.2 (`@earendil-works/pi-coding-agent`) and Node ≥ 22.
-
-```bash
-pi install git:github.com/artalar/baton          # from GitHub
-pi install git:github.com/artalar/baton@v0.1.0   # pinned
-pi -e ./src/index.ts                             # one-off local run from a clone
-pi install ./baton                               # local path install
+```
+system (stable, cacheable)   ROLE: "below is a junior's work… you have no tools, everything is below"
+                             PROJECT SKILLS (relevant SKILL.md, selected by score within a budget)
+                             PROJECT RULES (AGENTS.md / CLAUDE.md)
+user (per call)              PINNED PLAN (the contract the work is checked against)
+                             TASK + USER PROMPTS (verbatim)
+                             ARTEFACTS: diff --stat, changed files, git diff, last test run (verbatim),
+                                        timeline / last calls (help), repo map (plan), deferred loop items
+                             EXECUTOR CLAIMS (unverified)
+                             INSTRUCTIONS + JSON reply schema (last)
 ```
 
-## Config
+Why it is cheaper and better than a review subagent:
 
-Baton reads `~/.pi/agent/baton.json` (honours `PI_CODING_AGENT_DIR`) and then the project `.pi/baton.json`; later files override earlier ones. Both files hold **model ids only**. Keys come from pi itself (`/login`, `~/.pi/agent/auth.json`, or env such as `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `TYPESAFE_API_KEY`). Keys that look like secrets (`apiKey`, `token`, …) are ignored. Do not use a `.env` file.
+- **One call, no tool loop.** The reviewer cannot read files, so it does not burn turns; the pack is built
+  deterministically from git and the journal (no LLM in the preparation path).
+- **Third-person, evidence-only framing.** The executor's narrative is not shown; its claims are labelled
+  unverified and must be confirmed by quoting the diff/test output.
+- **Project skills as review rules.** The relevant `SKILL.md` files become the checklist; non-idiomatic code
+  is flagged against them.
+- **Prompt caching.** Role + skills + AGENTS.md are a byte-identical prefix across calls of the same kind,
+  marked with Anthropic `cache_control` when the advisor is `anthropic/*` on OpenRouter.
+- **Budgeted.** A conservative token estimate (chars/2.4, non-ASCII ×2) clips the most cuttable sections first
+  (repo map → changed files → skills/plan/timeline → diff → test output); task, claims and instructions are never cut.
+- **Structured reply.** Validated JSON (`verdict`, `facts_corrected`, `plan` with `done_when` and
+  `verify: self|review`, `do_not_retry`, …), one retry on invalid/cut-off JSON.
 
-See [`baton.example.json`](baton.example.json) for all options with their defaults. The most important ones:
+Baton ships as a **pi-independent core** (library + CLI) and a **thin pi extension**.
 
-| Option | Default |
+## Architecture
+
+```
+src/core/                 no pi imports (only node + typebox)
+  pack/sections.ts        PackInput → ordered sections, budget fitting (fitSections)
+  pack/index.ts           buildReviewPack(input) → { messages, sections, tokens, stableTokens }; buildPack (single text)
+  pack/collect.ts         collectPackInput({kind, cwd, task, plan, claims, journal?, …}): git diff, changed files,
+                          last test, skills selection, AGENTS.md, repo map, help context from a journal
+  advisor.ts              runAdvisor(model, messages, complete): validation + one retry, transport-agnostic
+  openrouter.ts           OpenRouter transport (OPENROUTER_API_KEY), cache_control on the stable prefix
+  journal.ts repo.ts skills.ts schema.ts util.ts
+src/cli/                  baton-pack, baton-review
+src/pi/                   the pi extension (thin layer)
+  index.ts                tools baton_review / baton_plan / baton_help / baton_step / baton_recall, /baton command
+  advisor.ts              pi transport: modelRegistry.complete with systemPrompt = cacheable prefix
+  gate.ts triggers.ts     review gating, finalize mode, plan/commit gates, nudges
+  loop.ts                 deterministic stuck-loop detector
+  mask.ts reset.ts        OPTIONAL handoff compaction (compact.enabled)
+  config.ts
+```
+
+## Library API
+
+```ts
+import { collectPackInput, buildReviewPack, runAdvisor, openRouterComplete } from "pi-baton";
+
+const input = await collectPackInput({
+  kind: "review",                 // "review" | "help" | "plan"
+  cwd: "/path/to/repo",
+  task: "Add a pause button to the game",
+  plan: pinnedPlanText,           // optional: the contract to review against
+  claims: ["all tests pass"],     // shown as unverified
+});
+const pack = buildReviewPack(input, { budgetTokens: 40_000 });
+// pack.messages = [{ role: "system", content, cache: true }, { role: "user", content }]
+
+const res = await runAdvisor("anthropic/claude-opus-5.5", pack.messages,
+  openRouterComplete({ model: "anthropic/claude-opus-5.5", maxTokens: 8192 }));
+if (res.ok) console.log(res.reply.verdict, res.reply.plan);
+```
+
+You can also fill `PackInput` yourself (diff, files, test output from your own tooling) and call
+`buildReviewPack` directly; `runAdvisor` accepts any `complete(messages)` transport.
+
+## CLI
+
+Node ≥ 22.6 (runs the TypeScript sources directly).
+
+```sh
+# print the pack for the working tree of a repo — no LLM call
+baton-pack --cwd ./my-repo "Add a pause button"            # human-readable, token estimate on stderr
+baton-pack --kind plan --json --task-file TASK.md
+baton-pack --plan PLAN.md --claim "tests pass" "Add a pause button"
+
+# call the advisor via OpenRouter (key from env OPENROUTER_API_KEY only; never put it in config)
+baton-review --model anthropic/claude-opus-5.5 --cwd ./my-repo "Add a pause button"
+baton-review --json --no-cache --max-tokens 4096 "…"
+```
+
+Options: `--cwd DIR`, `--kind review|help|plan` (default review), `--plan FILE`, `--claim TEXT` (repeatable),
+`--task-file FILE`, `--budget N` (pack tokens, default 40000), `--json`; `baton-review` adds `--model`,
+`--max-tokens`, `--no-cache`.
+
+## pi extension
+
+```sh
+pi install npm:pi-baton      # or: pi -e ./src/pi/index.ts
+```
+
+Tools for the executor:
+
+| Tool | What it does |
 |---|---|
-| `executor` | `openrouter/z-ai/glm-5.3-flash` (informational; choose the model with `/model`) |
-| `advisor` | `openrouter/anthropic/claude-opus-5.5` |
-| `packBudgetTokens` | `40000` |
-| `triggers.contextRatio` / `sameErrorCount` / `remindEvery` / `minGapCalls` | `0.6` / `3` / `12` / `5` |
-| `triggers.milestoneReview` / `autoPlanAfterReads` / `planBeforeWrite` / `driftCalls` | `true` / `8` / `true` / `20` |
-| `pack.skills` | `{ enabled: true, budgetRatio: 0.35, maxSkills: 4 }` |
-| `pack.excludePaths` | journal dir, `node_modules`, `dist`, lockfiles |
-| `pack.pinPlan` | `true` |
-| `mask.neverMaskPaths` | skills and reference docs |
-| `triggers.reviewBeforeCommit` | `true` |
-| `review.enabled` | `true` |
-| `review.minCalls` | `15` |
-| `review.minDiffLines` | `80` |
-| `review.helpMinCalls` | `5` |
-| `review.finalizeAfterDone` | `true` |
-| `loop.maxHops` / `hopGapCalls` | `6` / `30` |
-| `loop.windowCalls` / `readRepeatThreshold` | `30` / `8` |
-| `loop.enabled` / `cutContext` / `forceHandoff` / `blockDeferredEdits` | `true` / `true` / `true` / `true` |
-| `mask.mode` | `"handoff"` (or legacy `"continuous"`) |
-| `reset.keepTurns` / `reset.keepCalls` / `help.lastCalls` | `2` / `2` / `8` |
-| `judge.enabled` | `false` |
-| `replaceAutoCompact` | `true` |
+| `baton_plan` | Pack with skills, AGENTS.md, repo map and exploration findings → plan with invariants, skill rules, checkpoints. Pinned into every request. |
+| `baton_review` | Review pack (diff, changed files, last test, pinned plan, unverified note) → verdict + fixes. Required before `git commit`. |
+| `baton_help` | Last N tool calls verbatim, same-error calls, hypothesis/attempts (unverified) → root cause + plan. |
+| `baton_step` | Mark a pinned-plan step done / in_progress / blocked / deferred with evidence (no advisor call). |
+| `baton_recall` | Full output of a journal event (`evt#`). |
 
-Model refs are `provider/id`; the id may contain slashes. The OpenRouter ids above were checked against the OpenRouter model list on 2026-10-13. Run `/model` in pi to see what your keys can reach.
+Kept from 0.5: **review gating** (review refused until the previous review's review-verified steps are closed
+or ~15 calls / ~80 changed lines accumulated; `verify: self` steps need no re-review), **finalize mode** after
+`done`, plan-before-write and review-before-commit soft gates, nudges, the **loop detector** (default: forces
+an automatic `baton_help` with the loop as reason; the looping item is deferred and its test file edits are
+blocked until the reviewer or the user unblocks it — `/baton unblock D1 [guidance]`, `/baton drop D1`).
 
-Add `.pi/baton/` to your project's `.gitignore`: the journal stores raw tool output, which may contain secrets.
+**Compaction is optional and off by default.** With `compact.enabled: false` the advisor reply is appended to
+the conversation normally and nothing is masked, stubbed or cut; pi's own auto-compaction is untouched. With
+`compact.enabled: true` you get the 0.4 behaviour: at each handoff the executor context is reset to task +
+pinned plan + advisor reply + last calls (older outputs become `evt#` stubs), context pressure forces a review
+handoff, loop items are cut from the context, and pi's auto-compaction is routed through a review.
 
-## How it works (pi APIs)
+## Configuration
 
-| Feature | pi API |
+`~/.pi/agent/baton.json`, then `.pi/baton.json` in the project (deep-merged; keys that look like secrets are
+ignored). Full defaults: [`baton.example.json`](baton.example.json).
+
+| Group | Keys (defaults) |
 |---|---|
-| Journal | `tool_result` (exit code from bash `structuredContent.exit_code`), `before_agent_start` for user prompts |
-| Handoff snapshot (stubs, loop cuts), pinned plan; legacy continuous masking | `context` (request-only) |
-| Tools | `pi.registerTool` (TypeBox params), `promptGuidelines` |
-| Advisor call | `ctx.modelRegistry.find` + `complete(model, ctx, { cacheRetention: "none" })` |
-| Judge | `ctx.modelRegistry.findOfType("classifier", …)` + `classify()` |
-| Reset | `turn_end` → `{ entries: [{ type: "compaction", summary, firstKeptEntryId }] }`; `/baton reset` uses `ctx.compact()` + `session_before_compact` |
-| Commit gate | `tool_call` → `{ block: true, reason }` |
-| Nudges | `turn_end` → `custom_message` entry |
-| Context ratio | `ctx.getContextUsage()` |
+| `advisor` | `model` (`openrouter/anthropic/claude-opus-5.5`, from pi's model registry), `maxTokens` 8192, `cache` `"short"` \| `"long"` \| `"none"` |
+| `pack` | `budgetTokens` 40000, `excludePaths` (lockfiles, dist, node_modules, journal), `skills` {`enabled`, `budgetRatio` 0.35, `maxSkills` 4, `dirs`}, `pinPlan` true, `helpLastCalls` 8 |
+| `review` | gating: `enabled`, `minDiffLines` 80, `minCalls` 15, `helpMinCalls` 5, `finalizeAfterDone` |
+| `triggers` | nudges and soft gates: `contextRatio`, `sameErrorCount`, `reviewBeforeCommit`, `remindEvery`, `minGapCalls`, `milestoneReview`, `autoPlanAfterReads`, `planBeforeWrite`, `driftCalls` |
+| `loop` | `enabled`, `windowCalls` 30, `maxHops` 6, `hopGapCalls` 30, `readRepeatThreshold` 8, `action` `"help"` \| `"nudge"`, `blockDeferredEdits`, `ignoreReadPaths` |
+| `compact` | **`enabled` false**, `keepTurns` 2, `keepCalls` 2, `exemptTools`, `neverMaskPaths`, `replaceAutoCompact` |
+| — | `journalDir` `.pi/baton` |
 
-Development: `npm install && npm run check` runs `tsc --noEmit` against the real pi types and the vitest unit tests (journal, masking, pack, triggers, schema, judge, reset).
+Prompt caching: in pi the stable prefix is sent as the system prompt and pi-ai marks it with
+`cache_control` for `openrouter/anthropic/*` models (`advisor.cache` maps to pi's `cacheRetention`). The core
+OpenRouter client does the same itself (`--no-cache` to disable).
 
-## Status / limitations
+## Development
 
-0.4.0 is an early version. The handoff-only compaction is covered by unit tests; it has not yet been run end-to-end with GLM and Opus. The type-checked code, the unit tests and the extension loading in pi's real loader are verified. End-to-end sessions with GLM-5.3-Flash and Opus 5.5 via OpenRouter were run on a Tetris-on-Reatom task.
+```sh
+npm install
+npm run check      # tsc --noEmit + vitest
+```
 
-- Token counts are conservative estimates (chars/2.4, non-ASCII ×2; calibrated on real Opus input tokens, where chars/3.2 still under-counted by 23–32%); pi has no public tokenizer. Real advisor usage is recorded in the journal (`advisor` events: `usage`, `attempts`, `packTokens`).
-- A handoff rewrites the prefix of the request once (prompt cache breaks once per advisor call); between handoffs the prefix is stable except for the pinned plan's progress marks. An automatic handoff costs one advisor call.
-- Test-summary parsing is regex based (vitest/jest/pytest/cargo/go). Other runners only get exit codes.
-- The reset relies on `turn_end` compaction entries. If pi rejects the entry, use `/baton reset`.
-- The Jev judge only covers the help-pack timeline. Its question format follows pi's `ClassifierContext` types, but it has not been run against the TypeSafe API.
-- `executor` in the config is informational. Baton never switches models.
+No test calls a paid model: transports are faked and the request shape is asserted.
 
 ## License
 

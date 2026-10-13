@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildPack, type PackInput } from "../src/pack.ts";
-import { estimateTokens } from "../src/util.ts";
+import { buildPack, type PackInput } from "../src/core/pack/index.ts";
+import { estimateTokens } from "../src/core/util.ts";
 
 const base: PackInput = { kind: "review", task: "Fix the bug", userPrompts: [{ evt: 1, text: "Fix the bug" }, { evt: 5, text: "also add tests" }] };
 

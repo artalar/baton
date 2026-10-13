@@ -8,8 +8,8 @@
  * A loop is `maxHops` hops (edit/write → test/build run → the same failure again) on one failure
  * signature, or the same file re-read `readRepeatThreshold` times without a write within `windowCalls`.
  */
-import { errorSignature, normPath, TEST_CMD } from "./journal.ts";
-import { matchesAny } from "./util.ts";
+import { errorSignature, normPath, TEST_CMD } from "../core/journal.ts";
+import { matchesAny } from "../core/util.ts";
 
 export interface LoopConfig {
 	enabled: boolean;
@@ -21,10 +21,11 @@ export interface LoopConfig {
 	hopGapCalls: number;
 	/** Same file re-read this many times inside the window without a write to it → loop (0 = off). */
 	readRepeatThreshold: number;
-	/** Cut the looping calls/results out of the context (at the handoff the loop forces; on the fly only in mask.mode "continuous") and replace them with one note. */
-	cutContext: boolean;
-	/** On firing, force a handoff (auto baton_help with the loop as reason) instead of only a nudge. Handoff mode only. */
-	forceHandoff: boolean;
+	/**
+	 * On firing: "help" (default) forces an automatic baton_help with the loop as reason; "nudge" only
+	 * posts a note. The looping calls are cut from the context only when compact.enabled is true.
+	 */
+	action: "help" | "nudge";
 	/** Block edit/write of files tied to a deferred item until the reviewer or user unblocks it. */
 	blockDeferredEdits: boolean;
 	/** Reads of these paths never count (reference docs, dependencies). */

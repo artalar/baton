@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0 — 2026-10-13
+
+Repositioned as an **efficient review agent**: the core value is context preparation for an expensive, tool-less reviewer.
+
+- **pi-independent core** (`src/core`): `pack/sections.ts` (ordering + budget), `pack/index.ts` (`buildReviewPack(input) → {messages, sections, tokens, stableTokens}`), `pack/collect.ts` (`collectPackInput`: git diff/stat, changed files, last test, skills selection, AGENTS.md, repo map, help context from a journal; injectable `exec`), `advisor.ts` (`runAdvisor`, transport-agnostic validation + one retry), `openrouter.ts` (standalone client, `OPENROUTER_API_KEY` only). Journal/repo/skills/schema/util moved under `src/core`. A test asserts nothing under `src/core`/`src/cli` imports pi.
+- **Pack order**: role → skills → AGENTS.md (stable system prefix, cacheable) → pinned plan → task + prompts → artefacts → executor claims (unverified) → instructions + schema. Role text: "below is a junior's work… no tools, everything you need is below". New `claims` input; a review note is rendered as an unverified claim.
+- **Prompt caching**: the pack is two messages; the system prefix carries Anthropic `cache_control` (OpenRouter client) / is passed as pi's `systemPrompt` with `cacheRetention` (`advisor.cache`, default `short`; pi-ai adds `cache_control` for `openrouter/anthropic/*`). Previously caching was disabled (`cacheRetention: "none"`).
+- **CLI**: `baton-pack` (print the pack, no LLM call) and `baton-review` (call the advisor via OpenRouter).
+- **pi extension is a thin layer** (`src/pi`): tools call the core; pinned plan, review gating, finalize mode, triggers unchanged.
+- **Compaction optional, default OFF** (`compact.enabled: false`): the advisor reply is appended normally, nothing is masked or cut, pi's auto-compaction is untouched. `true` restores the 0.4/0.5 handoff compaction.
+- **Loop detector** defaults to forcing `baton_help` (`loop.action: "help"`, or `"nudge"`); looping calls are cut only when compaction is on. Removed `loop.cutContext`, `loop.forceHandoff`.
+- **Removed the Jev judge** (`judge.ts`, `judge-jev.ts`, config `judge`): it only re-ranked medium-importance timeline events of `baton_help` packs, was off by default, needed a separate classifier provider and added an LLM call to a path that should be deterministic; the timeline now uses the importance ≥2 rule (`timelineEvents`).
+- **Removed** legacy per-request masking mode (`mask.mode: "continuous"`, dedup/stale reads in the extension; `maskMessages` stays as a library function).
+- **Config regrouped**: `advisor {model, maxTokens, cache}`, `pack {budgetTokens, excludePaths, skills, pinPlan, helpLastCalls}`, `review`, `triggers`, `loop`, `compact`, `journalDir`. Removed `executor`, `advisorMaxTokens`, `packBudgetTokens`, `judge`, `mask`, `help`, `reset`, `replaceAutoCompact` (moved into the groups above). `baton.example.json` equals the defaults (tested).
+
 ## 0.5.0 — 2026-10-13
 
 - **Review gating** (`src/gate.ts`, config `review`). Experiment C4 showed review ping-pong: Opus returned `course_correct` with 3-4 tiny steps, GLM did one in 7-13 s and called `baton_review` again (8 handoffs at ~$0.2, ~3 useful). A self-invoked `baton_review` is now refused unless all review-verified steps of the previous review are closed (`baton_step` done/deferred) or enough change accumulated: `review.minCalls` = 15 executor tool calls or `review.minDiffLines` = 80 changed lines since the review (numstat between `git stash create` snapshots). Forced handoffs (loop, context pressure, pi auto-compaction) bypass it. `baton_help` stays available, rate-limited to `review.helpMinCalls` = 5 calls after any advisor reply.

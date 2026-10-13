@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG, deepMerge } from "../src/config.ts";
-import { pinnedBlock } from "../src/index.ts";
+import { DEFAULT_CONFIG, deepMerge } from "../src/pi/config.ts";
+import { pinnedBlock } from "../src/pi/index.ts";
 import {
 	bashReads,
 	cutLoops,
@@ -15,8 +15,8 @@ import {
 	observeLoop,
 	renderDeferred,
 	resolveDeferred,
-} from "../src/loop.ts";
-import { parseAdvisorReply } from "../src/schema.ts";
+} from "../src/pi/loop.ts";
+import { parseAdvisorReply } from "../src/core/schema.ts";
 
 const cfg = DEFAULT_CONFIG.loop;
 const CWD = "/workspace/tetris-exp/C";
@@ -43,7 +43,7 @@ function replay(calls: Call[], c = cfg) {
 
 describe("loop config", () => {
 	it("has calibrated defaults and merges overrides", () => {
-		expect(cfg).toMatchObject({ enabled: true, windowCalls: 30, maxHops: 6, hopGapCalls: 30, readRepeatThreshold: 8, cutContext: true, forceHandoff: true, blockDeferredEdits: true });
+		expect(cfg).toMatchObject({ enabled: true, windowCalls: 30, maxHops: 6, hopGapCalls: 30, readRepeatThreshold: 8, action: "help", blockDeferredEdits: true });
 		const m = deepMerge(DEFAULT_CONFIG, { loop: { maxHops: 4 } });
 		expect(m.loop.maxHops).toBe(4);
 		expect(m.loop.windowCalls).toBe(30);

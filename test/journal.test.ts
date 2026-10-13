@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { argsDigest, buildToolEvent, errorSignature, Journal, parseTestSummary } from "../src/journal.ts";
+import { argsDigest, buildToolEvent, errorSignature, Journal, parseTestSummary } from "../src/core/journal.ts";
 
 const obs = (o: Partial<Parameters<typeof buildToolEvent>[1]> = {}) => ({
 	tool: "bash", input: { command: "ls" }, output: "a\nb", isError: false, turn: 1, cwd: "/repo", now: new Date("2026-10-13T00:00:00Z"), ...o,

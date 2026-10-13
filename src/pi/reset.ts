@@ -1,5 +1,5 @@
-import { type JournalEvent, eventLine } from "./journal.ts";
-import { clip } from "./util.ts";
+import { type JournalEvent, eventLine } from "../core/journal.ts";
+import { clip } from "../core/util.ts";
 
 /** Structural view of a pi SessionEntry. */
 export interface EntryLike {

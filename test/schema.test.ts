@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractJson, parseAdvisorReply, renderPlan } from "../src/schema.ts";
+import { extractJson, parseAdvisorReply, renderPlan } from "../src/core/schema.ts";
 
 const good = {
 	assessment: "close",
@@ -40,7 +40,7 @@ describe("advisor schema", () => {
 	});
 });
 
-import { repairTruncatedJson } from "../src/schema.ts";
+import { repairTruncatedJson } from "../src/core/schema.ts";
 describe("truncated advisor replies", () => {
 	it("salvages a reply cut off by max_tokens: complete steps kept, tail fields defaulted", () => {
 		const full = JSON.stringify({ assessment: "a", verdict: "course_correct", facts_corrected: [], plan: [{ id: "S1", action: "x", done_when: "t" }, { id: "S2", action: "y", done_when: "u" }] });

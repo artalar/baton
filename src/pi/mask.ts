@@ -1,6 +1,6 @@
 import type { DeferredItem } from "./loop.ts";
-import { type JournalEvent, eventLine, normPath } from "./journal.ts";
-import { matchesAny } from "./util.ts";
+import { type JournalEvent, eventLine, normPath } from "../core/journal.ts";
+import { matchesAny } from "../core/util.ts";
 
 /** Minimal structural view of pi's AgentMessage that masking needs. */
 export interface MsgLike {

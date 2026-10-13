@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG } from "../src/config.ts";
-import { commitAllowedByGate, finalizeAllowedBash, finalizeGate, gateOnAdvisor, gateReleaseFinalize, type GateState, helpGate, initialGateState, reviewGate } from "../src/gate.ts";
-import { numstatLines } from "../src/repo.ts";
-import { parseAdvisorReply, renderPlan } from "../src/schema.ts";
+import { DEFAULT_CONFIG } from "../src/pi/config.ts";
+import { commitAllowedByGate, finalizeAllowedBash, finalizeGate, gateOnAdvisor, gateReleaseFinalize, type GateState, helpGate, initialGateState, reviewGate } from "../src/pi/gate.ts";
+import { numstatLines } from "../src/core/repo.ts";
+import { parseAdvisorReply, renderPlan } from "../src/core/schema.ts";
 
 const cfg = DEFAULT_CONFIG.review;
 const afterReview = (steps: { id: string; verify?: "self" | "review" }[], verdict = "course_correct", calls = 100) => gateOnAdvisor(initialGateState(), "review", verdict, steps, calls, "abc", cfg);

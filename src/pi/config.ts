@@ -25,64 +25,57 @@ export interface TriggerConfig {
 	driftCalls: number;
 }
 
-export interface JudgeConfig {
-	enabled: boolean;
-	/** "provider/id" of a classifier model, e.g. typesafe/jev-latest. */
-	model: string;
-	minConfidence: number;
-}
-
 export interface BatonConfig {
-	/** Informational: the intended executor model ("provider/id"). Baton does not switch models. */
-	executor: string;
-	/** Advisor model ("provider/id"), called once per baton_review/help/plan. */
-	advisor: string;
-	advisorMaxTokens: number;
-	judge: JudgeConfig;
-	packBudgetTokens: number;
+	/** The expensive reviewer, called once per baton_review/help/plan. */
+	advisor: {
+		/** "provider/id" in pi's model registry. */
+		model: string;
+		maxTokens: number;
+		/** Prompt caching of the stable prefix (role + skills + AGENTS.md): "short" (5 min), "long" (1 h), "none". */
+		cache: "short" | "long" | "none";
+	};
+	/** Context preparation for the advisor. */
 	pack: {
+		budgetTokens: number;
 		/** Globs never included in the pack diff / changed files (in addition to journalDir), regardless of .gitignore. */
 		excludePaths: string[];
 		/** Include relevant project skills (SKILL.md) in advisor packs. */
 		skills: { enabled: boolean; budgetRatio: number; maxSkills: number; dirs: string[] };
-		/** Pin the latest advisor plan into every request (never masked). */
+		/** Pin the latest advisor plan into every executor request. */
 		pinPlan: boolean;
+		/** baton_help: how many last tool calls go to the advisor verbatim. */
+		helpLastCalls: number;
 	};
-	triggers: TriggerConfig;
-	/** Review gating and finalize mode (see src/gate.ts). */
+	/** Review gating and finalize mode (see src/pi/gate.ts). */
 	review: ReviewGateConfig;
-	/** Deterministic stuck-loop detector (see src/loop.ts). */
+	/** Nudges and soft gates (plan before write, review before commit, context pressure). */
+	triggers: TriggerConfig;
+	/** Deterministic stuck-loop detector (see src/pi/loop.ts). */
 	loop: LoopConfig;
-	mask: {
+	/**
+	 * OPTIONAL executor-context compaction at handoffs (v0.4 behaviour). Off by default: the advisor reply is
+	 * appended to the conversation normally and nothing is masked or cut.
+	 */
+	compact: {
 		enabled: boolean;
-		/**
-		 * "handoff" (default): the executor's context is never rewritten between advisor calls; old tool
-		 * outputs become evt# stubs only at a handoff (baton_review/help/plan, auto loop/context handoff).
-		 * "continuous": legacy v0.3 behaviour, masks answered outputs on every request.
-		 */
-		mode: "handoff" | "continuous";
-		/** Tool names whose output is never masked. */
+		/** Assistant turns kept after a reset. */
+		keepTurns: number;
+		/** Tool outputs kept verbatim after a review/plan handoff (help keeps pack.helpLastCalls). */
+		keepCalls: number;
+		/** Tool names whose output is never stubbed. */
 		exemptTools: string[];
-		dedupReads: boolean;
-		staleReads: boolean;
-		/** Reads (read tool, or bash cat/sed/head of a path) matching these globs are never masked: skills and reference docs. */
+		/** Reads matching these globs are never stubbed: skills and reference docs. */
 		neverMaskPaths: string[];
+		/** Route pi's auto-compaction through a review handoff and Baton's deterministic summary. */
+		replaceAutoCompact: boolean;
 	};
-	help: { lastCalls: number };
-	/** keepTurns: assistant turns kept after a handoff reset; keepCalls: tool outputs kept verbatim after a review/plan handoff (help keeps help.lastCalls). */
-	reset: { keepTurns: number; keepCalls: number };
-	/** Replace pi's LLM auto-compaction (threshold/overflow) with Baton's deterministic summary. */
-	replaceAutoCompact: boolean;
 	journalDir: string;
 }
 
 export const DEFAULT_CONFIG: BatonConfig = {
-	executor: "openrouter/z-ai/glm-5.3-flash",
-	advisor: "openrouter/anthropic/claude-opus-5.5",
-	advisorMaxTokens: 8192,
-	judge: { enabled: false, model: "typesafe/jev-latest", minConfidence: 0.7 },
-	packBudgetTokens: 40_000,
+	advisor: { model: "openrouter/anthropic/claude-opus-5.5", maxTokens: 8192, cache: "short" },
 	pack: {
+		budgetTokens: 40_000,
 		excludePaths: [
 			".pi/baton/**",
 			"**/node_modules/**",
@@ -102,7 +95,10 @@ export const DEFAULT_CONFIG: BatonConfig = {
 		],
 		skills: { enabled: true, budgetRatio: 0.35, maxSkills: 4, dirs: [".agents/skills", ".pi/skills", ".claude/skills", "skills"] },
 		pinPlan: true,
+		helpLastCalls: 8,
 	},
+	// C4: 8 handoffs, 3 of them ping-pong reviews 5-11 calls apart; these refuse exactly those.
+	review: { enabled: true, minDiffLines: 80, minCalls: 15, helpMinCalls: 5, finalizeAfterDone: true },
 	triggers: {
 		contextRatio: 0.6,
 		sameErrorCount: 3,
@@ -114,8 +110,6 @@ export const DEFAULT_CONFIG: BatonConfig = {
 		planBeforeWrite: true,
 		driftCalls: 20,
 	},
-	// C4: 8 handoffs, 3 of them ping-pong reviews 5-11 calls apart; these refuse exactly those.
-	review: { enabled: true, minDiffLines: 80, minCalls: 15, helpMinCalls: 5, finalizeAfterDone: true },
 	// Calibrated on experiment C v2: fires at call 324 (8 edit→run→fail hops on the lock-delay test,
 	// 21 calls after its first failure); max hop count on any signature before that loop: 1.
 	loop: {
@@ -124,17 +118,15 @@ export const DEFAULT_CONFIG: BatonConfig = {
 		maxHops: 6,
 		hopGapCalls: 30,
 		readRepeatThreshold: 8,
-		cutContext: true,
-		forceHandoff: true,
+		action: "help",
 		blockDeferredEdits: true,
 		ignoreReadPaths: ["**/node_modules/**", "**/SKILL.md", "**/REFERENCE.md", "**/README.md", "**/AGENTS.md", ".agents/**", ".pi/**", "docs/**"],
 	},
-	mask: {
-		enabled: true,
-		mode: "handoff",
+	compact: {
+		enabled: false,
+		keepTurns: 2,
+		keepCalls: 2,
 		exemptTools: ["baton_review", "baton_help", "baton_plan", "baton_step"],
-		dedupReads: true,
-		staleReads: true,
 		neverMaskPaths: [
 			"**/SKILL.md",
 			".agents/skills/**",
@@ -147,10 +139,8 @@ export const DEFAULT_CONFIG: BatonConfig = {
 			"**/REFERENCE.md",
 			"docs/**/*.md",
 		],
+		replaceAutoCompact: true,
 	},
-	help: { lastCalls: 8 },
-	reset: { keepTurns: 2, keepCalls: 2 },
-	replaceAutoCompact: true,
 	journalDir: ".pi/baton",
 };
 

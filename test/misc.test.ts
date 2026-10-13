@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG, deepMerge, parseModelRef } from "../src/config.ts";
-import type { JournalEvent } from "../src/journal.ts";
-import { filterEvents, type JudgeProvider } from "../src/judge.ts";
-import { repoMap } from "../src/repo.ts";
-import { pickFirstKept, resetSummary } from "../src/reset.ts";
+import { DEFAULT_CONFIG, deepMerge, parseModelRef } from "../src/pi/config.ts";
+import type { JournalEvent } from "../src/core/journal.ts";
+import { timelineEvents } from "../src/core/pack/collect.ts";
+import { repoMap } from "../src/core/repo.ts";
+import { pickFirstKept, resetSummary } from "../src/pi/reset.ts";
 
 const ev = (evt: number, importance: 0 | 1 | 2 | 3): JournalEvent => ({ evt, ts: "", turn: 0, kind: "tool_call", tool: "bash", importance });
 
@@ -21,31 +21,9 @@ describe("config", () => {
 	});
 });
 
-describe("judge", () => {
-	it("heuristics only: keeps 3 and 2, drops 1 and 0", async () => {
-		const { kept } = await filterEvents([ev(1, 3), ev(2, 2), ev(3, 1), ev(4, 0)], "t", undefined, 0.7);
-		expect(kept.map((e) => e.evt)).toEqual([1, 2]);
-	});
-	it("judge decides only medium events, respecting confidence", async () => {
-		const asked: string[] = [];
-		const judge: JudgeProvider = {
-			name: "fake",
-			async decide(req) {
-				asked.push(String(req.state.event));
-				const e = String(req.state.event);
-				if (e.startsWith("evt#2")) return { include: { choice: "noise", confidence: 0.9 } };
-				if (e.startsWith("evt#3")) return { include: { choice: "must", confidence: 0.95 } };
-				return { include: { choice: "noise", confidence: 0.3 } };
-			},
-		};
-		const { kept, judged } = await filterEvents([ev(1, 3), ev(2, 2), ev(3, 1), ev(4, 0), ev(5, 2)], "t", judge, 0.7);
-		expect(asked).toHaveLength(3);
-		expect(judged).toBe(2);
-		expect(kept.map((e) => e.evt)).toEqual([1, 3, 5]);
-	});
-	it("falls back to heuristics when the judge throws", async () => {
-		const judge: JudgeProvider = { name: "x", decide: async () => { throw new Error("down"); } };
-		expect((await filterEvents([ev(2, 2), ev(3, 1)], "t", judge, 0.7)).kept.map((e) => e.evt)).toEqual([2]);
+describe("timeline", () => {
+	it("keeps importance 3 and 2, drops 1 and 0 (deterministic; the Jev judge was removed)", () => {
+		expect(timelineEvents([ev(1, 3), ev(2, 2), ev(3, 1), ev(4, 0)]).map((e) => e.evt)).toEqual([1, 2]);
 	});
 });
 
