@@ -24,10 +24,11 @@ A [pi](https://github.com/earendil-works/pi) extension that lets a cheap executo
   - 20 tool calls without `baton_step` while a plan is pinned (drift);
   - a reminder after 12 tool calls without an advisor call;
   - a cooldown between nudges.
+- **Loop detector.** This is deterministic and needs no LLM. It fires after 6 hops on the same failing test or build error, where one hop is edit/write → run (test/build) → the same failure again. It also fires on the same file re-read 8× without a write within 30 calls. The looping calls are then cut out of the request and replaced by one `⚠ Loop detected … DEFERRED` note. The item is added to the deferred list, which is pinned and journaled. Edits of its failing test file are soft-blocked. `baton_review` sees the deferred items and rules on them (`deferred_rulings`: unblock with guidance, drop, or keep). The user can unblock or drop them with `/baton unblock D1 [guidance]` or `/baton drop D1`. The executor can defer a step itself with `baton_step` status `deferred`. Calibration on the C v2 transcript (509 calls): the first fire is at call 324 with 8 hops, 21 calls after the first failure of the lock-delay test. Before that loop the hop count never exceeded 1.
   - `git commit` is **blocked** until `baton_review` returns `on_track` or `done`. New edits revoke the pass.
 - **Auto-compaction.** pi's threshold and overflow compaction is replaced by a deterministic, no-LLM Baton summary (task, prompts, last plan, timeline). This is configurable.
 - **Optional judge** (off by default). A Jev-format classifier (`typesafe/jev-latest` via pi's `modelRegistry.classify`) decides include/drop only for medium-importance events in the help pack. Heuristics are the fallback.
-- **Skill** `baton` and prompt `/baton-plan` tell the executor when to call which tool. The same guidance goes into the system prompt as tool guidelines. Command: `/baton` (status) and `/baton reset`.
+- **Skill** `baton` and prompt `/baton-plan` tell the executor when to call which tool. The same guidance goes into the system prompt as tool guidelines. Commands: `/baton` (status), `/baton reset`, `/baton unblock <D1|all> [guidance]` and `/baton drop <D1|all>`.
 
 ## Install
 
@@ -58,6 +59,9 @@ See [`baton.example.json`](baton.example.json) for all options with their defaul
 | `pack.pinPlan` | `true` |
 | `mask.neverMaskPaths` | skills and reference docs |
 | `triggers.reviewBeforeCommit` | `true` |
+| `loop.maxHops` / `hopGapCalls` | `6` / `30` |
+| `loop.windowCalls` / `readRepeatThreshold` | `30` / `8` |
+| `loop.enabled` / `cutContext` / `blockDeferredEdits` | `true` / `true` / `true` |
 | `judge.enabled` | `false` |
 | `replaceAutoCompact` | `true` |
 
@@ -83,7 +87,7 @@ Development: `npm install && npm run check` runs `tsc --noEmit` against the real
 
 ## Status / limitations
 
-0.2.0 is an early version. The type-checked code, the unit tests and the extension loading in pi's real loader are verified. End-to-end sessions with GLM-5.3-Flash and Opus 5.5 via OpenRouter were run on a Tetris-on-Reatom task.
+0.3.0 is an early version. The type-checked code, the unit tests and the extension loading in pi's real loader are verified. End-to-end sessions with GLM-5.3-Flash and Opus 5.5 via OpenRouter were run on a Tetris-on-Reatom task.
 
 - Token counts are conservative estimates (chars/2.4, non-ASCII ×2; calibrated on real Opus input tokens, where chars/3.2 still under-counted by 23–32%); pi has no public tokenizer. Real advisor usage is recorded in the journal (`advisor` events: `usage`, `attempts`, `packTokens`).
 - Masking rewrites the prefix of the request, which breaks prompt caching. That is cheap for GLM but would be costly for Anthropic executors. Stubs are stable, so the prefix only changes once per batch.

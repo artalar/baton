@@ -26,4 +26,6 @@ Rules:
 - After a plan arrives, work step by step; each step has a `done when` criterion. Run the test command it names.
 - Skill files and reference docs (SKILL.md, AGENTS.md, README.md) are never masked; read them before planning.
 - The first write without a plan is blocked once: call `baton_plan`, or retry the write if the task is trivial.
+- **Stuck rule.** If one bug or test still fails after ~3 fix attempts, stop. Mark the step `deferred` with `baton_step` (or call `baton_help` once) and go on to the next plan step. A deferred item is resolved only after the reviewer (`baton_review`) or the user confirms.
+- **Loop detector.** If you see `⚠ Loop detected (D1) … DEFERRED`, Baton has removed the looping calls from your context. Do not continue that item and do not edit its test file (those edits are blocked); proceed with the next plan step. The item stays listed under "Deferred items" in the pinned plan until `baton_review` or the user unblocks it, and an unblock comes with guidance: follow it.
 - Baton nudges (messages starting with `Baton:`) are deterministic triggers: exploration done without a plan, first milestone, context ≥60%, the same error 3×, 12 calls without a check, 20 calls without `baton_step`. Follow them.

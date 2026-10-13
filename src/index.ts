@@ -7,9 +7,10 @@ import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@eare
 import { Type } from "typebox";
 import { type AdvisorResult, callAdvisor } from "./advisor.ts";
 import { type BatonConfig, loadConfig } from "./config.ts";
-import { Journal, type JournalEvent, eventLine } from "./journal.ts";
+import { Journal, type JournalEvent, eventLine, normPath } from "./journal.ts";
 import { filterEvents, type JudgeProvider } from "./judge.ts";
 import { jevJudge } from "./judge-jev.ts";
+import { cutLoops, type DeferredItem, deferFire, deferredEditGate, initialLoopState, type LoopState, loopKeys, loopNote, observeLoop, renderDeferred, resolveDeferred } from "./loop.ts";
 import { maskMessages, type MsgLike, pinPlan } from "./mask.ts";
 import { type AdvisorKind, buildPack, type PackInput, type VerbatimCall } from "./pack.ts";
 import { autoCompactSummary, pickFirstKept, resetSummary } from "./reset.ts";
@@ -25,11 +26,12 @@ Use the advisor tools (a stronger model, one call each, costly — do not spam):
 - baton_step: mark a plan step done/blocked with evidence (command + result). Cheap, no advisor call.
 - baton_help: when stuck — the same error twice, or you do not understand a failure. Give your hypothesis, what you tried, and important evt numbers. Resets your context to task + plan.
 - baton_review: at the first milestone (core model works, tests/build green), at the plan's checkpoints, and always before git commit. Its plan is appended; follow it.
+Stuck rule: if one bug or test still fails after ~3 fix attempts, STOP. Mark the step blocked (baton_step status "blocked", or call baton_help once), treat the item as DEFERRED and move on to the next plan step. Deferred items are resolved only after the reviewer (baton_review) or the user confirms. Baton's loop detector enforces this: when it reports "⚠ Loop detected", do not touch that item again until it is unblocked.
 Skill files (SKILL.md) and reference docs are never masked.`;
 
 /** Pure: pinned plan text with step status marks. */
 export function renderPinned(plan: { reply: AdvisorReply; label: string }, status: Record<string, string>): string {
-	const marks = plan.reply.plan.map((st) => `[${status[st.id] === "done" ? "x" : status[st.id] === "blocked" ? "!" : " "}] ${st.id}`).join("  ");
+	const marks = plan.reply.plan.map((st) => `[${status[st.id] === "done" ? "x" : status[st.id] === "blocked" ? "!" : status[st.id] === "deferred" ? "~" : " "}] ${st.id}`).join("  ");
 	return `${renderPlan(plan.reply, plan.label)}\nProgress: ${marks || "(no steps)"}\nMark steps with baton_step({id, status, evidence}).`;
 }
 
@@ -45,6 +47,14 @@ interface Runtime {
 	pendingReset?: { summary: string; kind: AdvisorKind };
 	pendingNudge?: string;
 	maskStats: { masked: number; deduped: number; stale: number; charsSaved: number };
+	loop: LoopState;
+	deferred: DeferredItem[];
+}
+
+/** Pure: the text pinned into every request (plan with progress, then deferred items). */
+export function pinnedBlock(plan: { reply: AdvisorReply; label: string } | undefined, status: Record<string, string>, deferred: readonly DeferredItem[]): string | undefined {
+	const parts = [plan ? renderPinned(plan, status) : undefined, renderDeferred(deferred)].filter(Boolean);
+	return parts.length ? parts.join("\n\n") : undefined;
 }
 
 function textOf(content: readonly { type: string; text?: string }[] | undefined): string {
@@ -65,9 +75,17 @@ export default function baton(pi: ExtensionAPI) {
 			userPrompts: [],
 			stepStatus: {},
 			maskStats: { masked: 0, deduped: 0, stale: 0, charsSaved: 0 },
+			loop: initialLoopState(),
+			deferred: [],
 		};
+		const snap = [...rt.journal.events].reverse().find((e) => e.kind === "note" && (e.data as { deferred?: unknown } | undefined)?.deferred);
+		if (snap) rt.deferred = (snap.data as { deferred: DeferredItem[] }).deferred;
 		rt.userPrompts = rt.journal.events.filter((e) => e.kind === "user_prompt").map((e) => ({ evt: e.evt, text: e.text ?? "" }));
 		return rt;
+	};
+
+	const saveDeferred = (r: Runtime, text: string, extra?: Record<string, unknown>) => {
+		r.journal.record("note", r.turn, text, { ...extra, deferred: r.deferred });
 	};
 
 	const exec: Exec = async (cmd, args) => {
@@ -104,6 +122,12 @@ export default function baton(pi: ExtensionAPI) {
 			r.journal.record("note", r.turn, "plan gate: first write blocked once (no plan yet)");
 			return pg;
 		}
+		const p = (e.input as { path?: unknown; file_path?: unknown }).path ?? (e.input as { file_path?: unknown }).file_path;
+		const dg = deferredEditGate(e.toolName, typeof p === "string" ? normPath(p, ctx.cwd) : undefined, r.deferred, r.cfg.loop);
+		if (dg) {
+			r.journal.record("note", r.turn, `deferred gate: blocked ${e.toolName} ${String(p)}`);
+			return dg;
+		}
 		if (e.toolName !== "bash") return undefined;
 		const cmd = String((e.input as { command?: unknown }).command ?? "");
 		return commitGate(cmd, r.triggers, r.cfg.triggers);
@@ -130,6 +154,18 @@ export default function baton(pi: ExtensionAPI) {
 		const { nudge, state } = evaluate(r.triggers, r.cfg.triggers, ratio);
 		r.triggers = state;
 		if (nudge) r.pendingNudge = nudge.message;
+		if (e.toolCallId && !e.toolName.startsWith("baton_")) {
+			const keys = loopKeys({ toolCallId: e.toolCallId, tool: e.toolName, input: e.input as Record<string, unknown>, output: textOf(e.content), isError: e.isError }, ctx.cwd, r.cfg.loop.ignoreReadPaths);
+			const lr = observeLoop(r.loop, e.toolCallId, keys, r.cfg.loop);
+			r.loop = lr.state;
+			if (lr.fire) {
+				const { list, item } = deferFire(r.deferred, lr.fire);
+				r.deferred = list;
+				saveDeferred(r, `loop detected: ${item.id} ${item.target}, ${lr.fire.count} calls${item.sig ? `, ${item.sig}` : ""}`, { loop: lr.fire });
+				if (!r.cfg.loop.cutContext) r.pendingNudge = loopNote(item, lr.fire.count);
+				else r.pendingNudge = undefined; // the note replaces the looping calls in the context
+			}
+		}
 		return undefined;
 	});
 
@@ -138,7 +174,9 @@ export default function baton(pi: ExtensionAPI) {
 		const r = init(ctx);
 		const { messages, stats } = maskMessages(e.messages as unknown as MsgLike[], (id) => r.journal.forCall(id), { ...r.cfg.mask, cwd: ctx.cwd });
 		r.maskStats = stats;
-		const out = r.cfg.pack.pinPlan && r.pinned ? pinPlan(messages, renderPinned(r.pinned, r.stepStatus)) : messages;
+		const cut = r.cfg.loop.cutContext ? cutLoops(messages, r.deferred).messages : messages;
+		const pin = r.cfg.pack.pinPlan ? pinnedBlock(r.pinned, r.stepStatus, r.deferred) : undefined;
+		const out = pin ? pinPlan(cut, pin) : cut;
 		return { messages: out as unknown as typeof e.messages };
 	});
 
@@ -209,11 +247,11 @@ export default function baton(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "baton_step",
 		label: "Baton step",
-		description: "Mark a step of the pinned advisor plan as done, in_progress or blocked, with evidence (command and result). No advisor call; cheap.",
+		description: "Mark a step of the pinned advisor plan as done, in_progress, blocked or deferred, with evidence (command and result). Use deferred when one bug/test resists ~3 fix attempts: it is parked until the reviewer or user confirms, and you move on. No advisor call; cheap.",
 		promptSnippet: "baton_step(id, status, evidence): track progress on the pinned plan",
 		parameters: Type.Object({
 			id: Type.String({ description: "Plan step id, e.g. S2" }),
-			status: Type.Union([Type.Literal("done"), Type.Literal("in_progress"), Type.Literal("blocked")]),
+			status: Type.Union([Type.Literal("done"), Type.Literal("in_progress"), Type.Literal("blocked"), Type.Literal("deferred")]),
 			evidence: Type.Optional(Type.String({ description: "Command run and its result that proves the done criterion" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -222,9 +260,14 @@ export default function baton(pi: ExtensionAPI) {
 			const step = r.pinned.reply.plan.find((x) => x.id === params.id);
 			if (!step) return { content: [{ type: "text", text: `Unknown step ${params.id}. Steps: ${r.pinned.reply.plan.map((x) => x.id).join(", ")}` }], details: { ok: false } };
 			r.stepStatus[params.id] = params.status;
+			if (params.status === "deferred") {
+				const { list, item } = deferFire(r.deferred, { kind: "test", key: `step:${params.id}`, target: `step ${params.id} (${step.action.slice(0, 80)})`, count: 0, span: [], files: [], sig: params.evidence?.slice(0, 160), at: r.loop.n });
+				r.deferred = list;
+				saveDeferred(r, `executor deferred ${item.id}: step ${params.id}`);
+			}
 			r.journal.record("note", r.turn, `step ${params.id}: ${params.status}${params.evidence ? ` — ${params.evidence}` : ""}`, { step: params.id, status: params.status });
 			const checkpoint = params.status === "done" && (r.pinned.reply.checkpoints ?? []).includes(params.id);
-			const left = r.pinned.reply.plan.filter((x) => r.stepStatus[x.id] !== "done").map((x) => x.id);
+			const left = r.pinned.reply.plan.filter((x) => r.stepStatus[x.id] !== "done" && r.stepStatus[x.id] !== "deferred").map((x) => x.id);
 			const next = checkpoint
 				? `Checkpoint ${params.id} reached: call baton_review now.`
 				: left.length
@@ -244,6 +287,7 @@ export default function baton(pi: ExtensionAPI) {
 		const r = init(ctx);
 		const task = r.userPrompts[0]?.text ?? "";
 		const pinnedText = r.pinned ? renderPinned(r.pinned, r.stepStatus) : r.lastPlan;
+		const open = r.deferred.filter((d) => d.status === "deferred");
 		const base: PackInput = { kind, task, userPrompts: r.userPrompts, previousPlan: pinnedText, ...extra };
 		const tools = r.journal.toolEvents();
 		const excludes = packExcludes(r.cfg.journalDir, r.cfg.pack.excludePaths);
@@ -255,6 +299,13 @@ export default function baton(pi: ExtensionAPI) {
 			base.changedFiles = await changedFiles(exec, ctx.cwd, 400, excludes);
 			const lt = [...tools].reverse().find((e) => e.test);
 			if (lt) base.lastTest = verbatim(r, lt, 8000);
+			if (open.length)
+				base.deferred = open
+					.map((d) => {
+						const last = [...d.cut].reverse().map((id) => r.journal.forCall(id)).find((x) => x && (x.errSig || x.test));
+						return `${d.id}: ${d.target}${d.sig ? ` — ${d.sig}` : ""} (${d.count} calls, cut from the executor's context)${d.files.length ? `\nfiles: ${d.files.join(", ")}` : ""}${last ? `\nlast failing call:\n${clip(`${eventLine(last)}\n${r.journal.raw(last.evt) ?? last.outTail ?? ""}`, 3000)}` : ""}`;
+					})
+					.join("\n\n");
 			// review sees artefacts + the pinned plan (as a contract), never the executor's narrative
 		} else if (kind === "help") {
 			base.diffStat = await packDiff(exec, ["--stat"], excludes);
@@ -359,6 +410,10 @@ export default function baton(pi: ExtensionAPI) {
 				r.lastPlan = plan;
 				r.journal.record("advisor", r.turn, `baton_${kind}: ${res.reply.verdict}`, { ...res.reply, usage: res.usage, attempts: res.attempts, packTokens: pack.tokens });
 				r.triggers = onAdvisor(r.triggers, kind, res.reply.verdict, res.reply.plan.length);
+				if (res.reply.deferred_rulings?.length && r.deferred.length) {
+					r.deferred = resolveDeferred(r.deferred, res.reply.deferred_rulings, "reviewer");
+					saveDeferred(r, `deferred rulings from baton_${kind}: ${res.reply.deferred_rulings.map((d) => `${d.id}=${d.ruling}`).join(", ")}`);
+				}
 				if (res.reply.plan.length && res.reply.verdict !== "done") {
 					r.pinned = { reply: res.reply, label: `baton_${kind}` };
 					r.stepStatus = {};
@@ -383,9 +438,18 @@ export default function baton(pi: ExtensionAPI) {
 	// ---- commands ------------------------------------------------------------
 
 	pi.registerCommand("baton", {
-		description: "Baton status | reset (compact to task + last plan now)",
+		description: "Baton status | reset (compact to task + last plan now) | unblock <D1|all> [guidance] | drop <D1|all>",
 		handler: async (args, ctx) => {
 			const r = init(ctx);
+			const m = args.trim().match(/^(unblock|drop)\s+(\S+)\s*(.*)$/);
+			if (m) {
+				const before = r.deferred.filter((d) => d.status === "deferred").length;
+				r.deferred = resolveDeferred(r.deferred, [{ id: m[2]!, ruling: m[1] as "unblock" | "drop", guidance: m[3] || undefined }], "user");
+				const changed = before - r.deferred.filter((d) => d.status === "deferred").length;
+				saveDeferred(r, `user ${m[1]} ${m[2]}${m[3] ? `: ${m[3]}` : ""}`);
+				ctx.ui.notify(changed ? `Baton: ${m[1]} ${m[2]} (${changed} item(s)).` : `Baton: no deferred item ${m[2]}.`, changed ? "info" : "warning");
+				return;
+			}
 			if (args.trim() === "reset") {
 				r.pendingReset = { kind: "plan", summary: resetSummary({ task: r.userPrompts[0]?.text ?? "", userPrompts: r.userPrompts.map((p) => p.text), plan: r.lastPlan ?? "(no plan yet)" }) };
 				ctx.compact({ onError: (err) => ctx.ui.notify(`Baton reset failed: ${err.message}`, "error") });
@@ -399,6 +463,7 @@ export default function baton(pi: ExtensionAPI) {
 					`tool calls ${t.toolCalls}, since advisor ${t.toolCalls - t.lastAdvisorAt}, review passed: ${t.reviewPassed}`,
 					`last request: masked ${s.masked}, duplicate ${s.deduped}, stale ${s.stale}, ~${Math.round(s.charsSaved / 2.4)} tok saved`,
 					`plan: ${r.pinned ? `${r.pinned.label}, ${Object.values(r.stepStatus).filter((x) => x === "done").length}/${r.pinned.reply.plan.length} steps done` : "none"}`,
+					`deferred: ${r.deferred.length ? r.deferred.map((d) => `${d.id} ${d.status} (${d.target})`).join("; ") : "none"}`,
 					`advisor ${r.cfg.advisor}, judge ${r.cfg.judge.enabled ? r.cfg.judge.model : "off"}`,
 				].join("\n"),
 				"info",

@@ -102,7 +102,7 @@ export function errorSignature(output: string, isError: boolean): string | null 
 	return loc ? `${norm} @${loc[1]}` : norm;
 }
 
-const TEST_CMD = /\b(vitest|jest|mocha|pytest|go test|cargo test|npm (run )?test|pnpm (run )?test|yarn test|bun test|deno test|rspec|phpunit)\b/;
+export const TEST_CMD = /\b(vitest|jest|mocha|pytest|go test|cargo test|npm (run )?test|pnpm (run )?test|yarn test|bun test|deno test|rspec|phpunit)\b/;
 
 /** Parse common test-runner summaries. Returns null for non-test commands. */
 export function parseTestSummary(cmd: string, output: string): TestSummary | null {

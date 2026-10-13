@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { LoopConfig } from "./loop.ts";
 
 export interface TriggerConfig {
 	/** Nudge when context usage reaches this fraction of the window. */
@@ -47,6 +48,8 @@ export interface BatonConfig {
 		pinPlan: boolean;
 	};
 	triggers: TriggerConfig;
+	/** Deterministic stuck-loop detector (see src/loop.ts). */
+	loop: LoopConfig;
 	mask: {
 		enabled: boolean;
 		/** Tool names whose output is never masked. */
@@ -100,6 +103,18 @@ export const DEFAULT_CONFIG: BatonConfig = {
 		autoPlanAfterReads: 8,
 		planBeforeWrite: true,
 		driftCalls: 20,
+	},
+	// Calibrated on experiment C v2: fires at call 324 (8 edit→run→fail hops on the lock-delay test,
+	// 21 calls after its first failure); max hop count on any signature before that loop: 1.
+	loop: {
+		enabled: true,
+		windowCalls: 30,
+		maxHops: 6,
+		hopGapCalls: 30,
+		readRepeatThreshold: 8,
+		cutContext: true,
+		blockDeferredEdits: true,
+		ignoreReadPaths: ["**/node_modules/**", "**/SKILL.md", "**/REFERENCE.md", "**/README.md", "**/AGENTS.md", ".agents/**", ".pi/**", "docs/**"],
 	},
 	mask: {
 		enabled: true,

@@ -35,6 +35,8 @@ export interface PackInput {
 	// shared
 	timeline?: JournalEvent[];
 	previousPlan?: string;
+	/** Deferred (loop-detected) items the reviewer must rule on. */
+	deferred?: string;
 }
 
 export interface Section {
@@ -112,6 +114,8 @@ export function packSections(i: PackInput): Section[] {
 		if (i.hypothesis) s.push({ title: "EXECUTOR HYPOTHESIS (unverified)", cut: 0, body: i.hypothesis });
 		if (i.attempts?.length) s.push({ title: "EXECUTOR ATTEMPTS (unverified)", cut: 0, body: i.attempts.map((a) => `- ${a}`).join("\n") });
 	}
+	if (i.deferred)
+		s.push({ title: "DEFERRED ITEMS (Baton loop detector; rule on each in deferred_rulings: unblock with guidance, drop, or keep)", cut: 0, body: i.deferred });
 	if (i.question) s.push({ title: i.kind === "review" ? "EXECUTOR CLAIMS (unverified)" : "QUESTION FROM EXECUTOR", cut: 0, body: i.question });
 	s.push({
 		title: "INSTRUCTIONS",

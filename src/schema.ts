@@ -26,6 +26,15 @@ export const AdvisorReply = Type.Object({
 	invariants: Type.Optional(Type.Array(Type.String())),
 	rules: Type.Optional(Type.Array(Type.String())),
 	checkpoints: Type.Optional(Type.Array(Type.String())),
+	deferred_rulings: Type.Optional(
+		Type.Array(
+			Type.Object({
+				id: Type.String({ minLength: 1 }),
+				ruling: Type.Union([Type.Literal("unblock"), Type.Literal("drop"), Type.Literal("keep")]),
+				guidance: Type.Optional(Type.String()),
+			}),
+		),
+	),
 });
 
 export type AdvisorReply = Static<typeof AdvisorReply>;
@@ -44,7 +53,8 @@ export const REPLY_SCHEMA_TEXT = `{
   "next_checkpoint": "after S2 | on red tests | before commit",
   "invariants": ["architecture decisions / invariants the executor must keep"],
   "rules": ["concrete rule from a project skill the code must follow (name the skill)"],
-  "checkpoints": ["S2", "S4"]
+  "checkpoints": ["S2", "S4"],
+  "deferred_rulings": [{"id": "D1", "ruling": "unblock | drop | keep", "guidance": "how to resolve it, or why to drop it (only when DEFERRED ITEMS are listed)"}]
 }`;
 
 /** Pull the first balanced JSON object out of a model reply (tolerates ```json fences and prose). */
@@ -170,6 +180,10 @@ export function renderPlan(r: AdvisorReply, label: string, truncated = false): s
 	}
 	if (r.checkpoints?.length) out.push(`Review checkpoints: call baton_review after ${r.checkpoints.join(", ")}`);
 	if (truncated) out.push(`(plan cut to ${MAX_STEPS} steps: call the advisor again after the last one)`);
+	if (r.deferred_rulings?.length) {
+		out.push("Deferred item rulings:");
+		for (const d of r.deferred_rulings) out.push(`- ${d.id}: ${d.ruling}${d.guidance ? ` — ${d.guidance}` : ""}`);
+	}
 	if (r.do_not_retry.length) out.push(`Do not retry: ${r.do_not_retry.join("; ")}`);
 	if (r.test_cmd) out.push(`Test command: ${r.test_cmd}`);
 	if (r.questions_for_user?.length) out.push(`Questions for the user: ${r.questions_for_user.join(" | ")}`);

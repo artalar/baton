@@ -50,6 +50,25 @@
     "planBeforeWrite": true,
     "driftCalls": 20
   },
+  "loop": {
+    "enabled": true,
+    "windowCalls": 30,
+    "maxHops": 6,
+    "hopGapCalls": 30,
+    "readRepeatThreshold": 8,
+    "cutContext": true,
+    "blockDeferredEdits": true,
+    "ignoreReadPaths": [
+      "**/node_modules/**",
+      "**/SKILL.md",
+      "**/REFERENCE.md",
+      "**/README.md",
+      "**/AGENTS.md",
+      ".agents/**",
+      ".pi/**",
+      "docs/**"
+    ]
+  },
   "mask": {
     "enabled": true,
     "exemptTools": [
