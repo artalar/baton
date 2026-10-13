@@ -25,6 +25,8 @@ export interface SwitchConfig {
 	maxImplementMs: number;
 	/** Replay the lead payload (max_tokens 1) when the lead was idle this long during a helper stretch (ms, 0 = off). */
 	cacheKeepaliveMs: number;
+	/** Budget estimate per keepalive (USD; the aborted stream reports no usage). */
+	cacheKeepaliveCostUsd: number;
 	/** Tool-call caps per helper stretch. */
 	maxReadCalls: number;
 	maxFollowupCalls: number;
@@ -72,6 +74,7 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	maxHelperMs: 270_000,
 	maxImplementMs: 0,
 	cacheKeepaliveMs: 230_000,
+	cacheKeepaliveCostUsd: 0.06,
 	maxReadCalls: 30,
 	maxFollowupCalls: 12,
 	readTextChars: 300,

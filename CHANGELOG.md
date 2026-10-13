@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.3
+
+- **Keepalive fixed.** Arm J: the 0.10.1 keepalive stripped `reasoning` and set `max_tokens: 1`. Changing thinking params invalidates Anthropic's message cache, so it *wrote* the cache instead of reading it (cached 0, $0.195). It now replays the lead payload byte-identically (streamed) and aborts after the first model chunk. The budget counts `cacheKeepaliveCostUsd` (0.06) per keepalive.
+
 ## 0.10.2
 
 - `maxImplementMs` now defaults to **0 = no time limit** on GLM implement stretches; a cap applies only when set explicitly. The lead cache stays warm via the 0.10.1 keepalive.

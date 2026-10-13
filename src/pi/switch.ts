@@ -332,22 +332,39 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		keepaliveBusy = true;
 		const t0 = Date.now();
 		try {
-			const { stream: _s, stream_options: _so, ...rest } = lastLeadPayload as Record<string, unknown>;
-			const body = { ...rest, max_tokens: 1, usage: { include: true } };
-			delete (body as Record<string, unknown>).max_completion_tokens;
-			delete (body as Record<string, unknown>).reasoning;
-			delete (body as Record<string, unknown>).reasoning_effort;
+			// Byte-identical body (thinking params included — changing them invalidates Anthropic's
+			// message cache, arm J: keepalive without reasoning missed and cost $0.195). Stream and
+			// abort on the first chunk: the prefix is read from cache, almost no output is billed.
+			const ac = new AbortController();
+			const timer = setTimeout(() => ac.abort(), 30_000);
 			const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
 				method: "POST",
 				headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-				body: JSON.stringify(body),
-				signal: AbortSignal.timeout(30_000),
+				body: JSON.stringify({ ...(lastLeadPayload as Record<string, unknown>), stream: true }),
+				signal: ac.signal,
 			});
-			const j = (await r.json().catch(() => ({}))) as { usage?: { cost?: number; prompt_tokens_details?: { cached_tokens?: number } } };
-			const cost = Number(j.usage?.cost ?? 0);
+			let firstMs: number | null = null;
+			try {
+				const rd = r.body?.getReader();
+				if (rd) {
+					// skip OpenRouter's ": PROCESSING" comments: wait for the first model chunk,
+					// so the upstream request has really read the cached prefix before we abort
+					const dec = new TextDecoder();
+					for (;;) {
+						const { done, value } = await rd.read();
+						if (done || dec.decode(value, { stream: true }).includes('"choices"')) break;
+					}
+					firstMs = Date.now() - t0;
+					await rd.cancel().catch(() => {});
+				}
+			} finally {
+				ac.abort();
+				clearTimeout(timer);
+			}
+			const cost = cfg.cacheKeepaliveCostUsd;
 			keepaliveCost += cost;
 			lastLeadAt = t0;
-			log("cache_keepalive", { status: r.status, ms: Date.now() - t0, cost, cachedTokens: j.usage?.prompt_tokens_details?.cached_tokens ?? null, phase: st.phase });
+			log("cache_keepalive", { status: r.status, ms: Date.now() - t0, firstMs, costEstimate: cost, phase: st.phase });
 		} catch (err) {
 			log("cache_keepalive", { error: String((err as Error).name), phase: st?.phase });
 			lastLeadAt = Date.now();
