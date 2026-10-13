@@ -184,7 +184,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	};
 	const summary = () => {
 		if (!st) return;
-		const s = { phase: st.phase, jev: jevSummary(), switches: st.switches.length, followups: st.followups, costs, total: num(costs), budget: { ...budgetSpend(costs, leadId(), cfg!.helperCostFactor), jevUsd: extraCost() }, budgetStopped, metrics: st.metrics, flags: st.flags, wallS: Math.round((Date.now() - started) / 1000), switchLog: st.switches };
+		const s = { phase: st.phase, jev: jevSummary(), switches: st.switches.length, followups: st.followups, costs, total: num(costs), budget: { ...budgetSpend(costs, leadId(), cfg!.helperCostFactor), jevUsd: extraCost() }, budgetStopped, metrics: st.metrics, flags: st.flags, wallS: Math.round((Date.now() - started) / 1000), switchLog: st.switches, spec: { stats: st.specStats, runs: st.specLog, adapt: st.specAdaptLog, cap: st.specCap } };
 		try {
 			writeFileSync(join(dir, "switch-summary.json"), JSON.stringify(s, null, 2));
 		} catch {
