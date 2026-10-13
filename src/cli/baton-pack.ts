@@ -3,8 +3,9 @@
  * baton-pack: print the advisor pack for a repository + task. No LLM call.
  *   baton-pack [--cwd DIR] [--kind review|help|plan] [--plan FILE] [--claim TEXT]... [--budget N] [--json] TASK...
  */
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { collectPackInput } from "../core/pack/collect.ts";
 import { type AdvisorKind, buildReviewPack } from "../core/pack/index.ts";
 
@@ -21,31 +22,81 @@ export interface CliArgs {
 	noCache: boolean;
 }
 
-/** Pure: parse argv (without node + script). */
-export function parseArgs(argv: string[]): CliArgs {
+export type CliParse = { help: true } | { version: true } | CliArgs;
+
+export function packUsage(): string {
+	return [
+		"baton-pack: print the advisor pack for a repository and a task. No LLM call.",
+		"Usage: baton-pack [options] TASK...",
+		"",
+		"Options:",
+		"  --cwd DIR              repository directory (default: cwd)",
+		"  --kind review|help|plan",
+		"  --plan FILE            pinned plan file",
+		"  --claim TEXT           executor claim (repeatable)",
+		"  --budget N             pack budget in tokens (positive integer)",
+		"  --json                 print the pack as JSON",
+		"  --task-file FILE       read the task from a file",
+		"  -h, --help             show this help",
+		"  -V, --version          print the package version",
+		"",
+	].join("\n");
+}
+
+export function packageVersion(from: string = import.meta.url): string {
+	let dir = dirname(fileURLToPath(from));
+	for (;;) {
+		const pkgPath = join(dir, "package.json");
+		if (existsSync(pkgPath)) {
+			const version = (JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: unknown }).version;
+			if (typeof version === "string" && version) return version;
+		}
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	throw new Error("package.json not found");
+}
+
+function positiveInt(flag: string, raw: string): number {
+	if (!/^[1-9]\d*$/.test(raw)) throw new Error(`${flag} must be a positive integer`);
+	const n = Number(raw);
+	if (!Number.isSafeInteger(n)) throw new Error(`${flag} must be a positive integer`);
+	return n;
+}
+
+export function parseArgs(argv: string[]): CliParse {
 	const a: CliArgs = { cwd: process.cwd(), kind: "review", task: "", claims: [], json: false, noCache: false };
 	const rest: string[] = [];
+	let positional = false;
 	for (let i = 0; i < argv.length; i++) {
 		const x = argv[i]!;
+		if (positional) {
+			rest.push(x);
+			continue;
+		}
 		const val = () => {
 			const v = argv[++i];
 			if (v === undefined) throw new Error(`${x} needs a value`);
 			return v;
 		};
-		if (x === "--cwd") a.cwd = resolve(val());
+		if (x === "--") positional = true;
+		else if (x === "--help" || x === "-h") return { help: true };
+		else if (x === "--version" || x === "-V") return { version: true };
+		else if (x === "--cwd") a.cwd = resolve(val());
 		else if (x === "--kind") {
 			const k = val();
 			if (k !== "review" && k !== "help" && k !== "plan") throw new Error(`--kind must be review|help|plan`);
 			a.kind = k;
 		} else if (x === "--plan") a.plan = readFileSync(val(), "utf8");
 		else if (x === "--claim") a.claims.push(val());
-		else if (x === "--budget") a.budget = Number(val());
+		else if (x === "--budget") a.budget = positiveInt("--budget", val());
 		else if (x === "--model") a.model = val();
-		else if (x === "--max-tokens") a.maxTokens = Number(val());
+		else if (x === "--max-tokens") a.maxTokens = positiveInt("--max-tokens", val());
 		else if (x === "--no-cache") a.noCache = true;
 		else if (x === "--json") a.json = true;
-		else if (x === "--") continue;
 		else if (x === "--task-file") rest.push(readFileSync(val(), "utf8"));
+		else if (x.startsWith("-")) throw new Error(`unknown option ${x}`);
 		else rest.push(x);
 	}
 	a.task = rest.join(" ").trim();
@@ -58,8 +109,17 @@ export async function packFromArgs(a: CliArgs) {
 	return buildReviewPack(input, { budgetTokens: a.budget });
 }
 
-export async function main() {
-	const a = parseArgs(process.argv.slice(2));
+export async function main(argv: string[] = process.argv.slice(2)) {
+	const parsed = parseArgs(argv);
+	if ("help" in parsed) {
+		process.stdout.write(packUsage());
+		return;
+	}
+	if ("version" in parsed) {
+		process.stdout.write(`${packageVersion()}\n`);
+		return;
+	}
+	const a = parsed;
 	const pack = await packFromArgs(a);
 	if (a.json) process.stdout.write(`${JSON.stringify(pack, null, 2)}\n`);
 	else {

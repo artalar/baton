@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -60,5 +60,41 @@ describe("journal", () => {
 		expect(j2.events).toHaveLength(2);
 		expect(j2.forCall("c1")?.evt).toBe(2);
 		expect(j2.nextEvt()).toBe(3);
+		expect(readFileSync(join(dir, ".gitignore"), "utf8")).toBe("*\n");
+	});
+	it("does not overwrite an existing journal gitignore", () => {
+		const dir = mkdtempSync(join(tmpdir(), "baton-"));
+		writeFileSync(join(dir, ".gitignore"), "keep\n");
+		new Journal(dir);
+		expect(readFileSync(join(dir, ".gitignore"), "utf8")).toBe("keep\n");
+	});
+	it("scopes prompts to a session directory and reloads that session only", () => {
+		const dir = mkdtempSync(join(tmpdir(), "baton-"));
+		const first = new Journal(dir, { sessionId: "sess-a" });
+		first.record("user_prompt", 0, "first task");
+		first.record("note", 1, "gate", { gate: { finalize: true } });
+		const second = new Journal(dir, { sessionId: "sess-b" });
+		expect(second.events).toEqual([]);
+		second.record("user_prompt", 0, "second task");
+		expect(second.events.map((e) => e.text)).toEqual(["second task"]);
+		const resumed = new Journal(dir, { sessionId: "sess-a" });
+		expect(resumed.events.map((e) => e.text)).toEqual(["first task", "gate"]);
+		expect(resumed.dir).toBe(join(dir, "sessions", "sess-a"));
+		expect(readFileSync(join(dir, ".gitignore"), "utf8")).toBe("*\n");
+	});
+	it("hides earlier events after a fresh session marker when there is no session id", () => {
+		const dir = mkdtempSync(join(tmpdir(), "baton-"));
+		const old = new Journal(dir);
+		old.record("user_prompt", 0, "ancient");
+		const cur = new Journal(dir, { freshMarker: true });
+		expect(cur.events.map((e) => e.kind)).toEqual(["session_start"]);
+		expect(cur.get(1)).toBeUndefined();
+		cur.record("user_prompt", 1, "now");
+		expect(cur.events.some((e) => e.text === "ancient")).toBe(false);
+		const next = new Journal(dir, { freshMarker: true });
+		expect(next.events.map((e) => e.text)).toEqual(["session_start"]);
+		expect(next.events.some((e) => e.text === "now" || e.text === "ancient")).toBe(false);
+		const whole = new Journal(dir);
+		expect(whole.events.some((e) => e.text === "ancient")).toBe(true);
 	});
 });

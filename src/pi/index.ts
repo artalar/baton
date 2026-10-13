@@ -38,6 +38,21 @@ Stuck rule: if one bug or test still fails after ~3 fix attempts, STOP. Mark the
 /** Default guidance (compaction off). */
 export const SYSTEM_SNIPPET = systemSnippet(false);
 
+function piSessionId(ctx: ExtensionContext): string | undefined {
+	try {
+		const id = ctx.sessionManager.getSessionId();
+		return id.trim() ? id.trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function openSessionJournal(ctx: ExtensionContext, journalDir: string): Journal {
+	const root = join(ctx.cwd, journalDir);
+	const sessionId = piSessionId(ctx);
+	return sessionId ? new Journal(root, { sessionId }) : new Journal(root, { freshMarker: true });
+}
+
 /** Pure: pinned plan text with step status marks. */
 export function renderPinned(plan: { reply: AdvisorReply; label: string }, status: Record<string, string>): string {
 	const marks = plan.reply.plan.map((st) => `[${status[st.id] === "done" ? "x" : status[st.id] === "blocked" ? "!" : status[st.id] === "deferred" ? "~" : " "}] ${st.id}`).join("  ");
@@ -91,7 +106,7 @@ export default function baton(pi: ExtensionAPI) {
 		const cfg = loadConfig(ctx.cwd, (m) => ctx.hasUI && ctx.ui.notify(m, "warning"));
 		rt = {
 			cfg,
-			journal: new Journal(join(ctx.cwd, cfg.journalDir)),
+			journal: openSessionJournal(ctx, cfg.journalDir),
 			triggers: initialTriggerState(),
 			turn: 0,
 			userPrompts: [],
@@ -124,40 +139,57 @@ export default function baton(pi: ExtensionAPI) {
 		return { stdout: r.stdout, code: r.code };
 	};
 
-	pi.on("session_start", (_e, ctx) => {
-		init(ctx);
-	});
-	pi.on("session_shutdown", () => {
-		rt = undefined;
-	});
-
 	// 0.11: keep the advisor's shared system prefix cached while the executor works and another advisor
 	// call is expected (a pinned plan that is not done → a review will follow). Same model, same cache
 	// retention, no reasoning (as the real call), max 1 output token; see advisorKeepaliveWorthIt.
 	let keepaliveBusy = false;
-	const keepaliveTimer = setInterval(async () => {
-		const r = rt;
-		if (!r || keepaliveBusy || !r.frozenSystem || !r.keepaliveCtx || r.advisorAt === undefined) return;
-		const ka = r.cfg.advisor.keepalive;
-		if (!ka.everyMs || r.cfg.advisor.cache !== "short") return;
-		const expectNext = !!r.pinned && r.pinned.reply.verdict !== "done";
-		if (!expectNext || (r.keepalives ?? 0) >= ka.max || Date.now() - r.advisorAt < ka.everyMs * ((r.keepalives ?? 0) + 1)) return;
-		keepaliveBusy = true;
-		try {
-			const ref = parseModelRef(r.cfg.advisor.model);
-			const model = ref && r.keepaliveCtx.modelRegistry.find(ref.provider, ref.id);
-			if (!model) return;
-			const res = await r.keepaliveCtx.modelRegistry.complete(model, toPiContext([{ role: "system", content: r.frozenSystem }, { role: "user", content: "Cache keepalive. Reply with {}." }]) as any, { maxTokens: 1, cacheRetention: r.cfg.advisor.cache });
-			r.keepalives = (r.keepalives ?? 0) + 1;
-			r.journal.record("note", r.turn, `advisor cache keepalive #${r.keepalives}`, { keepalive: true, usage: res.usage });
-		} catch (err) {
-			r.journal.record("note", r.turn, `advisor cache keepalive failed: ${(err as Error).name}`, { keepalive: true });
-			r.keepalives = ka.max;
-		} finally {
-			keepaliveBusy = false;
+	let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+	const stopKeepalive = () => {
+		if (keepaliveTimer) clearInterval(keepaliveTimer);
+		keepaliveTimer = undefined;
+		if (rt) {
+			rt.advisorAt = undefined;
+			rt.keepaliveCtx = undefined;
 		}
-	}, 10_000);
-	(keepaliveTimer as { unref?: () => void }).unref?.();
+	};
+	const armKeepalive = () => {
+		if (keepaliveTimer) return;
+		keepaliveTimer = setInterval(async () => {
+			const r = rt;
+			if (!r || keepaliveBusy || !r.frozenSystem || !r.keepaliveCtx || r.advisorAt === undefined) return;
+			const ka = r.cfg.advisor.keepalive;
+			if (!ka.everyMs || r.cfg.advisor.cache !== "short") return;
+			const expectNext = !!r.pinned && r.pinned.reply.verdict !== "done";
+			if (!expectNext || (r.keepalives ?? 0) >= ka.max || Date.now() - r.advisorAt < ka.everyMs * ((r.keepalives ?? 0) + 1)) return;
+			keepaliveBusy = true;
+			try {
+				const ref = parseModelRef(r.cfg.advisor.model);
+				const model = ref && r.keepaliveCtx.modelRegistry.find(ref.provider, ref.id);
+				if (!model) return;
+				const res = await r.keepaliveCtx.modelRegistry.complete(model, toPiContext([{ role: "system", content: r.frozenSystem }, { role: "user", content: "Cache keepalive. Reply with {}." }]) as any, { maxTokens: 1, cacheRetention: r.cfg.advisor.cache });
+				if (rt !== r || r.advisorAt === undefined || r.pinned?.reply.verdict === "done") return;
+				r.keepalives = (r.keepalives ?? 0) + 1;
+				r.journal.record("note", r.turn, `advisor cache keepalive #${r.keepalives}`, { keepalive: true, usage: res.usage });
+			} catch (err) {
+				if (rt !== r) return;
+				r.journal.record("note", r.turn, `advisor cache keepalive failed: ${(err as Error).name}`, { keepalive: true });
+				r.keepalives = ka.max;
+			} finally {
+				keepaliveBusy = false;
+			}
+		}, 10_000);
+		(keepaliveTimer as { unref?: () => void }).unref?.();
+	};
+	armKeepalive();
+
+	pi.on("session_start", (_e, ctx) => {
+		init(ctx);
+		armKeepalive();
+	});
+	pi.on("session_shutdown", () => {
+		stopKeepalive();
+		rt = undefined;
+	});
 	pi.on("turn_start", (e, ctx) => {
 		init(ctx).turn = e.turnIndex;
 	});
@@ -225,9 +257,9 @@ export default function baton(pi: ExtensionAPI) {
 		r.triggers = onToolResult(r.triggers, e.toolName, ev.errSig, (ev.filesWritten?.length ?? 0) > 0, callFacts(e.toolName, cmd, ev.exit, ev.test));
 		const usage = ctx.getContextUsage();
 		const ratio = usage && usage.tokens !== null && usage.contextWindow ? usage.tokens / usage.contextWindow : null;
-		const { nudge, state } = evaluate(r.triggers, r.cfg.triggers, ratio);
-		r.triggers = state;
 		const compact = r.cfg.compact.enabled;
+		const { nudge, state } = evaluate(r.triggers, r.cfg.triggers, ratio, compact);
+		r.triggers = state;
 		if (nudge?.kind === "context" && compact) {
 			// context pressure: hand off to the advisor (review) instead of silent masking
 			r.pendingHandoff ??= { kind: "review", reason: "auto:context", question: `Context is at ${Math.round((ratio ?? 0) * 100)}% of the window. Review the work so far and give the plan for the rest; the executor's context is reset after your reply.` };
@@ -439,6 +471,12 @@ export default function baton(pi: ExtensionAPI) {
 	/** One advisor call (a handoff). In handoff mode a successful call also resets the executor's context. */
 	async function handoff(kind: AdvisorKind, extra: Partial<PackInput> & { importantEvts?: number[] }, ctx: ExtensionContext, signal?: AbortSignal) {
 		const { r, pack, res } = await runAdvisor(kind, extra, ctx, signal);
+		if (res.ok && res.reply && res.reply.verdict === "done") {
+			r.advisorAt = undefined;
+			r.keepaliveCtx = undefined;
+			r.pinned = { label: `baton_${kind}`, reply: res.reply };
+			r.stepStatus = {};
+		}
 		if (!res.ok || !res.reply) {
 			r.journal.record("advisor", r.turn, `baton_${kind} failed: ${(res.errors ?? []).join("; ")}`, { raw: res.raw, usage: res.usage, attempts: res.attempts });
 			const fallback = res.raw ? `\nRaw advisor reply (unvalidated):\n${clip(res.raw, 8000)}` : "";

@@ -83,13 +83,23 @@ const INSTRUCTIONS: Record<AdvisorKind, string> = {
 5. Batch: put ALL fixes you want into this one reply (the executor cannot call you again until the review-verified steps are closed or a lot of code changed). Do not drip-feed 1-2 tiny steps per review.
 6. Mark each step's verify: "self" for small/mechanical fixes (rename, cast removal, one-line fix, add a test the executor can run, docs, optional nits) — the executor does them, runs the check and marks them done, no re-review; "review" only for changes whose correctness you must see. Prefer "self".
 7. Optional nits never block "done": if the work satisfies the task, return verdict done (any remaining nits as verify:"self" steps); after done the executor only commits.
-verdict: done = complete and correct; on_track = correct so far; course_correct = fixable issues (put fixes in plan); replan = the approach is wrong.`,
+verdict: done = complete and correct; on_track = correct so far; course_correct = fixable issues (put fixes in plan); replan = the approach is wrong. Use need_user when the task is ambiguous or needs a user decision; put the questions in questions_for_user.`,
 	help: "Explain the root cause in assessment, correct wrong executor beliefs in facts_corrected (cite evt numbers), list approaches that must not be retried, and give the next steps.",
 	plan: "Base the architecture on the PROJECT SKILLS rules (name the skill in each rule). Put architecture decisions in invariants, skill rules in rules, and the ids of steps after which a review is due in checkpoints (at least one, early: right after the core model works).",
 };
 
+const BATON_CLOSER = /<\/(file|skill|baton_pack)>/g;
+
+export function escapeXmlAttr(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function neutralizeBatonClosers(text: string): string {
+	return text.replace(BATON_CLOSER, "<\\/$1>");
+}
+
 function fmtCall(c: VerbatimCall): string {
-	return `--- ${eventLine(c.event)}\nargs: ${c.args}\noutput:\n${c.output}`;
+	return neutralizeBatonClosers(`--- ${eventLine(c.event)}\nargs: ${c.args}\noutput:\n${c.output}`);
 }
 
 /**
@@ -105,22 +115,27 @@ export function packSections(i: PackInput): Section[] {
 			title: "PROJECT SKILLS (rules to check against)",
 			cut: 3,
 			stable: true,
-			body: i.skills.map((k) => `<skill name="${k.name}" path="${k.path}">\n${k.body}\n</skill>`).join("\n\n"),
+			body: i.skills.map((k) => `<skill name="${escapeXmlAttr(k.name)}" path="${escapeXmlAttr(k.path)}">\n${neutralizeBatonClosers(k.body)}\n</skill>`).join("\n\n"),
 		});
-	if (i.agentsMd) s.push({ title: "PROJECT RULES (AGENTS.md)", cut: 3, stable: true, body: i.agentsMd });
+	if (i.agentsMd) s.push({ title: "PROJECT RULES (AGENTS.md)", cut: 3, stable: true, body: neutralizeBatonClosers(i.agentsMd) });
 	// kind-specific role: first section of the user message (after the shared cached prefix)
 	s.push({ title: "CALL ROLE", cut: 0, body: ROLE[i.kind] });
 	// 2. plan (the contract), 3. task
-	if (i.previousPlan) s.push({ title: i.kind === "review" ? "PINNED PLAN (review against it)" : "PREVIOUS ADVISOR PLAN", cut: 3, body: i.previousPlan });
-	s.push({ title: "TASK (verbatim)", cut: 0, body: i.task || "(no task captured)" });
+	if (i.previousPlan) s.push({ title: i.kind === "review" ? "PINNED PLAN (review against it)" : "PREVIOUS ADVISOR PLAN", cut: 3, body: neutralizeBatonClosers(i.previousPlan) });
+	s.push({ title: "TASK (verbatim)", cut: 0, body: neutralizeBatonClosers(i.task || "(no task captured)") });
 	if (i.userPrompts.length)
-		s.push({ title: "USER PROMPTS (verbatim)", cut: 0, body: i.userPrompts.map((p) => `${p.evt ? `[evt#${p.evt}] ` : ""}${p.text}`).join("\n\n") });
+		s.push({ title: "USER PROMPTS (verbatim)", cut: 0, body: neutralizeBatonClosers(i.userPrompts.map((p) => `${p.evt ? `[evt#${p.evt}] ` : ""}${p.text}`).join("\n\n")) });
 	// 4. artefacts (long data)
-	if (i.kind === "plan" && i.repoMap) s.push({ title: "REPO MAP", cut: 4, body: i.repoMap });
-	if (i.diffStat) s.push({ title: "GIT DIFF --stat", cut: 0, body: i.diffStat });
+	if (i.kind === "plan" && i.repoMap) s.push({ title: "REPO MAP", cut: 4, body: neutralizeBatonClosers(i.repoMap) });
+	if (i.diffStat) s.push({ title: "GIT DIFF --stat", cut: 0, body: neutralizeBatonClosers(i.diffStat) });
 	if (i.kind === "review") {
-		if (i.changedFiles?.length) s.push({ title: "CHANGED FILES", cut: 4, body: i.changedFiles.map((f) => `<file path="${f.path}">\n${f.content}\n</file>`).join("\n\n") });
-		if (i.diff !== undefined) s.push({ title: "GIT DIFF", cut: 2, body: i.diff || "(empty diff)" });
+		if (i.changedFiles?.length)
+			s.push({
+				title: "CHANGED FILES",
+				cut: 4,
+				body: i.changedFiles.map((f) => `<file path="${escapeXmlAttr(f.path)}">\n${neutralizeBatonClosers(f.content)}\n</file>`).join("\n\n"),
+			});
+		if (i.diff !== undefined) s.push({ title: "GIT DIFF", cut: 2, body: neutralizeBatonClosers(i.diff || "(empty diff)") });
 		s.push({ title: "LAST TEST RUN", cut: 1, body: i.lastTest ? fmtCall(i.lastTest) : "(no test run recorded)" });
 	}
 	if (i.kind === "help") {
@@ -128,17 +143,17 @@ export function packSections(i: PackInput): Section[] {
 		if (i.sameErrorCalls?.length) s.push({ title: "EARLIER CALLS WITH THE SAME ERROR SIGNATURE", cut: 2, body: i.sameErrorCalls.map(fmtCall).join("\n\n") });
 		if (i.important?.length) s.push({ title: "EVENTS MARKED IMPORTANT BY EXECUTOR", cut: 2, body: i.important.map(fmtCall).join("\n\n") });
 	}
-	if (i.timeline?.length) s.push({ title: i.kind === "plan" ? "EXPLORATION FINDINGS (journal)" : "TIMELINE (importance ≥2)", cut: 3, body: i.timeline.map(eventLine).join("\n") });
+	if (i.timeline?.length) s.push({ title: i.kind === "plan" ? "EXPLORATION FINDINGS (journal)" : "TIMELINE (importance ≥2)", cut: 3, body: neutralizeBatonClosers(i.timeline.map(eventLine).join("\n")) });
 	if (i.deferred)
-		s.push({ title: "DEFERRED ITEMS (Baton loop detector; rule on each in deferred_rulings: unblock with guidance, drop, or keep)", cut: 0, body: i.deferred });
+		s.push({ title: "DEFERRED ITEMS (Baton loop detector; rule on each in deferred_rulings: unblock with guidance, drop, or keep)", cut: 0, body: neutralizeBatonClosers(i.deferred) });
 	// 5. executor claims, always unverified
 	if (i.kind === "help") {
-		if (i.hypothesis) s.push({ title: "EXECUTOR HYPOTHESIS (unverified)", cut: 0, body: i.hypothesis });
-		if (i.attempts?.length) s.push({ title: "EXECUTOR ATTEMPTS (unverified)", cut: 0, body: i.attempts.map((a) => `- ${a}`).join("\n") });
+		if (i.hypothesis) s.push({ title: "EXECUTOR HYPOTHESIS (unverified)", cut: 0, body: neutralizeBatonClosers(i.hypothesis) });
+		if (i.attempts?.length) s.push({ title: "EXECUTOR ATTEMPTS (unverified)", cut: 0, body: neutralizeBatonClosers(i.attempts.map((a) => `- ${a}`).join("\n")) });
 	}
 	const claims = [...(i.claims ?? []), ...(i.kind === "review" && i.question ? [i.question] : [])];
-	if (claims.length) s.push({ title: "EXECUTOR CLAIMS (unverified)", cut: 0, body: claims.length === 1 ? claims[0]! : claims.map((c) => `- ${c}`).join("\n") });
-	if (i.question && i.kind !== "review") s.push({ title: "QUESTION FROM EXECUTOR", cut: 0, body: i.question });
+	if (claims.length) s.push({ title: "EXECUTOR CLAIMS (unverified)", cut: 0, body: neutralizeBatonClosers(claims.length === 1 ? claims[0]! : claims.map((c) => `- ${c}`).join("\n")) });
+	if (i.question && i.kind !== "review") s.push({ title: "QUESTION FROM EXECUTOR", cut: 0, body: neutralizeBatonClosers(i.question) });
 	// 6. instructions + schema last
 	s.push({
 		title: "INSTRUCTIONS",

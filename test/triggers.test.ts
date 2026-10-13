@@ -22,6 +22,9 @@ describe("triggers", () => {
 		expect(evaluate(s, cfg, 0.59).nudge).toBeUndefined();
 		const r = evaluate(s, cfg, 0.6);
 		expect(r.nudge?.kind).toBe("context");
+		expect(r.nudge?.message).toContain("context is at 60%");
+		expect(r.nudge?.message).not.toContain("reset");
+		expect(evaluate(run(initialTriggerState(), 6), cfg, 0.6, true).nudge?.message).toContain("reset the context to task + plan");
 		s = run(r.state, 10);
 		expect(evaluate(s, cfg, 0.9).nudge).toBeUndefined();
 	});

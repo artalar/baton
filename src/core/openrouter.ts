@@ -15,7 +15,10 @@ export interface OpenRouterOptions {
 	cacheTtl?: "5m" | "1h";
 	/** Extra request fields (e.g. `reasoning: {effort: "low"}`). */
 	extra?: Record<string, unknown>;
+	timeoutMs?: number;
 }
+
+export const DEFAULT_OPENROUTER_TIMEOUT_MS = 300_000;
 
 export function supportsCacheControl(model: string): boolean {
 	return /^anthropic\//.test(model);
@@ -25,6 +28,7 @@ export function supportsCacheControl(model: string): boolean {
 export function buildOpenRouterRequest(messages: ChatMessage[], o: OpenRouterOptions): Record<string, unknown> {
 	const cache = (o.cache ?? true) && supportsCacheControl(o.model);
 	return {
+		...(o.extra ?? {}),
 		model: o.model,
 		max_tokens: o.maxTokens ?? 8192,
 		messages: messages.map((m) =>
@@ -33,7 +37,6 @@ export function buildOpenRouterRequest(messages: ChatMessage[], o: OpenRouterOpt
 				: { role: m.role, content: m.content },
 		),
 		usage: { include: true },
-		...(o.extra ?? {}),
 	};
 }
 
@@ -46,20 +49,32 @@ export function openRouterComplete(o: OpenRouterOptions, deps: { apiKey?: string
 	return async (messages): Promise<CompletionResult> => {
 		const key = deps.apiKey ?? process.env.OPENROUTER_API_KEY;
 		if (!key) return { text: "", stopReason: "error", errorMessage: "OPENROUTER_API_KEY is not set" };
+		const timeoutMs = o.timeoutMs ?? DEFAULT_OPENROUTER_TIMEOUT_MS;
+		const timeout = new AbortController();
+		const timer = setTimeout(() => timeout.abort(), timeoutMs);
+		(timer as { unref?: () => void }).unref?.();
+		const signal = deps.signal ? AbortSignal.any([deps.signal, timeout.signal]) : timeout.signal;
 		const f = deps.fetch ?? fetch;
 		try {
 			const res = await f(OPENROUTER_URL, {
 				method: "POST",
 				headers: { "content-type": "application/json", authorization: `Bearer ${key}`, "x-title": "baton" },
 				body: JSON.stringify(buildOpenRouterRequest(messages, o)),
-				signal: deps.signal,
+				signal,
 			});
-			if (!res.ok) return { text: "", stopReason: "error", errorMessage: `OpenRouter HTTP ${res.status}` };
+			if (!res.ok) {
+				const snippet = (await res.text()).slice(0, 300);
+				return { text: "", stopReason: "error", errorMessage: snippet ? `OpenRouter HTTP ${res.status}: ${snippet}` : `OpenRouter HTTP ${res.status}` };
+			}
 			const j = (await res.json()) as { choices?: { message?: { content?: string }; finish_reason?: string }[]; usage?: unknown };
 			const c = j.choices?.[0];
 			return { text: c?.message?.content ?? "", stopReason: c?.finish_reason === "length" ? "length" : "stop", usage: j.usage };
 		} catch (e) {
-			return { text: "", stopReason: deps.signal?.aborted ? "aborted" : "error", errorMessage: (e as Error).message };
+			if (deps.signal?.aborted) return { text: "", stopReason: "aborted", errorMessage: (e as Error).message };
+			if (timeout.signal.aborted) return { text: "", stopReason: "error", errorMessage: `OpenRouter request timed out after ${timeoutMs} ms` };
+			return { text: "", stopReason: "error", errorMessage: (e as Error).message };
+		} finally {
+			clearTimeout(timer);
 		}
 	};
 }

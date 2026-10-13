@@ -1,8 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { estimateTokens, headTail, oneLine, sha1, sha256 } from "./util.ts";
 
-export type EventKind = "tool_call" | "user_prompt" | "advisor" | "reset" | "note";
+export type EventKind = "tool_call" | "user_prompt" | "advisor" | "reset" | "note" | "session_start";
 
 export interface TestSummary {
 	cmd: string;
@@ -191,26 +192,67 @@ export function eventLine(e: JournalEvent): string {
 	return `evt#${e.evt} ${e.tool} ${e.argsDigest ?? ""} → exit ${e.exit}, ${e.outTokens ?? 0} tok${t}${err}`;
 }
 
-/** Append-only journal on disk: <dir>/events.jsonl + <dir>/raw/<evt>.txt. */
+export interface JournalOptions {
+	sessionId?: string;
+	freshMarker?: boolean;
+}
+
+export function sanitizeSessionId(id: string): string {
+	const safe = id.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^\.+/, "").slice(0, 200);
+	return safe && safe !== "." && safe !== ".." ? safe : sha1(id).slice(0, 16);
+}
+
+export function ensureJournalGitignore(dir: string) {
+	mkdirSync(dir, { recursive: true });
+	try {
+		writeFileSync(join(dir, ".gitignore"), "*\n", { flag: "wx" });
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+	}
+}
+
+/** Append-only journal on disk: <dir>/events.jsonl + <dir>/raw/<evt>.txt. A sessionId stores that journal under <dir>/sessions/<sessionId>/. */
 export class Journal {
 	readonly dir: string;
 	events: JournalEvent[] = [];
 	private byCall = new Map<string, JournalEvent>();
 
-	constructor(dir: string) {
-		this.dir = dir;
-		mkdirSync(join(dir, "raw"), { recursive: true });
-		const file = join(dir, "events.jsonl");
-		if (existsSync(file)) {
-			for (const line of readFileSync(file, "utf8").split("\n")) {
-				if (!line.trim()) continue;
-				try {
-					this.index(JSON.parse(line) as JournalEvent);
-				} catch {
-					/* skip corrupt line */
-				}
+	constructor(dir: string, opts: JournalOptions = {}) {
+		ensureJournalGitignore(dir);
+		this.dir = opts.sessionId ? join(dir, "sessions", sanitizeSessionId(opts.sessionId)) : dir;
+		mkdirSync(join(this.dir, "raw"), { recursive: true });
+		this.load();
+		if (!opts.sessionId && opts.freshMarker) this.markSession();
+	}
+
+	private load() {
+		const file = join(this.dir, "events.jsonl");
+		if (!existsSync(file)) return;
+		for (const line of readFileSync(file, "utf8").split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				this.index(JSON.parse(line) as JournalEvent);
+			} catch {
+				/* skip corrupt line */
 			}
 		}
+	}
+
+	private markSession() {
+		const marker: JournalEvent = {
+			evt: this.nextEvt(),
+			ts: new Date().toISOString(),
+			turn: 0,
+			kind: "session_start",
+			text: "session_start",
+			data: { sessionStart: randomUUID() },
+			importance: 0,
+		};
+		this.append(marker);
+		const start = this.events.findLastIndex((e) => e.kind === "session_start");
+		this.events = this.events.slice(start);
+		this.byCall = new Map();
+		for (const e of this.events) if (e.toolCallId) this.byCall.set(e.toolCallId, e);
 	}
 
 	private index(e: JournalEvent) {

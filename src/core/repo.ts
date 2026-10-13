@@ -13,6 +13,41 @@ export async function git(exec: Exec, args: string[]): Promise<string | undefine
 	}
 }
 
+export function splitNul(out: string): string[] {
+	return out.split("\0").filter((p) => p.length > 0);
+}
+
+export async function gitRoot(exec: Exec, cwd: string): Promise<string> {
+	const top = (await git(exec, ["rev-parse", "--show-toplevel"]))?.trim();
+	return top || cwd;
+}
+
+const BINARY_PROBE = 8192;
+
+export function readRepoText(abs: string): string | undefined {
+	if (!existsSync(abs)) return undefined;
+	try {
+		const buf = readFileSync(abs);
+		if (buf.subarray(0, Math.min(buf.length, BINARY_PROBE)).includes(0)) return undefined;
+		return buf.toString("utf8");
+	} catch {
+		return undefined;
+	}
+}
+
+export function formatRepoFile(abs: string, maxLines: number): string {
+	if (!existsSync(abs)) return "(deleted)";
+	try {
+		const buf = readFileSync(abs);
+		if (buf.subarray(0, Math.min(buf.length, BINARY_PROBE)).includes(0)) return `(binary, ${buf.length} bytes)`;
+		const text = buf.toString("utf8");
+		const lines = text.split("\n");
+		return lines.length <= maxLines ? text : `(${lines.length} lines; too long, see diff)`;
+	} catch {
+		return "(unreadable)";
+	}
+}
+
 /** Pure: the journal dir plus configured globs; always applied, regardless of .gitignore. */
 export function packExcludes(journalDir: string, extra: readonly string[]): string[] {
 	const j = journalDir.replace(/^\.\//, "").replace(/\/+$/, "");
@@ -55,25 +90,11 @@ export async function diffLinesSince(exec: Exec, from: string, excludes: readonl
 }
 
 export async function changedFiles(exec: Exec, cwd: string, maxLines = 400, excludes: readonly string[] = [".pi/baton/**"]): Promise<{ path: string; content: string }[]> {
-	const tracked = (await git(exec, ["diff", "--name-only", "HEAD"])) ?? (await git(exec, ["diff", "--name-only"])) ?? "";
-	const untracked = (await git(exec, ["ls-files", "--others", "--exclude-standard"])) ?? "";
-	const paths = [...new Set([...tracked.split("\n"), ...untracked.split("\n")].map((s) => s.trim()).filter(Boolean))].filter((p) => !matchesAny(p, excludes));
-	const out: { path: string; content: string }[] = [];
-	for (const p of paths.slice(0, 40)) {
-		const abs = join(cwd, p);
-		if (!existsSync(abs)) {
-			out.push({ path: p, content: "(deleted)" });
-			continue;
-		}
-		try {
-			const text = readFileSync(abs, "utf8");
-			const lines = text.split("\n");
-			out.push({ path: p, content: lines.length <= maxLines ? text : `(${lines.length} lines; too long, see diff)` });
-		} catch {
-			out.push({ path: p, content: "(unreadable)" });
-		}
-	}
-	return out;
+	const root = await gitRoot(exec, cwd);
+	const tracked = splitNul((await git(exec, ["diff", "--name-only", "-z", "HEAD"])) ?? (await git(exec, ["diff", "--name-only", "-z"])) ?? "");
+	const untracked = splitNul((await git(exec, ["ls-files", "--others", "--exclude-standard", "-z", "--full-name"])) ?? "");
+	const paths = [...new Set([...tracked, ...untracked])].filter((p) => !matchesAny(p, excludes));
+	return paths.slice(0, 40).map((p) => ({ path: p, content: formatRepoFile(join(root, p), maxLines) }));
 }
 
 const SYMBOL = /^\s*(export\s+)?(default\s+)?(async\s+)?(function|class|interface|type|const|enum|def|fn|func|struct|trait|impl)\s+([A-Za-z_][\w]*)/;

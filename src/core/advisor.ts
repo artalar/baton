@@ -27,22 +27,25 @@ export interface AdvisorResult {
 	raw: string;
 	errors?: string[];
 	usage?: unknown;
+	usages: unknown[];
 	model: string;
 	attempts: number;
 }
 
 export async function runAdvisor(model: string, messages: ChatMessage[], complete: CompleteFn): Promise<AdvisorResult> {
 	const msgs = [...messages];
+	const usages: unknown[] = [];
 	let raw = "";
 	let usage: unknown;
 	for (let attempt = 1; attempt <= 2; attempt++) {
 		const res = await complete(msgs);
+		usages.push(res.usage);
 		usage = res.usage;
-		if (res.stopReason === "error" || res.stopReason === "aborted") return { ok: false, raw, errors: [res.errorMessage ?? res.stopReason], usage, model, attempts: attempt };
+		if (res.stopReason === "error" || res.stopReason === "aborted") return { ok: false, raw, errors: [res.errorMessage ?? res.stopReason], usage, usages, model, attempts: attempt };
 		raw = res.text;
 		const parsed = parseAdvisorReply(raw);
-		if (parsed.ok) return { ok: true, reply: parsed.reply, truncated: parsed.truncated, raw, usage, model, attempts: attempt };
-		if (attempt === 2) return { ok: false, raw, errors: parsed.errors, usage, model, attempts: attempt };
+		if (parsed.ok) return { ok: true, reply: parsed.reply, truncated: parsed.truncated, raw, usage, usages, model, attempts: attempt };
+		if (attempt === 2) return { ok: false, raw, errors: parsed.errors, usage, usages, model, attempts: attempt };
 		msgs.push({ role: "assistant", content: raw });
 		msgs.push({
 			role: "user",
@@ -52,5 +55,5 @@ export async function runAdvisor(model: string, messages: ChatMessage[], complet
 					: `Your reply did not match the schema: ${parsed.errors.join("; ")}. Reply again with ONE valid JSON object only.`,
 		});
 	}
-	return { ok: false, raw, model, attempts: 2 };
+	return { ok: false, raw, usage, usages, model, attempts: 2 };
 }

@@ -12,6 +12,8 @@ describe("buildPack", () => {
 		expect(p.text).toContain("## GIT DIFF\n+a");
 		expect(p.text).toContain("LAST TEST RUN");
 		expect(p.text).toContain('"verdict"');
+		expect(p.text).toContain("needs a user decision");
+		expect(p.text).toContain("questions_for_user");
 		expect(p.overBudget).toBe(false);
 	});
 	it("fits a huge pack into the budget, cutting files before the diff and never the prompts", () => {
