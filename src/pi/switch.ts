@@ -5,12 +5,29 @@
  * Load with `-e src/pi/switch.ts`, or `-e src/pi/index.ts` with BATON_MODE=switch.
  * Config: `.pi/baton.json` → { "switch": { …SwitchConfig } }. Journal: `<journalDir>/switch.jsonl`, summary in switch-summary.json.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseModelRef } from "./config.ts";
-import { addCost, type Call, type CostRow, DEFAULT_SWITCH, decideTurn, gateCall, initialSwitchState, isHelper, MSG, type Msg, type Result, shapeContext, type SwitchConfig, type SwitchState, capReasoning, capMaxTokens, anchorCache } from "./switch-core.ts";
+import { addCost, anchorCache, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
+
+/** Test files under cwd (skips node_modules, dot dirs, dist). */
+export function hasTestFiles(dir: string, depth = 5): boolean {
+	if (depth < 0) return false;
+	let ents: import("node:fs").Dirent[];
+	try {
+		ents = readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return false;
+	}
+	for (const e of ents) {
+		if (e.isFile() && TEST_FILE.test(e.name)) return true;
+		if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules" && e.name !== "dist" && hasTestFiles(join(dir, e.name), depth - 1)) return true;
+	}
+	return false;
+}
 
 export function loadSwitchConfig(cwd: string): SwitchConfig & { journalDir: string } {
 	let over: Partial<SwitchConfig> = {};
@@ -25,10 +42,13 @@ export function loadSwitchConfig(cwd: string): SwitchConfig & { journalDir: stri
 			/* ignore bad config */
 		}
 	}
+	const env = process.env.BATON_BUDGET_USD;
+	if (env && Number(env) > 0) over.budgetUsd = Number(env);
 	return { ...DEFAULT_SWITCH, ...over, journalDir };
 }
 
 type Block = { type: string; id?: string; name?: string; arguments?: Record<string, unknown>; text?: string; thinking?: string };
+const num = (rows: Record<string, CostRow>) => Object.values(rows).reduce((a, r) => a + r.cost, 0);
 
 export default function batonSwitch(pi: ExtensionAPI) {
 	let cfg: (SwitchConfig & { journalDir: string }) | undefined;
@@ -38,6 +58,9 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	let turn = 0;
 	let started = 0;
 	let prevLeadLen = 0;
+	let afterHelper = false;
+	let budgetStopped = false;
+	let cwd = "";
 
 	const leadId = () => parseModelRef(cfg!.lead)!.id;
 	const log = (kind: string, data: Record<string, unknown>) => {
@@ -50,7 +73,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	};
 	const summary = () => {
 		if (!st) return;
-		const s = { phase: st.phase, switches: st.switches.length, followups: st.followups, costs, total: Object.values(costs).reduce((a, r) => a + r.cost, 0), wallS: Math.round((Date.now() - started) / 1000), switchLog: st.switches };
+		const s = { phase: st.phase, switches: st.switches.length, followups: st.followups, costs, total: num(costs), budget: budgetSpend(costs, leadId(), cfg!.helperCostFactor), budgetStopped, metrics: st.metrics, flags: st.flags, wallS: Math.round((Date.now() - started) / 1000), switchLog: st.switches };
 		try {
 			writeFileSync(join(dir, "switch-summary.json"), JSON.stringify(s, null, 2));
 		} catch {
@@ -61,6 +84,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	const init = (ctx: ExtensionContext) => {
 		if (cfg) return;
 		cfg = loadSwitchConfig(ctx.cwd);
+		cwd = ctx.cwd;
 		dir = isAbsolute(cfg.journalDir) ? cfg.journalDir : join(ctx.cwd, cfg.journalDir);
 	};
 
@@ -88,26 +112,47 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		log("start", { lead: cfg!.lead, helper: cfg!.helper, config: { ...cfg } });
 		await setModelFor(ctx, "read");
 		log("switch", { from: "-", to: "read", reason: "session start: helper reads first" });
-		return { message: { customType: "baton-switch-helper", content: MSG.read, display: true } };
+		return { message: { customType: "baton-switch-helper", content: MSG.read, display: true }, systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE };
 	});
 
 	pi.on("tool_call", (e, ctx) => {
 		if (!st) return undefined;
 		const c: Call = { id: e.toolCallId, name: e.toolName, args: (e.input ?? {}) as Record<string, unknown> };
-		const g = gateCall(st, c, (p) => existsSync(isAbsolute(p) ? p : join(ctx.cwd, p)));
+		const abs = (p: string) => (isAbsolute(p) ? p : join(ctx.cwd, p));
+		const g = gateCall(st, c, (p) => existsSync(abs(p)), (p) => {
+			try {
+				return readFileSync(abs(p), "utf8");
+			} catch {
+				return undefined;
+			}
+		});
 		if (g) {
 			st.blocked.push(c.id);
-			log("blocked", { phase: st.phase, tool: c.name, reason: g.reason });
+			log(g.reason.startsWith("Baton guardrail") ? "guardrail" : "blocked", { phase: st.phase, tool: c.name, reason: g.reason, args: JSON.stringify(c.args).slice(0, 300) });
 			return g;
 		}
 		return undefined;
 	});
 
-	pi.on("message_end", (e) => {
+	pi.on("message_end", (e, ctx) => {
 		const m = e.message as { role?: string; model?: string; usage?: Parameters<typeof addCost>[2]; responseId?: string; stopReason?: string };
 		if (m.role !== "assistant") return undefined;
 		costs = addCost(costs, m.model ?? "?", m.usage);
+		const isLead = !!m.model && String(m.model).includes(leadId());
 		log("usage", { model: m.model, phase: st?.phase, responseId: m.responseId, stopReason: m.stopReason, cost: m.usage?.cost?.total ?? 0, input: m.usage?.input, output: m.usage?.output, cacheRead: m.usage?.cacheRead, cacheWrite: m.usage?.cacheWrite });
+		if (isLead && afterHelper) {
+			log("lead_after_helper", { cacheRead: m.usage?.cacheRead, cacheWrite: m.usage?.cacheWrite, input: m.usage?.input, cost: m.usage?.cost?.total ?? 0 });
+			afterHelper = false;
+		}
+		if (cfg && st && !budgetStopped) {
+			const b = budgetExceeded(costs, leadId(), cfg);
+			if (b.stop) {
+				budgetStopped = true;
+				log("budget_stop", { estimate: b.estimate, budget: cfg.budgetUsd, reserve: cfg.reserveUsd, factor: cfg.helperCostFactor, phase: st.phase });
+				summary();
+				ctx.abort();
+			}
+		}
 		return undefined;
 	});
 
@@ -122,14 +167,18 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		if (!st || isHelper(st.phase)) return undefined;
 		const p = e.payload as { model?: string } | undefined;
 		if (!p?.model || !String(p.model).includes(leadId())) return undefined;
-		let out = capMaxTokens(e.payload, cfg!.leadMaxTokens);
+		const plan = leadRequestPlan(st, cfg!);
+		let out = capMaxTokens(e.payload, plan.maxTokens);
 		const len = Array.isArray((p as { messages?: unknown[] }).messages) ? (p as { messages: unknown[] }).messages.length : 0;
 		if (prevLeadLen && len - prevLeadLen > 3) {
-			out = anchorCache(out, prevLeadLen);
-			log("cache_anchor", { at: prevLeadLen, len });
+			const a = anchorCache(out, prevLeadLen);
+			out = a.payload;
+			log("cache_anchor", { prevLen: prevLeadLen, len, anchored: a.anchored, at: a.at, partType: a.partType, before: a.before, after: a.after, skipped: a.skipped });
 		}
 		prevLeadLen = len;
-		if (st.planningLeft <= 0 && cfg!.thinkingCap) out = capReasoning(out, cfg!.thinkingCap);
+		if (plan.capReasoning) out = capReasoning(out, cfg!.thinkingCap);
+		const o = out as { reasoning?: unknown; reasoning_effort?: unknown; max_tokens?: unknown; max_completion_tokens?: unknown };
+		log("lead_request", { phase: st.phase, planning: plan.planning, reasoning: o.reasoning ?? null, reasoning_effort: o.reasoning_effort ?? null, max_tokens: o.max_tokens ?? o.max_completion_tokens ?? null, cacheControls: countCacheControl(out), messages: len });
 		return out;
 	});
 
@@ -150,11 +199,19 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			text: (r.content as Block[]).flatMap((b) => (b.type === "text" && b.text ? [b.text] : [])).join("\n").slice(0, 20_000),
 		}));
 		const from = st.phase;
-		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, empty: !calls.length && !text.trim() && !hasThinking }, cfg);
+		const diffStat = () => {
+			try {
+				return execSync("git diff --stat HEAD; git ls-files --others --exclude-standard | sed 's/^/new file: /'", { cwd: ctx.cwd, encoding: "utf8", timeout: 10_000 }).slice(-3000);
+			} catch {
+				return "";
+			}
+		};
+		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
 		const entries: SessionBoundaryDraft[] = [];
-		if (d.reason && d.to === from && d.continue) log("retry", { phase: from, reason: d.reason });
+		if (d.reason && d.to === from && d.continue) log(d.message ? "nudge" : "retry", { phase: from, reason: d.reason });
 		if (d.to !== from) {
-			log("switch", { from, to: d.to, reason: d.reason, compacted: d.compacted, model: d.to === "done" ? undefined : isHelper(d.to) ? cfg!.helper : cfg!.lead, costs });
+			if (isHelper(from) && !isHelper(d.to)) afterHelper = true;
+			log("switch", { from, to: d.to, reason: d.reason, compacted: d.compacted, report: d.report, metrics: st.metrics, model: d.to === "done" ? undefined : isHelper(d.to) ? cfg!.helper : cfg!.lead, costs });
 			if (d.to !== "done") await setModelFor(ctx, d.to);
 			summary();
 		}
@@ -165,19 +222,43 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", () => {
-		if (st) log("end", { phase: st.phase, costs });
+		if (st) log("end", { phase: st.phase, costs, metrics: st.metrics, flags: st.flags, budget: budgetSpend(costs, leadId(), cfg!.helperCostFactor), budgetStopped });
 		summary();
 	});
 
+	const delegateReads = async (instruction: string) => {
+		const left = st ? cfg!.maxFollowups - st.followups : 0;
+		return { content: [{ type: "text" as const, text: left > 0 ? `Delegated to the helper: ${instruction}` : "No delegated read rounds left — read the files yourself." }], details: { left } };
+	};
 	pi.registerTool({
 		name: "delegate_reads",
 		label: "Delegate reads",
-		description:
-			"Lead model only: hand a batch of file reading / searching to the cheaper helper model. Give an instruction listing what to read or find (files, symbols, docs). The helper runs read-only tools and hands control back with the outputs in the conversation. Limited rounds.",
+		description: "Hand a batch of file reading / searching to the cheaper helper model (same as baton_delegate kind \"reads\"). Limited rounds.",
 		parameters: Type.Object({ instruction: Type.String({ description: "What to read or search for, concretely." }) }),
 		async execute(_id, params) {
-			const left = st ? cfg!.maxFollowups - st.followups : 0;
-			return { content: [{ type: "text", text: left > 0 ? `Delegated to the helper: ${params.instruction}` : "No delegated read rounds left — read the files yourself." }], details: { left } };
+			return delegateReads(params.instruction);
+		},
+	});
+	pi.registerTool({
+		name: "baton_delegate",
+		label: "Baton delegate",
+		description:
+			"Hand work to the cheaper helper model. kind \"reads\": it reads/searches what you list and you get a harness report with the outputs (limited rounds). kind \"debug\": it runs typecheck/tests/build and fixes failures with small edits, then hands back with a report.",
+		parameters: Type.Object({ kind: Type.Union([Type.Literal("reads"), Type.Literal("debug")]), instruction: Type.Optional(Type.String({ description: "What to read, or extra notes for the fix loop." })) }),
+		async execute(_id, params) {
+			if (params.kind === "reads") return delegateReads(params.instruction ?? "");
+			return { content: [{ type: "text" as const, text: "The helper takes over the verify/fix loop now." }], details: {} };
+		},
+	});
+	pi.registerTool({
+		name: "baton_optimize",
+		label: "Baton optimize",
+		description: "Drop superseded read outputs from your context and clip long ones (one prompt-cache rewrite).",
+		parameters: Type.Object({}),
+		async execute() {
+			const r = st ? optimizeContext(st) : { stubbed: 0, clipped: 0 };
+			log("optimize", r);
+			return { content: [{ type: "text" as const, text: `Context optimized: ${r.stubbed} stale outputs dropped, ${r.clipped} clipped.` }], details: r };
 		},
 	});
 }

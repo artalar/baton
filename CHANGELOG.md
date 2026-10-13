@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0 — 2026-10-13
+Switch mode, after the arm-D independent review (section 5):
+- **Verify detection on executed commands only**: heredoc bodies and quoted strings (`node -e '…'`) are stripped, only command starts / segments after `&&` `||` `;` `|` newlines count (`executedSegments`, `verifyKinds`). The arm-D T18 scaffolding command (fixture) is no longer a verify run.
+- **Tests come from the lead**: lead prompt "write the tests together with the code and run them once"; lead → debug only after the lead itself ran tests or test files exist; a lead finishing without tests gets one nudge.
+- **Thinking cap enforced**: reasoning cap (`reasoning.max_tokens`) outside planning plus `max_tokens = nonWriteMaxTokens` (6000) on lead turns that are neither planning nor after a writing turn; a `length` stop is continued and uncapped. Journal `lead_request` logs `reasoning`, `max_tokens`, payload `cache_control` count.
+- **Planning** full thinking stays pending until the first lead turn that writes (edit/write); re-armed after `delegate_reads`/escalation.
+- **Cache anchor**: ≤4 breakpoints guard, anchor on the last non-thinking part of any type, journal `cache_anchor {anchored, at, partType, before, after, skipped}` and `lead_after_helper {cacheRead, cacheWrite}`.
+- **Helper guardrails** (blocked + flagged, 2nd hit in a stretch escalates): `--passWithNoTests`, new `as unknown as`, package version downgrades / pinned installs, `.skip/.todo/x*/.only`, removed test cases, deleting test files. Green tsc/build + tests followed by exploratory scripts → straight to review.
+- **Honest handoff**: helper turns are no longer shown to the lead (neither raw nor as the lead's tool calls). The lead's next instruction (user-role message) starts with a `[Baton harness] … intercepted and performed by automation (helper model)` report: read outputs (reading stretches) or diff stat, final check outputs, one-line intent per helper edit, SUSPICIOUS EDITS. Lead turns untouched (signed thinking kept).
+- **Harness tools**: `baton_delegate({kind: reads|debug})`, `baton_optimize()`, `delegate_reads` alias; a short neutral description in the system prompt, no instruction to use them. Metrics: self-initiated baton calls, lead re-verification (verify reruns / reads of helper-touched files after a handback), guardrail blocks, length stops — in `switch.jsonl` (`switch`, `end`) and `switch-summary.json`.
+- **Budget stop**: `budgetUsd` (or env `BATON_BUDGET_USD`): lead cost exact + helper × `helperCostFactor` (2.3) + `reserveUsd` (0.5) ≥ budget → `budget_stop` event, abort.
+
 ## 0.7.0
 - New mode **switch** (`-e src/pi/switch.ts` or `BATON_MODE=switch`): in-session model switching in one pi session, the lead (Opus) leads. Helper (GLM) does adaptive reading (read-only tool gate; non-read tool / long text / cap / 4.5 min → back to lead), up to 2 delegated follow-up read rounds (`delegate_reads` or "lead issued only reads"), verify/debug loops (escalates after 6 same-failure red cycles, 12 total, or a new file), and the final review; lead does an optional short final check.
 - Lead context: helper turns are reduced to tool calls + results (no text/thinking, blocked calls dropped), helper instructions hidden, empty replies dropped; lead messages untouched (signed reasoning kept). Compaction frozen only at helper→lead handoffs (dedup reads, clip huge reads, stub old verify outputs).

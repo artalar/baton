@@ -92,7 +92,7 @@ describe("state machine", () => {
 		const s = initialSwitchState(0);
 		s.phase = "lead";
 		decideTurn(s, turn({ calls: [c("w", "write", { path: "a.ts" })] }), cfg);
-		expect(decideTurn(s, turn({ text: "done" }), cfg)).toMatchObject({ to: "debug", continue: true });
+		expect(decideTurn(s, turn({ text: "done", testsExist: true }), cfg)).toMatchObject({ to: "debug", continue: true });
 		decideTurn(s, turn({ calls: [c("v", "bash", { command: "npm test" })], results: [{ id: "v", isError: false, text: "ok" }] }), cfg);
 		expect(decideTurn(s, turn({ text: "GREEN" }), cfg).to).toBe("review");
 	});
@@ -145,12 +145,10 @@ describe("shapeContext", () => {
 		{ role: "assistant", model: lead, content: [{ type: "thinking", thinking: "plan", thinkingSignature: "sig" }, { type: "text", text: "ok" }] },
 		{ role: "assistant", model: lead, content: [{ type: "text", text: "" }] },
 	];
-	it("for the lead: helper messages become tool calls only; blocked calls, helper notes and empty replies vanish; Opus kept whole", () => {
+	it("for the lead: helper turns and their results vanish entirely (honest handoff); helper notes and empty replies vanish; Opus kept whole", () => {
 		const out = shapeContext(msgs, { stubs: {}, clips: { g1: 20 }, blocked: ["g2"] }, true, lead);
-		expect(out.map((m) => m.role)).toEqual(["user", "assistant", "toolResult", "assistant"]);
-		expect(out[1]!.content).toEqual([{ type: "toolCall", id: "g1", name: "read" }]);
-		expect((out[2]!.content as { text: string }[])[0]!.text).toContain("clipped");
-		expect(out[3]).toBe(msgs[6]);
+		expect(out.map((m) => m.role)).toEqual(["user", "assistant"]);
+		expect(out[1]).toBe(msgs[6]);
 	});
 	it("for the helper: history untouched except compaction and empty replies", () => {
 		const out = shapeContext(msgs, { stubs: { g1: "STUB" }, clips: {}, blocked: ["g2"] }, false, lead);
@@ -159,10 +157,12 @@ describe("shapeContext", () => {
 	});
 	it("anchors a cache breakpoint at the end of the lead's previous prefix", () => {
 		const msgs = [{ role: "system", content: "s" }, { role: "user", content: "task" }, { role: "assistant", content: null }, { role: "tool", content: "out" }, { role: "assistant", content: null }, { role: "tool", content: "x" }, { role: "tool", content: "y" }];
-		const out = anchorCache({ messages: msgs }, 4) as { messages: { content: unknown }[] };
+		const r = anchorCache({ messages: msgs }, 4);
+		const out = r.payload as { messages: { content: unknown }[] };
 		expect(out.messages[3]!.content).toEqual([{ type: "text", text: "out", cache_control: { type: "ephemeral" } }]);
 		expect(msgs[3]!.content).toBe("out");
-		expect(anchorCache({ messages: msgs }, 7)).toEqual({ messages: msgs });
+		expect(r).toMatchObject({ anchored: true, at: 3, before: 0, after: 1 });
+		expect(anchorCache({ messages: msgs }, 7).payload).toEqual({ messages: msgs });
 	});
 	it("caps lead max tokens", () => {
 		expect(capMaxTokens({ max_tokens: 128000 }, 16000)).toEqual({ max_tokens: 16000 });
