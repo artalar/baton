@@ -1,266 +1,257 @@
-import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import baton from "../src/pi/index.ts";
+import { HELPER_INSTRUCTION_TYPE, LEAD_NOTE_TYPE } from "../src/context.ts";
+import baton from "../src/index.ts";
+import { gitRepo } from "./helpers.ts";
 
-const PLAN = JSON.stringify({
-	verdict: "on_track",
-	facts_corrected: [],
-	plan: [{ id: "S1", action: "implement the widget", done_when: "tests pass", verify: "self" }],
-	do_not_retry: [],
-	test_cmd: null,
-});
-const REVIEW_OK = JSON.stringify({ verdict: "on_track", facts_corrected: [], plan: [], do_not_retry: [], test_cmd: null });
-const REVIEW_FIX = JSON.stringify({
-	verdict: "course_correct",
-	facts_corrected: [],
-	plan: [{ id: "S9", action: "fix the failing test", done_when: "vitest passes", verify: "review" }],
-	do_not_retry: [],
-	test_cmd: null,
-});
-const DONE = JSON.stringify({ verdict: "done", facts_corrected: [], plan: [], do_not_retry: [], test_cmd: null });
-
+const LEAD = "anthropic/claude-opus-5.5";
+const HELPER = "z-ai/glm-5.3-flash";
 const agentDir = mkdtempSync(join(tmpdir(), "baton-agent-"));
-const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+const savedEnv = { ...process.env };
 
 beforeAll(() => {
 	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.BATON_JEV = "0";
+	delete process.env.BATON_BUDGET_USD;
 });
 afterAll(() => {
-	if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-	else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+	process.env = savedEnv;
 });
 
-function gitRepo(): string {
-	const dir = mkdtempSync(join(tmpdir(), "baton-ext-"));
-	const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: dir });
-	git("init", "-q");
-	writeFileSync(join(dir, "a.ts"), "export const a = 1;\n");
-	git("add", ".");
-	git("commit", "-qm", "init");
-	return dir;
-}
+const PROJECT = {
+	"package.json": JSON.stringify({
+		scripts: {
+			test: `node -e "process.exit(require('fs').readFileSync('src/model.ts','utf8').includes('broken') ? 1 : 0)"`,
+			build: `node -e "if (!require('fs').readFileSync('vite.config.js','utf8').includes('jsx')) { console.error('error: JSX syntax extension is not enabled'); process.exit(1) }"`,
+		},
+	}),
+	"src/model.ts": "export const model = 1;\n",
+	"vite.config.js": "export default { jsx: true };\n",
+};
 
-function contextText(context: { systemPrompt?: string; messages?: { content?: unknown }[] }): string {
-	const parts = [context.systemPrompt ?? ""];
-	for (const message of context.messages ?? []) {
-		const content = message.content;
-		if (typeof content === "string") parts.push(content);
-		else if (Array.isArray(content)) for (const part of content) if (part && typeof part === "object" && "text" in part) parts.push(String((part as { text?: unknown }).text ?? ""));
-	}
-	return parts.join("\n");
-}
+type Handler = (event: unknown, ctx: unknown) => unknown;
 
-function mount(dir: string, replyFor: (text: string) => string) {
-	const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
-	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<any> }>();
-	const advisorTexts: string[] = [];
-	const pings = { n: 0 };
-	let sessionId = "sess-a";
+function mount(cwd: string) {
+	const handlers = new Map<string, Handler[]>();
+	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: { text: string }[] }> }>();
+	const models: string[] = [];
+	let aborted = 0;
 	const ctx = {
-		cwd: dir,
+		cwd,
 		hasUI: false,
 		ui: { notify() {} },
-		sessionManager: { getSessionId: () => sessionId },
-		getContextUsage: () => ({ tokens: 100, contextWindow: 200_000, percent: 0 }),
-		modelRegistry: {
-			find: () => ({ id: "advisor", provider: "openrouter" }),
-			complete: async (_model: unknown, context: { systemPrompt?: string; messages?: { content?: unknown }[] }) => {
-				const text = contextText(context);
-				if (text.includes("Cache keepalive")) {
-					pings.n += 1;
-					return { content: [{ type: "text", text: "{}" }], stopReason: "stop", usage: { input: 1, output: 1 } };
-				}
-				advisorTexts.push(text);
-				return { content: [{ type: "text", text: replyFor(text) }], stopReason: "stop", usage: { input: 10, output: 4 } };
-			},
-		},
+		model: undefined as { id: string; provider: string } | undefined,
+		signal: undefined,
+		sessionManager: { getSessionId: () => "session-1" },
+		modelRegistry: { find: (provider: string, id: string) => ({ provider, id }) },
+		abort: () => aborted++,
 	};
 	const pi = {
-		on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
-			const list = handlers.get(event) ?? [];
-			list.push(handler);
-			handlers.set(event, list);
+		on(event: string, handler: Handler) {
+			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 			return () => {};
 		},
-		registerTool(tool: { name: string; execute: (...args: unknown[]) => Promise<any> }) {
+		registerTool(tool: { name: string; execute: (...args: unknown[]) => Promise<{ content: { text: string }[] }> }) {
 			tools.set(tool.name, tool);
 		},
-		registerCommand() {},
-		exec(command: string, args: string[]) {
-			return new Promise((resolve) => {
-				execFile(command, args, { cwd: dir }, (err, stdout, stderr) => {
-					const code = err && typeof (err as { code?: unknown }).code === "number" ? (err as { code: number }).code : err ? 1 : 0;
-					resolve({ stdout: String(stdout ?? ""), stderr: String(stderr ?? ""), code });
-				});
-			});
+		async setModel(model: { id: string; provider: string }) {
+			ctx.model = model;
+			models.push(model.id);
+			return true;
 		},
 	};
-	baton(pi as any);
-	const emit = async (event: string, payload: unknown) => {
+	baton(pi as never);
+	const emit = async (event: string, payload: unknown): Promise<any> => {
 		let result: unknown;
 		for (const handler of handlers.get(event) ?? []) result = await handler(payload, ctx);
 		return result;
 	};
-	return {
-		ctx,
-		tools,
-		advisorTexts,
-		pings,
-		emit,
-		setSession(id: string) {
-			sessionId = id;
-		},
+	let callCounter = 0;
+	const turn = (model: string, calls: { name: string; args: Record<string, unknown>; output?: string; isError?: boolean }[], text = "") => {
+		const withIds = calls.map((call) => ({ ...call, id: `call-${++callCounter}` }));
+		return emit("turn_end", {
+			message: { role: "assistant", model, stopReason: withIds.length ? "toolUse" : "stop", content: [...(text ? [{ type: "text", text }] : []), ...withIds.map((call) => ({ type: "toolCall", id: call.id, name: call.name, arguments: call.args }))] },
+			toolResults: withIds.filter((call) => call.output !== undefined).map((call) => ({ toolCallId: call.id, isError: !!call.isError, content: [{ type: "text", text: call.output }] })),
+		});
 	};
+	return { ctx, tools, models, emit, turn, aborted: () => aborted };
 }
 
-async function prompt(h: ReturnType<typeof mount>, text: string) {
-	await h.emit("before_agent_start", { type: "before_agent_start", messageType: "user", prompt: text, systemPrompt: "", systemPromptOptions: {} });
+async function startTask(h: ReturnType<typeof mount>, prompt = "Build tetris") {
+	await h.emit("session_start", { reason: "startup" });
+	return h.emit("before_agent_start", { messageType: "user", prompt, systemPrompt: "BASE PROMPT", systemPromptOptions: {} });
 }
 
-async function tool(h: ReturnType<typeof mount>, toolName: string, input: Record<string, unknown>, output: string, isError = false) {
-	const id = `c${h.advisorTexts.length}-${toolName}-${Math.random().toString(16).slice(2)}`;
-	const call = await h.emit("tool_call", { type: "tool_call", toolCallId: id, toolName, input });
-	await h.emit("tool_result", {
-		type: "tool_result",
-		toolCallId: id,
-		toolName,
-		input,
-		content: [{ type: "text", text: output }],
-		isError,
-		structuredContent: toolName === "bash" ? { exit_code: isError ? 1 : 0 } : undefined,
+describe("speculative execution in a pi session", () => {
+	it("runs the helper after a lead turn, reports facts with harness checks, and rolls back on request", async () => {
+		const cwd = gitRepo(PROJECT);
+		const h = mount(cwd);
+		const start = await startTask(h);
+		expect(start.systemPrompt).toMatch(/^BASE PROMPT\n\n# Baton: speculative execution/);
+		expect(h.ctx.model?.id).toBe(LEAD);
+
+		const handoff = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "export const model = 1;\n" }]);
+		expect(handoff.entries).toHaveLength(1);
+		expect(handoff.entries[0]).toMatchObject({ customType: HELPER_INSTRUCTION_TYPE });
+		expect(handoff.entries[0].content).toMatch(/Speculative run #1[\s\S]*read src\/model\.ts/);
+		expect(h.ctx.model?.id).toBe(HELPER);
+
+		writeFileSync(join(cwd, "src/model.ts"), "export const model = 'broken';\n");
+		expect(await h.turn(HELPER, [{ name: "edit", args: { path: "src/model.ts", oldText: "1", newText: "'broken'" }, output: "Edited src/model.ts" }], "Updating the model.")).toBeUndefined();
+		const back = await h.turn(HELPER, [], "All checks are green, the model is done.");
+		expect(back.continue).toBe(true);
+		expect(h.ctx.model?.id).toBe(LEAD);
+		const note: string = back.entries[0].content;
+		expect(back.entries[0].customType).toBe(LEAD_NOTE_TYPE);
+		expect(note).toMatch(/Speculative run #1 — performed by the helper model \(glm-5\.3-flash\), not by you/);
+		expect(note).toMatch(/2 turn\(s\), 1 tool call\(s\)\. It stopped because the helper stopped calling tools/);
+		expect(note).toContain("- modified src/model.ts");
+		expect(note).toContain("+export const model = 'broken';");
+		expect(note).toMatch(/test: `npm test --silent` → FAIL/);
+		expect(note).toMatch(/build: `npm run -s build` → PASS/);
+		expect(note).toContain("baton_rollback({run: 1})");
+		expect(note).not.toMatch(/All checks are green|Updating the model/);
+
+		const leadView = await h.emit("context", {
+			messages: [
+				{ role: "assistant", model: LEAD, content: [{ type: "toolCall", id: "l" }], timestamp: 1 },
+				{ role: "custom", customType: HELPER_INSTRUCTION_TYPE, content: "instruction", timestamp: 2 },
+				{ role: "assistant", model: HELPER, content: [{ type: "toolCall", id: "h" }], timestamp: 3 },
+				{ role: "toolResult", toolCallId: "h", content: [], timestamp: 4 },
+				{ role: "custom", customType: LEAD_NOTE_TYPE, content: note, timestamp: 5 },
+			],
+		});
+		expect(leadView.messages.map((message: { role: string }) => message.role)).toEqual(["assistant", "custom"]);
+
+		const rollback = await h.tools.get("baton_rollback")!.execute("t", {});
+		expect(rollback.content[0]!.text).toMatch(/run #1 rolled back[\s\S]*Restored: src\/model\.ts/);
+		expect(readFileSync(join(cwd, "src/model.ts"), "utf8")).toBe("export const model = 1;\n");
+		expect(await h.turn(LEAD, [{ name: "baton_rollback", args: {}, output: "rolled back" }])).toBeUndefined();
+		expect(await h.turn(LEAD, [], "Done.")).toBeUndefined();
+
+		await h.emit("agent_end", {});
+		const summary = JSON.parse(readFileSync(join(cwd, ".pi/baton/sessions/session-1/summary.json"), "utf8"));
+		expect(summary.stats).toMatchObject({ runs: 1, helperTurns: 2, rollbacks: 1 });
+		expect(readFileSync(join(cwd, ".pi/baton/.gitignore"), "utf8")).toBe("*\n");
 	});
-	return call;
-}
 
-const FAIL_OUT = "FAIL test/a.test.ts > adds numbers\nAssertionError: expected 1 to be 2\n";
+	it("ends the run when a guardrail blocks the helper, then respects the cooldown", async () => {
+		const cwd = gitRepo(PROJECT);
+		const h = mount(cwd);
+		await startTask(h);
+		await h.turn(LEAD, [{ name: "bash", args: { command: "ls" }, output: "src" }]);
+		const blocked = await h.emit("tool_call", { toolCallId: "w1", toolName: "write", input: { path: "src/model.ts", content: "rewritten" } });
+		expect(blocked).toMatchObject({ block: true });
+		expect(blocked.reason).toMatch(/overwrites the existing file src\/model\.ts/);
+		const sameTurn = await h.emit("tool_call", { toolCallId: "w2", toolName: "read", input: { path: "src/model.ts" } });
+		expect(sameTurn.reason).toMatch(/run already ended/);
+		const back = await h.emit("turn_end", {
+			message: { role: "assistant", model: HELPER, stopReason: "toolUse", content: [{ type: "toolCall", id: "w1", name: "write", arguments: { path: "src/model.ts", content: "rewritten" } }] },
+			toolResults: [{ toolCallId: "w1", isError: true, content: [{ type: "text", text: "blocked" }] }],
+		});
+		expect(back.entries[0].content).toMatch(/It stopped because guardrail blocked write: overwrites the existing file/);
+		expect(back.entries[0].content).toMatch(/write src\/model\.ts → ERROR — blocked by Baton/);
+		expect(back.entries[0].content).toMatch(/the run changed no files/);
+		expect(await h.turn(LEAD, [{ name: "read", args: { path: "a" }, output: "x" }])).toBeUndefined();
+		expect(h.ctx.model?.id).toBe(LEAD);
+		const next = await h.turn(LEAD, [{ name: "read", args: { path: "b" }, output: "y" }]);
+		expect(next.entries[0].content).toMatch(/Speculative run #2/);
+	});
 
-describe("pi extension wiring", () => {
-	it("reviews the current task and blocks commit until the review passes", async () => {
-		const dir = gitRepo();
-		const h = mount(dir, (text) => (text.includes('kind="plan"') ? PLAN : REVIEW_OK));
+	it("runs final checks when the lead finishes and sends it back while they fail", async () => {
+		const cwd = gitRepo(PROJECT);
+		writeFileSync(join(agentDir, "baton.json"), JSON.stringify({ speculate: false }));
 		try {
-			await h.emit("session_start", { type: "session_start", reason: "startup" });
-			await prompt(h, "Ship the widget");
-			await tool(h, "read", { path: "a.ts" }, "export const a = 1;\n");
-			await tool(h, "bash", { command: "ls" }, "a.ts\n");
-			await tool(h, "bash", { command: "pwd" }, dir);
-			const plan = await h.tools.get("baton_plan")!.execute("t-plan", {}, undefined, undefined, h.ctx);
-			expect(plan.details.ok).toBe(true);
-			await prompt(h, "also paint it blue");
-			const step = await h.tools.get("baton_step")!.execute("t-step", { id: "S1", status: "done", evidence: "tests pass" }, undefined, undefined, h.ctx);
-			expect(step.details).toMatchObject({ ok: true, step: "S1", status: "done" });
-			const blocked = await h.emit("tool_call", { type: "tool_call", toolCallId: "commit-1", toolName: "bash", input: { command: "git commit -m widget" } });
-			expect(blocked).toMatchObject({ block: true });
-			expect(String((blocked as { reason?: string }).reason)).toMatch(/baton_review/);
-			const review = await h.tools.get("baton_review")!.execute("t-review", {}, undefined, undefined, h.ctx);
-			expect(review.details).toMatchObject({ ok: true, verdict: "on_track" });
-			const allowed = await h.emit("tool_call", { type: "tool_call", toolCallId: "commit-2", toolName: "bash", input: { command: "git commit -m widget" } });
-			expect(allowed).toBeUndefined();
-			const packs = h.advisorTexts.filter((t) => t.includes("TASK (verbatim)"));
-			expect(packs.length).toBeGreaterThanOrEqual(2);
-			for (const pack of packs) expect(pack).toMatch(/## TASK \(verbatim\)\nShip the widget/);
-			expect(packs[0]).not.toContain("also paint it blue");
-			expect(packs.at(-1)).toContain("also paint it blue");
+			const h = mount(cwd);
+			await startTask(h);
+			writeFileSync(join(cwd, "vite.config.js"), "export default {};\n");
+			expect(await h.turn(LEAD, [{ name: "write", args: { path: "vite.config.js", content: "export default {};\n" }, output: "ok" }])).toBeUndefined();
+			const sentBack = await h.turn(LEAD, [], "Done.");
+			expect(sentBack.continue).toBe(true);
+			expect(sentBack.entries[0].content).toMatch(/Final checks — run by the harness after your final answer \(round 1 of 2\)\. 1 of 2 failed/);
+			expect(sentBack.entries[0].content).toMatch(/JSX syntax extension is not enabled/);
+			writeFileSync(join(cwd, "vite.config.js"), "export default { jsx: true, minify: true };\n");
+			expect(await h.turn(LEAD, [], "Fixed.")).toBeUndefined();
+			expect(await h.turn(LEAD, [], "Still done.")).toBeUndefined();
 		} finally {
-			await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+			writeFileSync(join(agentDir, "baton.json"), "{}");
 		}
 	});
 
-	it("does not restore another session's prompts, gate, or deferred items", async () => {
-		const dir = gitRepo();
-		mkdirSync(join(dir, ".pi"), { recursive: true });
-		writeFileSync(join(dir, ".pi", "baton.json"), JSON.stringify({ loop: { maxHops: 1 }, triggers: { planBeforeWrite: false } }));
-		const h = mount(dir, () => REVIEW_FIX);
+	it("keeps budget for the lead's wrap-up, then stops at the budget", async () => {
+		const cwd = gitRepo(PROJECT);
+		writeFileSync(join(agentDir, "baton.json"), JSON.stringify({ budget: { usd: 1 }, checks: { final: false } }));
 		try {
-			await h.emit("session_start", { type: "session_start", reason: "startup" });
-			await prompt(h, "OLD_TASK_ALPHA");
-			await tool(h, "bash", { command: "npx vitest run" }, FAIL_OUT, true);
-			await tool(h, "write", { path: "src/a.ts", content: "x" }, "wrote");
-			await tool(h, "bash", { command: "npx vitest run" }, FAIL_OUT, true);
-			const deferredEdit = await h.emit("tool_call", { type: "tool_call", toolCallId: "edit-a", toolName: "write", input: { path: "test/a.test.ts", content: "nope" } });
-			expect(String((deferredEdit as { reason?: string } | undefined)?.reason)).toMatch(/deferred/);
-			const review = await h.tools.get("baton_review")!.execute("rev-a", {}, undefined, undefined, h.ctx);
-			expect(review.details.ok).toBe(true);
-			expect(h.advisorTexts.at(-1)).toMatch(/## TASK \(verbatim\)\nOLD_TASK_ALPHA/);
-			const refused = await h.tools.get("baton_review")!.execute("rev-a2", {}, undefined, undefined, h.ctx);
-			expect(refused.details.refused).toBe(true);
-			const pinned = JSON.stringify(await h.emit("context", { type: "context", messages: [{ role: "user", content: "hello" }] }));
-			expect(pinned).toContain("DEFERRED");
-			await h.emit("session_shutdown", { type: "session_shutdown", reason: "new" });
-
-			h.setSession("sess-b");
-			await h.emit("session_start", { type: "session_start", reason: "new" });
-			await prompt(h, "NEW_TASK_BETA");
-			await prompt(h, "FOLLOW_UP_BETA");
-			const freshEdit = await h.emit("tool_call", { type: "tool_call", toolCallId: "edit-b", toolName: "write", input: { path: "test/a.test.ts", content: "ok" } });
-			expect(freshEdit).toBeUndefined();
-			const freshPin = JSON.stringify(await h.emit("context", { type: "context", messages: [{ role: "user", content: "hello" }] }));
-			expect(freshPin).not.toContain("DEFERRED");
-			const again = await h.tools.get("baton_review")!.execute("rev-b", {}, undefined, undefined, h.ctx);
-			expect(again.details.refused).not.toBe(true);
-			expect(again.details.ok).toBe(true);
-			const beta = h.advisorTexts.at(-1)!;
-			expect(beta).toMatch(/## TASK \(verbatim\)\nNEW_TASK_BETA/);
-			expect(beta).toContain("FOLLOW_UP_BETA");
-			expect(beta).not.toContain("OLD_TASK_ALPHA");
-			await h.emit("session_shutdown", { type: "session_shutdown", reason: "resume" });
-
-			h.setSession("sess-a");
-			await h.emit("session_start", { type: "session_start", reason: "resume" });
-			const restored = await h.emit("tool_call", { type: "tool_call", toolCallId: "edit-a2", toolName: "write", input: { path: "test/a.test.ts", content: "still" } });
-			expect(String((restored as { reason?: string } | undefined)?.reason)).toMatch(/deferred/);
-			const stillRefused = await h.tools.get("baton_review")!.execute("rev-a3", {}, undefined, undefined, h.ctx);
-			expect(stillRefused.details.refused).toBe(true);
-			const restoredPin = JSON.stringify(await h.emit("context", { type: "context", messages: [{ role: "user", content: "hello" }] }));
-			expect(restoredPin).toContain("DEFERRED");
-			expect(existsSync(join(dir, ".pi/baton/sessions/sess-a/events.jsonl"))).toBe(true);
-			expect(existsSync(join(dir, ".pi/baton/sessions/sess-b/events.jsonl"))).toBe(true);
-			expect(readFileSync(join(dir, ".pi/baton/sessions/sess-a/events.jsonl"), "utf8")).toContain("OLD_TASK_ALPHA");
-			expect(readFileSync(join(dir, ".pi/baton/sessions/sess-a/events.jsonl"), "utf8")).not.toContain("NEW_TASK_BETA");
-			expect(readFileSync(join(dir, ".pi/baton/.gitignore"), "utf8")).toBe("*\n");
+			const h = mount(cwd);
+			await startTask(h);
+			await h.emit("message_end", { message: { role: "assistant", model: LEAD, usage: { cost: { total: 0.45 } } } });
+			const wrapUp = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }]);
+			expect(wrapUp.entries).toHaveLength(1);
+			expect(wrapUp.entries[0].content).toMatch(/Budget: about \$0\.45 of \$1\.00 is spent\. No more speculative runs/);
+			expect(h.ctx.model?.id).toBe(LEAD);
+			expect(h.aborted()).toBe(0);
+			await h.emit("message_end", { message: { role: "assistant", model: LEAD, usage: { cost: { total: 0.6 } } } });
+			expect(h.aborted()).toBe(1);
+			await h.emit("before_agent_start", { messageType: "user", prompt: "more", systemPrompt: "", systemPromptOptions: {} });
+			expect(h.aborted()).toBe(2);
 		} finally {
-			await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+			writeFileSync(join(agentDir, "baton.json"), "{}");
 		}
 	});
 
-	it("stops advisor keepalive after a done verdict and on shutdown", async () => {
-		vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
-		vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-		const dir = gitRepo();
-		let mode = "plan";
-		const h = mount(dir, (text) => (mode === "done" ? DONE : text.includes('kind="plan"') ? PLAN : REVIEW_OK));
+	it("asks Jev with recent turns of both models and skips the run on a low probability", async () => {
+		const requests: { state: { recent_turns: string[]; proposed_call: { call: string } } }[] = [];
+		const answers = [0.95, 0.2];
+		vi.stubGlobal("fetch", async (_url: string, init: { body: string }) => {
+			requests.push(JSON.parse(init.body));
+			return new Response(JSON.stringify({ model: "typesafe/jev-1.13", answers: { more_calls: { type: "noul", noul: answers.shift() } }, usage: { cost: 0.001 } }));
+		});
+		process.env.BATON_JEV = "1";
+		process.env.OPENROUTER_API_KEY = "test-key";
 		try {
-			await h.emit("session_start", { type: "session_start", reason: "startup" });
-			await prompt(h, "Keep the cache warm");
-			const plan = await h.tools.get("baton_plan")!.execute("ka-plan", {}, undefined, undefined, h.ctx);
-			expect(plan.details.ok).toBe(true);
-			await vi.advanceTimersByTimeAsync(250_000);
-			expect(h.pings.n).toBeGreaterThan(0);
-			const afterPlan = h.pings.n;
-			mode = "done";
-			const review = await h.tools.get("baton_review")!.execute("ka-review", {}, undefined, undefined, h.ctx);
-			expect(review.details).toMatchObject({ ok: true, verdict: "done" });
-			await vi.advanceTimersByTimeAsync(1_000_000);
-			expect(h.pings.n).toBe(afterPlan);
-
-			await h.emit("session_shutdown", { type: "session_shutdown", reason: "new" });
-			h.setSession("sess-later");
-			mode = "plan";
-			await h.emit("session_start", { type: "session_start", reason: "new" });
-			await prompt(h, "A later session");
-			await h.tools.get("baton_plan")!.execute("ka-plan-2", {}, undefined, undefined, h.ctx);
-			await vi.advanceTimersByTimeAsync(500_000);
-			await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
-			const stopped = h.pings.n;
-			expect(stopped).toBeGreaterThan(afterPlan);
-			await vi.advanceTimersByTimeAsync(1_000_000);
-			expect(h.pings.n).toBe(stopped);
+			const h = mount(gitRepo(PROJECT));
+			await startTask(h);
+			const run = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "export const model = 1;" }]);
+			expect(run.entries[0].customType).toBe(HELPER_INSTRUCTION_TYPE);
+			await h.turn(HELPER, [{ name: "bash", args: { command: "npm test" }, output: "ok" }]);
+			await h.turn(HELPER, []);
+			await h.turn(LEAD, [{ name: "read", args: { path: "a" }, output: "cooldown turn" }]);
+			expect(requests).toHaveLength(1);
+			expect(await h.turn(LEAD, [{ name: "read", args: { path: "vite.config.js" }, output: "jsx" }])).toBeUndefined();
+			expect(requests).toHaveLength(2);
+			const state = requests[1]!.state;
+			expect(state.recent_turns.join("\n")).toMatch(/\[helper\] bash: npm test => ok[\s\S]*\[lead\] read a => ok/);
+			expect(state.proposed_call.call).toMatch(/\[lead\] read vite\.config\.js/);
+			expect(h.ctx.model?.id).toBe(LEAD);
 		} finally {
-			await h.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
-			vi.useRealTimers();
+			vi.unstubAllGlobals();
+			process.env.BATON_JEV = "0";
+			delete process.env.OPENROUTER_API_KEY;
 		}
+	});
+
+	it("closes an unfinished run when a new prompt arrives", async () => {
+		const h = mount(gitRepo(PROJECT));
+		await startTask(h);
+		await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }]);
+		expect(h.ctx.model?.id).toBe(HELPER);
+		const next = await h.emit("before_agent_start", { messageType: "user", prompt: "Also add a score", systemPrompt: "", systemPromptOptions: {} });
+		expect(h.ctx.model?.id).toBe(LEAD);
+		expect(next.message).toMatchObject({ customType: LEAD_NOTE_TYPE });
+		expect(next.message.content).toMatch(/Speculative run #1[\s\S]*stopped because a new prompt arrived/);
+	});
+
+	it("works outside git without checkpoints", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "baton-nogit-"));
+		const h = mount(cwd);
+		await startTask(h);
+		await h.turn(LEAD, [{ name: "read", args: { path: "a" }, output: "x" }]);
+		const back = await h.turn(HELPER, [], "");
+		expect(back.entries[0].content).toMatch(/Checkpoint: none \(not a git repository\)/);
+		const rollback = await h.tools.get("baton_rollback")!.execute("t", {});
+		expect(rollback.content[0]!.text).toMatch(/has no checkpoint/);
+		expect(existsSync(join(cwd, ".pi/baton/sessions/session-1/events.jsonl"))).toBe(true);
 	});
 });

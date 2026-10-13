@@ -1,16 +1,15 @@
 {
   "name": "pi-baton",
   "version": "0.13.1",
-  "description": "Baton: an efficient review agent for pi — prepares a tool-less, cache-friendly review pack (diff, files, tests, project skills, pinned plan, unverified claims) for an expensive advisor model",
+  "description": "Baton: speculative execution for pi — a cheap helper model continues the expensive lead model's tool calls in the same session, and the harness tells the lead exactly what happened",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi",
     "pi-extension",
-    "review",
-    "code-review",
-    "advisor",
-    "context"
+    "speculative-execution",
+    "agent",
+    "cost"
   ],
   "license": "MIT",
   "author": "artalar",
@@ -21,23 +20,13 @@
   "files": [
     "dist",
     "src",
-    "bin",
-    "skills",
-    "prompts",
     "README.md",
     "LICENSE",
-    "CHANGELOG.md",
-    "baton.example.json"
+    "CHANGELOG.md"
   ],
   "pi": {
     "extensions": [
-      "./dist/pi/index.js"
-    ],
-    "skills": [
-      "./skills"
-    ],
-    "prompts": [
-      "./prompts/*.md"
+      "./dist/index.js"
     ]
   },
   "scripts": {
@@ -51,7 +40,6 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=1.2.0",
-    "@earendil-works/pi-ai": ">=1.2.0",
     "typebox": "*"
   },
   "devDependencies": {
@@ -67,30 +55,10 @@
     "node": ">=22"
   },
   "packageManager": "bun@1.3.14",
-  "bin": {
-    "baton-pack": "./bin/baton-pack.mjs",
-    "baton-review": "./bin/baton-review.mjs"
-  },
   "exports": {
     ".": {
-      "types": "./dist/core/index.d.ts",
-      "default": "./dist/core/index.js"
-    },
-    "./core": {
-      "types": "./dist/core/index.d.ts",
-      "default": "./dist/core/index.js"
-    },
-    "./pi": {
-      "types": "./dist/pi/index.d.ts",
-      "default": "./dist/pi/index.js"
-    }
-  },
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    },
-    "@earendil-works/pi-ai": {
-      "optional": true
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
     }
   }
 }

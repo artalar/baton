@@ -14,14 +14,9 @@
         "vitest": "4.1.11",
       },
       "peerDependencies": {
-        "@earendil-works/pi-ai": ">=1.2.0",
         "@earendil-works/pi-coding-agent": ">=1.2.0",
         "typebox": "*",
       },
-      "optionalPeers": [
-        "@earendil-works/pi-ai",
-        "@earendil-works/pi-coding-agent",
-      ],
     },
   },
   "packages": {
