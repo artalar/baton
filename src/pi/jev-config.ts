@@ -71,6 +71,8 @@ export interface JevTrack {
 	writes: number;
 	filesWritten: string[];
 	consecutiveNonWrite: number;
+	/** Consecutive non-write calls of the lead only (drives the routine_ahead lead → helper switch). */
+	leadNonWrite: number;
 	lastCheck: "none" | "passed" | "FAILED";
 	tests: "none" | "passed" | "FAILED";
 	nodeModulesChanged: boolean;
@@ -80,5 +82,5 @@ export interface JevTrack {
 	recent: RecentCall[];
 	routineHandoffs: number;
 }
-export const initialTrack = (task = ""): JevTrack => ({ task: task.slice(0, 400), toolCalls: 0, writes: 0, filesWritten: [], consecutiveNonWrite: 0, lastCheck: "none", tests: "none", nodeModulesChanged: false, text: "", textTurn: 0, recent: [], routineHandoffs: 0 });
+export const initialTrack = (task = ""): JevTrack => ({ task: task.slice(0, 400), toolCalls: 0, writes: 0, filesWritten: [], consecutiveNonWrite: 0, leadNonWrite: 0, lastCheck: "none", tests: "none", nodeModulesChanged: false, text: "", textTurn: 0, recent: [], routineHandoffs: 0 });
 

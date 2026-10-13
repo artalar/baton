@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.9.2 — 2026-10-13
+- Jev lead → helper switch (`routine_ahead`) now requires ≥ `minNonWrite` consecutive non-write calls **of the lead** (`track.leadNonWrite`); helper read calls no longer count. Arm G: the switch fired right after the lead's first turn ("after 9 non-write calls" = GLM's reads), twice, each time GLM returned READ DONE in seconds.
+
 ## 0.9.1 — 2026-10-13
 - **Skills reach the lead verbatim**: in the honest reading handoff, outputs of skill documents (`SKILL.md` / `REFERENCE.md` anywhere, any file under `.agents/skills`, `.pi/skills`, `.claude/skills`, `skills/*.md`; via `read` or a single-file `cat`) are passed to the lead unchanged — never clipped, never omitted by the report size cap — and deduplicated per file (longest read wins, so a later partial read does not replace a full one). Other read outputs are clipped/capped as before. `skillKey`, `SKILL_PATH` exported.
 

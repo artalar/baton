@@ -846,10 +846,10 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 			const readLike = (c: Call) => !isEdit(c) && !isVerify(c) && !(BATON_TOOLS as readonly string[]).includes(c.name) && (isReadOnly(c) || s.noChange.includes(c.id));
 			s.leadReadTurns = real.length && real.every(readLike) ? s.leadReadTurns + 1 : 0;
 			// 0.9: Jev predicts routine (non-write) work ahead after ≥2 consecutive non-write calls → helper reads
-			if (inp.jev && real.length && !real.some(isEdit) && !(real.some(isVerify) && s.leadEditsInStretch > 0) && inp.jev.routine >= cfg.jev.thr.routine && s.track.consecutiveNonWrite >= cfg.jev.thr.minNonWrite && s.track.routineHandoffs < cfg.jev.maxRoutineHandoffs) {
+			if (inp.jev && real.length && !real.some(isEdit) && !(real.some(isVerify) && s.leadEditsInStretch > 0) && inp.jev.routine >= cfg.jev.thr.routine && s.track.leadNonWrite >= cfg.jev.thr.minNonWrite && s.track.routineHandoffs < cfg.jev.maxRoutineHandoffs) {
 				s.track.routineHandoffs++;
 				s.jev.switches++;
-				const d = to(s, inp, "followup", `jev: routine ahead ${inp.jev.routine.toFixed(2)} after ${s.track.consecutiveNonWrite} non-write calls`, cfg);
+				const d = to(s, inp, "followup", `jev: routine ahead ${inp.jev.routine.toFixed(2)} after ${s.track.leadNonWrite} lead non-write calls`, cfg);
 				const last = real.map((c) => (c.name === "bash" ? `$ ${String(c.args.command ?? "").replace(/\s+/g, " ").slice(0, 200)}` : `${c.name} ${JSON.stringify(c.args).slice(0, 200)}`)).join("\n- ");
 				d.message = { audience: "helper", text: MSG.followup(`the lead was exploring with these calls:\n- ${last}\nContinue this exploration: read/search the related files, types and docs the lead will need next (at least 3 calls) before replying READ DONE`) };
 				return d;

@@ -227,7 +227,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	pi.on("tool_result", (e, ctx) => {
 		if (st && !e.parentToolCallId && !st.blocked.includes(e.toolCallId)) {
 			const text = (e.content as Block[]).flatMap((b) => (b.type === "text" && b.text ? [b.text] : [])).join("\n");
-			recordCall(st.track, { id: e.toolCallId, name: e.toolName, args: (e.input ?? {}) as Record<string, unknown> }, isHelper(st.phase) ? cfg!.helper : cfg!.lead, { isError: !!e.isError, text }, cfg!.jev.recentCalls);
+			recordCall(st.track, { id: e.toolCallId, name: e.toolName, args: (e.input ?? {}) as Record<string, unknown> }, isHelper(st.phase) ? cfg!.helper : cfg!.lead, { isError: !!e.isError, text }, cfg!.jev.recentCalls, !isHelper(st.phase));
 		}
 		const p = pending.get(e.toolCallId);
 		if (!p || !st) return undefined;

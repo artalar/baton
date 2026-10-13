@@ -128,6 +128,16 @@ describe("jev-policy: state", () => {
 		expect(st.policy).toContain("--passWithNoTests");
 		expect(Object.keys(CALL_QUESTIONS).sort()).toEqual(["gate", "phase", "routine_ahead", "stuck", "tampers_env", "weakens_checks"]);
 	});
+	it("arm G: helper reads do not count toward the lead's non-write streak", () => {
+		const t = initialTrack();
+		for (let i = 0; i < 9; i++) recordCall(t, c(`h${i}`, "read", { path: "a" }), "glm", { isError: false, text: "" }, 5, false);
+		recordCall(t, c("l1", "read", { path: "b" }), "opus", { isError: false, text: "" }, 5, true);
+		expect([t.consecutiveNonWrite, t.leadNonWrite]).toEqual([10, 1]);
+		const s = initialSwitchState(0);
+		s.phase = "lead";
+		s.track = t;
+		expect(decideTurn(s, turn({ calls: [c("l1", "read", { path: "b" })], jev: { routine: 0.9, stuck: 0 } }), DEFAULT_SWITCH).to).toBe("lead");
+	});
 	it("call kinds", () => {
 		expect(callKind(c("a", "bash", { command: "npm i -D vitest" }))).toBe("write");
 		expect(callKind(c("a", "bash", { command: "cat > a.ts <<'EOF'\nx\nEOF" }))).toBe("write");
@@ -168,6 +178,7 @@ describe("switch-core integration", () => {
 			const s = initialSwitchState(0);
 			s.phase = "lead";
 			s.track.consecutiveNonWrite = 2;
+			s.track.leadNonWrite = 2;
 			return s;
 		};
 		const calls = [c("r1", "read", { path: "a.ts" })];

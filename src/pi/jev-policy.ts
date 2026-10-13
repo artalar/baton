@@ -91,18 +91,22 @@ export { initialTrack, type JevTrack, type RecentCall, type CallKind } from "./j
 import type { CallKind, JevTrack, RecentCall } from "./jev-config.ts";
 
 /** Pure: record a finished call into the ring buffer and counters. Mutates `t`. */
-export function recordCall(t: JevTrack, c: Call, model: string, r: { isError: boolean; text: string }, keep = 5): void {
+export function recordCall(t: JevTrack, c: Call, model: string, r: { isError: boolean; text: string }, keep = 5, isLead = false): void {
 	const kind = callKind(c);
 	t.toolCalls++;
 	if (kind === "write") {
 		t.writes++;
 		t.consecutiveNonWrite = 0;
+		if (isLead) t.leadNonWrite = 0;
 		const p = c.name === "bash" ? bashWriteTargets(c)[0] : String(c.args.path ?? c.args.file_path ?? "");
 		if (p) {
 			const f = p.split("/").pop()!;
 			t.filesWritten = [...t.filesWritten.filter((x) => x !== f), f].slice(-25);
 		}
-	} else t.consecutiveNonWrite++;
+	} else {
+		t.consecutiveNonWrite++;
+		if (isLead) t.leadNonWrite++;
+	}
 	if (kind === "verify") {
 		const failed = r.isError || /\bFAIL\b|error TS|failed/.test(r.text);
 		t.lastCheck = failed ? "FAILED" : "passed";
