@@ -23,6 +23,9 @@ export const AdvisorReply = Type.Object({
 	test_cmd: Type.Union([Type.String(), Type.Null()]),
 	questions_for_user: Type.Optional(Type.Array(Type.String())),
 	next_checkpoint: Type.Optional(Type.String()),
+	invariants: Type.Optional(Type.Array(Type.String())),
+	rules: Type.Optional(Type.Array(Type.String())),
+	checkpoints: Type.Optional(Type.Array(Type.String())),
 });
 
 export type AdvisorReply = Static<typeof AdvisorReply>;
@@ -38,7 +41,10 @@ export const REPLY_SCHEMA_TEXT = `{
   "do_not_retry": ["approach X - evt 40-52"],
   "test_cmd": "command that proves the work, or null",
   "questions_for_user": [],
-  "next_checkpoint": "after S2 | on red tests | before commit"
+  "next_checkpoint": "after S2 | on red tests | before commit",
+  "invariants": ["architecture decisions / invariants the executor must keep"],
+  "rules": ["concrete rule from a project skill the code must follow (name the skill)"],
+  "checkpoints": ["S2", "S4"]
 }`;
 
 /** Pull the first balanced JSON object out of a model reply (tolerates ```json fences and prose). */
@@ -106,6 +112,15 @@ export function renderPlan(r: AdvisorReply, label: string, truncated = false): s
 			if (s.escalate_if) out.push(`  escalate if: ${s.escalate_if}`);
 		}
 	}
+	if (r.invariants?.length) {
+		out.push("Invariants (keep them):");
+		for (const x of r.invariants) out.push(`- ${x}`);
+	}
+	if (r.rules?.length) {
+		out.push("Project skill rules (follow them):");
+		for (const x of r.rules) out.push(`- ${x}`);
+	}
+	if (r.checkpoints?.length) out.push(`Review checkpoints: call baton_review after ${r.checkpoints.join(", ")}`);
 	if (truncated) out.push(`(plan cut to ${MAX_STEPS} steps: call the advisor again after the last one)`);
 	if (r.do_not_retry.length) out.push(`Do not retry: ${r.do_not_retry.join("; ")}`);
 	if (r.test_cmd) out.push(`Test command: ${r.test_cmd}`);

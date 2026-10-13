@@ -1,8 +1,46 @@
 import { createHash } from "node:crypto";
 
-/** Rough token estimate used everywhere in Baton: chars / 4. */
+/**
+ * Conservative chars-per-token ratio. Real tokenizers give ~3.5-4 chars/token for English prose
+ * but ~2.8-3.4 for code, JSON and non-Latin text (e.g. Russian), so chars/4 under-counts the packs
+ * Baton sends. 3.2 keeps the pack budget safe for mixed code + prose.
+ */
+export const CHARS_PER_TOKEN = 3.2;
+
+/** Conservative token estimate used everywhere in Baton: chars / 3.2, plus extra weight for non-ASCII. */
 export function estimateTokens(text: string): number {
-	return Math.ceil(text.length / 4);
+	let nonAscii = 0;
+	for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 127) nonAscii++;
+	// Non-ASCII chars (Cyrillic, CJK, emoji) cost roughly one token per 1-2 chars: count them twice.
+	return Math.ceil((text.length + nonAscii) / CHARS_PER_TOKEN);
+}
+
+/** Inverse of estimateTokens for ASCII text: how many chars fit into `tokens`. */
+export function charsForTokens(tokens: number): number {
+	return Math.floor(tokens * CHARS_PER_TOKEN);
+}
+
+/** Minimal glob → RegExp: `**` (any depth), `*` (no slash), `?`. Anchored, POSIX separators. */
+export function globToRegExp(glob: string): RegExp {
+	let re = "";
+	for (let i = 0; i < glob.length; i++) {
+		const c = glob[i]!;
+		if (c === "*") {
+			if (glob[i + 1] === "*") {
+				const slash = glob[i + 2] === "/";
+				re += slash ? "(?:.*/)?" : ".*";
+				i += slash ? 2 : 1;
+			} else re += "[^/]*";
+		} else if (c === "?") re += "[^/]";
+		else re += /[.+^${}()|[\]\\]/.test(c) ? `\\${c}` : c;
+	}
+	return new RegExp(`^${re}$`);
+}
+
+/** True when the (relative or absolute) path matches any of the globs. */
+export function matchesAny(path: string, globs: readonly string[]): boolean {
+	const p = path.replace(/\\/g, "/").replace(/^\.\//, "");
+	return globs.some((g) => globToRegExp(g).test(p));
 }
 
 export function sha1(text: string): string {

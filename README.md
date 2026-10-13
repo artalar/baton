@@ -5,16 +5,24 @@ A [pi](https://github.com/earendil-works/pi) extension that lets a cheap executo
 ## What it does
 
 - **Journal.** Every tool call is written to `.pi/baton/events.jsonl`. Each record has `evt#`, `ts`, `tool`, an args digest (write/edit bodies are hashed, not stored), the exit code, the head and tail of the output, an error signature, files read and written, a test summary, and a `rawRef` to the full output in `.pi/baton/raw/<evt>.txt`.
-- **Masking.** In every request to the model (pi's `context` event; the session file itself stays complete), every tool output the model has already answered is replaced by a stub such as `[baton: output masked. evt#12 bash command=npm test → exit 1, 830 tok …]`. Earlier reads of a file that was read again are dropped as duplicates. Reads of a file that was edited afterwards are dropped as stale. `baton_recall({evt})` returns the full output.
-- **Advisor tools.** Each one builds a pack (≈40k token budget, estimated as chars/4), calls the advisor once with prompt caching disabled, and validates the JSON reply against a schema (`verdict`, `facts_corrected`, `plan[]` steps with `done_when`, `do_not_retry`, `test_cmd`). An invalid reply gets one retry.
-  - `baton_review`: the executor's narrative is excluded. The pack holds the task, the user prompts verbatim, `git diff`, the changed files and the last test run. The resulting plan is appended to the conversation.
+- **Masking.** In every request to the model (pi's `context` event; the session file itself stays complete), every tool output the model has already answered is replaced by a stub such as `[baton: output masked. evt#12 bash command=npm test → exit 1, 830 tok …]`. Earlier reads of a file that was read again are dropped as duplicates. Reads of a file that was edited afterwards are dropped as stale. `baton_recall({evt})` returns the full output. Reads of skills and reference docs (`SKILL.md`, `.agents/skills/**`, `.pi/skills/**`, `AGENTS.md`, `README.md`, `REFERENCE.md`, `docs/**/*.md`; configurable via `mask.neverMaskPaths`) are never masked, deduplicated or marked stale.
+- **Advisor tools.** Each one builds a pack (≈40k token budget, estimated conservatively as chars/3.2 with non-ASCII counted twice), calls the advisor once with prompt caching disabled, and validates the JSON reply against a schema (`verdict`, `facts_corrected`, `plan[]` steps with `done_when`, `do_not_retry`, `test_cmd`). An invalid reply gets one retry.
+  - The advisor has **no tools**. Every pack says so explicitly ("everything you need is below; do not ask for files") and presents the executor's work in the third person, as a junior's work to check, never as the advisor's own turns. Executor statements are labelled unverified.
+  - Packs are ordered for long context: role, project skills, `AGENTS.md`, pinned plan, task and prompts, artefacts, executor claims, and the instructions plus reply schema last.
+  - **Project skills in packs.** Baton discovers `SKILL.md` files in `.agents/skills`, `.pi/skills`, `.claude/skills` and `skills`, scores them against the task, prompts, diff and changed files (sibling skills of a strongly matching family are included too, review skills are preferred for reviews), and includes up to 4 of them within 35% of the pack budget. The largest one is clipped first.
+  - **Pack diff excludes.** The journal dir, `.pi/baton`, `node_modules`, `dist` and lockfiles are always excluded from the diff and changed files, regardless of `.gitignore` (`pack.excludePaths`).
+  - `baton_review`: the executor's narrative is excluded. The pack holds the task, the user prompts verbatim, the relevant skills, the pinned plan (the review checks done criteria, invariants and skill rules against it), `git diff`, the changed files and the last test run. A review that returns steps becomes the new pinned plan.
   - `baton_help`: the pack holds the last N (default 8) tool calls verbatim, earlier calls with the same error signature, the executor's hypothesis and attempts, and the evt#s it marked as important.
-  - `baton_plan`: the pack holds the task, `AGENTS.md` and a repo map.
+  - `baton_plan`: the pack holds the task, the relevant skills, `AGENTS.md`, a repo map and the exploration findings from the journal. The reply adds `invariants` (architecture decisions), `rules` (skill rules to follow) and `checkpoints` (steps after which to call review).
+  - **Pinned plan.** The latest plan, with progress marks, is appended to the first user message of every request (a stable position, so it never gets masked and the executor's prompt cache only breaks when the plan changes). `baton_step({id, status, evidence})` marks steps; finishing a checkpoint step asks for `baton_review`.
   - After help or plan, the executor's context is **reset** to task + plan + the last 2 turns. Baton does this by appending a `compaction` entry at `turn_end`.
 - **Safety triggers.** These are deterministic `Baton:` nudge messages:
   - context ≥60%;
   - the same error signature 3×;
-  - a reminder after 25 tool calls without an advisor call;
+  - exploration done without a plan (8 read-only calls) → call `baton_plan`; the first `write`/`edit` without a plan is blocked **once** (retrying passes);
+  - the first milestone after edits (tests green or a build/typecheck exits 0) → early `baton_review`;
+  - 20 tool calls without `baton_step` while a plan is pinned (drift);
+  - a reminder after 12 tool calls without an advisor call;
   - a cooldown between nudges.
   - `git commit` is **blocked** until `baton_review` returns `on_track` or `done`. New edits revoke the pass.
 - **Auto-compaction.** pi's threshold and overflow compaction is replaced by a deterministic, no-LLM Baton summary (task, prompts, last plan, timeline). This is configurable.
@@ -43,7 +51,12 @@ See [`baton.example.json`](baton.example.json) for all options with their defaul
 | `executor` | `openrouter/z-ai/glm-5.3-flash` (informational; choose the model with `/model`) |
 | `advisor` | `openrouter/anthropic/claude-opus-5.5` |
 | `packBudgetTokens` | `40000` |
-| `triggers.contextRatio` / `sameErrorCount` / `remindEvery` / `minGapCalls` | `0.6` / `3` / `25` / `5` |
+| `triggers.contextRatio` / `sameErrorCount` / `remindEvery` / `minGapCalls` | `0.6` / `3` / `12` / `5` |
+| `triggers.milestoneReview` / `autoPlanAfterReads` / `planBeforeWrite` / `driftCalls` | `true` / `8` / `true` / `20` |
+| `pack.skills` | `{ enabled: true, budgetRatio: 0.35, maxSkills: 4 }` |
+| `pack.excludePaths` | journal dir, `node_modules`, `dist`, lockfiles |
+| `pack.pinPlan` | `true` |
+| `mask.neverMaskPaths` | skills and reference docs |
 | `triggers.reviewBeforeCommit` | `true` |
 | `judge.enabled` | `false` |
 | `replaceAutoCompact` | `true` |
@@ -70,9 +83,9 @@ Development: `npm install && npm run check` runs `tsc --noEmit` against the real
 
 ## Status / limitations
 
-0.1.0 is an early version. The type-checked code, the unit tests and the extension loading in pi's real loader are verified. Not verified yet: an end-to-end session with real GLM and Opus keys.
+0.2.0 is an early version. The type-checked code, the unit tests and the extension loading in pi's real loader are verified. End-to-end sessions with GLM-5.3-Flash and Opus 5.5 via OpenRouter were run on a Tetris-on-Reatom task.
 
-- Token counts are estimates (chars/4); pi has no public tokenizer.
+- Token counts are conservative estimates (chars/3.2, non-ASCII ×2); pi has no public tokenizer. Real advisor usage is recorded in the journal (`advisor` events: `usage`, `attempts`, `packTokens`).
 - Masking rewrites the prefix of the request, which breaks prompt caching. That is cheap for GLM but would be costly for Anthropic executors. Stubs are stable, so the prefix only changes once per batch.
 - Test-summary parsing is regex based (vitest/jest/pytest/cargo/go). Other runners only get exit codes.
 - The reset relies on `turn_end` compaction entries. If pi rejects the entry, use `/baton reset`.

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { clip } from "./util.ts";
+import { clip, matchesAny } from "./util.ts";
 
 export type Exec = (cmd: string, args: string[]) => Promise<{ stdout: string; code: number }>;
 
@@ -13,10 +13,27 @@ export async function git(exec: Exec, args: string[]): Promise<string | undefine
 	}
 }
 
-export async function changedFiles(exec: Exec, cwd: string, maxLines = 400): Promise<{ path: string; content: string }[]> {
+/** Pure: the journal dir plus configured globs; always applied, regardless of .gitignore. */
+export function packExcludes(journalDir: string, extra: readonly string[]): string[] {
+	const j = journalDir.replace(/^\.\//, "").replace(/\/+$/, "");
+	return [...new Set([`${j}/**`, ".pi/baton/**", ...extra])];
+}
+
+/** Pure: git pathspec args (`-- . :(exclude,glob)…`) that drop excluded paths from diff/name lists. */
+export function excludePathspec(excludes: readonly string[]): string[] {
+	return ["--", ".", ...excludes.map((g) => `:(exclude,glob)${g}`)];
+}
+
+/** git diff [args] with the pack excludes; falls back to the unstaged diff when there is no HEAD. */
+export async function packDiff(exec: Exec, args: string[], excludes: readonly string[]): Promise<string | undefined> {
+	const spec = excludePathspec(excludes);
+	return (await git(exec, ["diff", ...args, "HEAD", ...spec])) ?? (await git(exec, ["diff", ...args, ...spec]));
+}
+
+export async function changedFiles(exec: Exec, cwd: string, maxLines = 400, excludes: readonly string[] = [".pi/baton/**"]): Promise<{ path: string; content: string }[]> {
 	const tracked = (await git(exec, ["diff", "--name-only", "HEAD"])) ?? (await git(exec, ["diff", "--name-only"])) ?? "";
 	const untracked = (await git(exec, ["ls-files", "--others", "--exclude-standard"])) ?? "";
-	const paths = [...new Set([...tracked.split("\n"), ...untracked.split("\n")].map((s) => s.trim()).filter(Boolean))].filter((p) => !p.startsWith(".pi/baton/"));
+	const paths = [...new Set([...tracked.split("\n"), ...untracked.split("\n")].map((s) => s.trim()).filter(Boolean))].filter((p) => !matchesAny(p, excludes));
 	const out: { path: string; content: string }[] = [];
 	for (const p of paths.slice(0, 40)) {
 		const abs = join(cwd, p);

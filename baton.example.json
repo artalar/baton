@@ -2,12 +2,83 @@
   "executor": "openrouter/z-ai/glm-5.3-flash",
   "advisor": "openrouter/anthropic/claude-opus-5.5",
   "advisorMaxTokens": 4096,
-  "judge": { "enabled": false, "model": "typesafe/jev-latest", "minConfidence": 0.7 },
+  "judge": {
+    "enabled": false,
+    "model": "typesafe/jev-latest",
+    "minConfidence": 0.7
+  },
   "packBudgetTokens": 40000,
-  "triggers": { "contextRatio": 0.6, "sameErrorCount": 3, "reviewBeforeCommit": true, "remindEvery": 25, "minGapCalls": 5 },
-  "mask": { "enabled": true, "exemptTools": ["baton_review", "baton_help", "baton_plan"], "dedupReads": true, "staleReads": true },
-  "help": { "lastCalls": 8 },
-  "reset": { "keepTurns": 2 },
+  "pack": {
+    "excludePaths": [
+      ".pi/baton/**",
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/package-lock.json",
+      "**/npm-shrinkwrap.json",
+      "**/pnpm-lock.yaml",
+      "**/yarn.lock",
+      "**/bun.lock",
+      "**/bun.lockb",
+      "**/Cargo.lock",
+      "**/poetry.lock",
+      "**/uv.lock",
+      "**/go.sum",
+      "**/composer.lock",
+      "**/Gemfile.lock"
+    ],
+    "skills": {
+      "enabled": true,
+      "budgetRatio": 0.35,
+      "maxSkills": 4,
+      "dirs": [
+        ".agents/skills",
+        ".pi/skills",
+        ".claude/skills",
+        "skills"
+      ]
+    },
+    "pinPlan": true
+  },
+  "triggers": {
+    "contextRatio": 0.6,
+    "sameErrorCount": 3,
+    "reviewBeforeCommit": true,
+    "remindEvery": 12,
+    "minGapCalls": 5,
+    "milestoneReview": true,
+    "autoPlanAfterReads": 8,
+    "planBeforeWrite": true,
+    "driftCalls": 20
+  },
+  "mask": {
+    "enabled": true,
+    "exemptTools": [
+      "baton_review",
+      "baton_help",
+      "baton_plan",
+      "baton_step"
+    ],
+    "dedupReads": true,
+    "staleReads": true,
+    "neverMaskPaths": [
+      "**/SKILL.md",
+      ".agents/skills/**",
+      ".pi/skills/**",
+      ".claude/skills/**",
+      "skills/**/*.md",
+      "**/AGENTS.md",
+      "**/CLAUDE.md",
+      "**/README.md",
+      "**/REFERENCE.md",
+      "docs/**/*.md"
+    ]
+  },
+  "help": {
+    "lastCalls": 8
+  },
+  "reset": {
+    "keepTurns": 2
+  },
   "replaceAutoCompact": true,
   "journalDir": ".pi/baton"
 }

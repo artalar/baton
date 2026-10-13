@@ -1,4 +1,5 @@
 import { type JournalEvent, eventLine, normPath } from "./journal.ts";
+import { matchesAny } from "./util.ts";
 
 /** Minimal structural view of pi's AgentMessage that masking needs. */
 export interface MsgLike {
@@ -15,6 +16,53 @@ export interface MaskOptions {
 	dedupReads: boolean;
 	staleReads: boolean;
 	cwd: string;
+	/** Reads of these paths (skills, reference docs) are never masked, deduped or marked stale. */
+	neverMaskPaths?: string[];
+}
+
+const BASH_READ = /^\s*(cat|head|tail|sed|less|more|bat|nl|awk)\b/;
+
+/** Pure: is this tool call a read of a skill / reference doc that must stay visible? */
+export function isReferenceRead(tool: string, args: Record<string, unknown> | undefined, cwd: string, globs: readonly string[] | undefined): boolean {
+	if (!globs?.length || !args) return false;
+	if (tool === "read") {
+		const p = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : undefined;
+		return !!p && matchesAny(normPath(p, cwd), globs);
+	}
+	if (tool === "bash" && typeof args.command === "string") {
+		// only simple read pipelines: every segment must be a read command, every path arg a reference doc
+		const segs = args.command.split(/&&|;|\|\|/).map((x) => x.trim()).filter(Boolean);
+		if (!segs.length) return false;
+		let paths = 0;
+		for (const seg of segs) {
+			if (!BASH_READ.test(seg)) return false;
+			for (const tok of seg.split(/\s+/).slice(1)) {
+				if (tok.startsWith("-") || /^[|>]/.test(tok) || /^\d+$/.test(tok) || /^['"]?\d*,?\d*p['"]?$/.test(tok)) continue;
+				const t = tok.replace(/^['"]|['"]$/g, "");
+				if (!t.includes("/") && !t.includes(".")) continue;
+				if (!matchesAny(normPath(t, cwd), globs)) return false;
+				paths++;
+			}
+		}
+		return paths > 0;
+	}
+	return false;
+}
+
+/**
+ * Pure: append the pinned plan to the first user message of the request (stable position, so the
+ * provider prompt cache only breaks when the plan itself changes). Never masked: masking only touches toolResult.
+ */
+export function pinPlan<T extends MsgLike>(messages: readonly T[], planText: string | undefined): T[] {
+	if (!planText) return [...messages];
+	const i = messages.findIndex((m) => m.role === "user");
+	if (i < 0) return [...messages];
+	const m = messages[i]!;
+	const block = { type: "text", text: `<baton_pinned_plan>\n${planText}\n</baton_pinned_plan>` };
+	const content = typeof m.content === "string" ? [{ type: "text", text: m.content }, block] : Array.isArray(m.content) ? [...m.content, block] : [block];
+	const out = [...messages];
+	out[i] = { ...m, content } as T;
+	return out;
 }
 
 export interface MaskStats {
@@ -89,6 +137,7 @@ export function maskMessages<T extends MsgLike>(messages: readonly T[], lookup: 
 		if (opts.exemptTools.includes(name)) return m;
 		const e = m.toolCallId ? lookup(m.toolCallId) : undefined;
 		const a = m.toolCallId ? args.get(m.toolCallId) : undefined;
+		if (isReferenceRead(name, a, opts.cwd, opts.neverMaskPaths)) return m;
 		let stub: string | undefined;
 		if (name === "read") {
 			const p = pathOf(a);

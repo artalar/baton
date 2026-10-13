@@ -10,19 +10,28 @@ import { type BatonConfig, loadConfig } from "./config.ts";
 import { Journal, type JournalEvent, eventLine } from "./journal.ts";
 import { filterEvents, type JudgeProvider } from "./judge.ts";
 import { jevJudge } from "./judge-jev.ts";
-import { maskMessages, type MsgLike } from "./mask.ts";
+import { maskMessages, type MsgLike, pinPlan } from "./mask.ts";
 import { type AdvisorKind, buildPack, type PackInput, type VerbatimCall } from "./pack.ts";
 import { autoCompactSummary, pickFirstKept, resetSummary } from "./reset.ts";
-import { changedFiles, type Exec, git, readAgentsMd, repoMap } from "./repo.ts";
-import { renderPlan } from "./schema.ts";
-import { commitGate, evaluate, initialTriggerState, onAdvisor, onToolResult, type TriggerState } from "./triggers.ts";
+import { changedFiles, type Exec, git, packDiff, packExcludes, readAgentsMd, repoMap } from "./repo.ts";
+import { discoverSkills, selectSkills } from "./skills.ts";
+import { type AdvisorReply, renderPlan } from "./schema.ts";
+import { callFacts, commitGate, evaluate, initialTriggerState, onAdvisor, onToolResult, planGate, type TriggerState } from "./triggers.ts";
 import { clip } from "./util.ts";
 
 export const SYSTEM_SNIPPET = `Baton is active. Tool outputs you have already seen are replaced by stubs like "[baton: output masked. evt#12 …]"; call baton_recall({"evt":12}) when you need the full text again.
 Use the advisor tools (a stronger model, one call each, costly — do not spam):
-- baton_plan: at the start of a non-trivial task, or when the context is getting long. Resets your context to task + plan.
+- baton_plan: after a short exploration (read the project skills and the repo first), before writing code; again when the context is getting long. The plan is pinned into every request; follow it.
+- baton_step: mark a plan step done/blocked with evidence (command + result). Cheap, no advisor call.
 - baton_help: when stuck — the same error twice, or you do not understand a failure. Give your hypothesis, what you tried, and important evt numbers. Resets your context to task + plan.
-- baton_review: when you believe a milestone or the task is done, and always before git commit. Its plan is appended; follow it.`;
+- baton_review: at the first milestone (core model works, tests/build green), at the plan's checkpoints, and always before git commit. Its plan is appended; follow it.
+Skill files (SKILL.md) and reference docs are never masked.`;
+
+/** Pure: pinned plan text with step status marks. */
+export function renderPinned(plan: { reply: AdvisorReply; label: string }, status: Record<string, string>): string {
+	const marks = plan.reply.plan.map((st) => `[${status[st.id] === "done" ? "x" : status[st.id] === "blocked" ? "!" : " "}] ${st.id}`).join("  ");
+	return `${renderPlan(plan.reply, plan.label)}\nProgress: ${marks || "(no steps)"}\nMark steps with baton_step({id, status, evidence}).`;
+}
 
 interface Runtime {
 	cfg: BatonConfig;
@@ -31,6 +40,8 @@ interface Runtime {
 	turn: number;
 	userPrompts: { evt: number; text: string }[];
 	lastPlan?: string;
+	pinned?: { reply: AdvisorReply; label: string };
+	stepStatus: Record<string, string>;
 	pendingReset?: { summary: string; kind: AdvisorKind };
 	pendingNudge?: string;
 	maskStats: { masked: number; deduped: number; stale: number; charsSaved: number };
@@ -52,6 +63,7 @@ export default function baton(pi: ExtensionAPI) {
 			triggers: initialTriggerState(),
 			turn: 0,
 			userPrompts: [],
+			stepStatus: {},
 			maskStats: { masked: 0, deduped: 0, stale: 0, charsSaved: 0 },
 		};
 		rt.userPrompts = rt.journal.events.filter((e) => e.kind === "user_prompt").map((e) => ({ evt: e.evt, text: e.text ?? "" }));
@@ -86,6 +98,12 @@ export default function baton(pi: ExtensionAPI) {
 	// Commit gate (permission-gate pattern).
 	pi.on("tool_call", (e, ctx) => {
 		const r = init(ctx);
+		const pg = planGate(e.toolName, r.triggers, r.cfg.triggers);
+		if (pg) {
+			r.triggers = { ...r.triggers, planGateFired: true };
+			r.journal.record("note", r.turn, "plan gate: first write blocked once (no plan yet)");
+			return pg;
+		}
 		if (e.toolName !== "bash") return undefined;
 		const cmd = String((e.input as { command?: unknown }).command ?? "");
 		return commitGate(cmd, r.triggers, r.cfg.triggers);
@@ -105,7 +123,8 @@ export default function baton(pi: ExtensionAPI) {
 			turn: r.turn,
 			cwd: ctx.cwd,
 		});
-		r.triggers = onToolResult(r.triggers, e.toolName, ev.errSig, (ev.filesWritten?.length ?? 0) > 0);
+		const cmd = typeof (e.input as { command?: unknown }).command === "string" ? String((e.input as { command: string }).command) : undefined;
+		r.triggers = onToolResult(r.triggers, e.toolName, ev.errSig, (ev.filesWritten?.length ?? 0) > 0, callFacts(e.toolName, cmd, ev.exit, ev.test));
 		const usage = ctx.getContextUsage();
 		const ratio = usage && usage.tokens !== null && usage.contextWindow ? usage.tokens / usage.contextWindow : null;
 		const { nudge, state } = evaluate(r.triggers, r.cfg.triggers, ratio);
@@ -119,7 +138,8 @@ export default function baton(pi: ExtensionAPI) {
 		const r = init(ctx);
 		const { messages, stats } = maskMessages(e.messages as unknown as MsgLike[], (id) => r.journal.forCall(id), { ...r.cfg.mask, cwd: ctx.cwd });
 		r.maskStats = stats;
-		return { messages: messages as unknown as typeof e.messages };
+		const out = r.cfg.pack.pinPlan && r.pinned ? pinPlan(messages, renderPinned(r.pinned, r.stepStatus)) : messages;
+		return { messages: out as unknown as typeof e.messages };
 	});
 
 	// Turn boundary: apply a pending reset (compaction entry) or deliver a nudge.
@@ -186,6 +206,34 @@ export default function baton(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "baton_step",
+		label: "Baton step",
+		description: "Mark a step of the pinned advisor plan as done, in_progress or blocked, with evidence (command and result). No advisor call; cheap.",
+		promptSnippet: "baton_step(id, status, evidence): track progress on the pinned plan",
+		parameters: Type.Object({
+			id: Type.String({ description: "Plan step id, e.g. S2" }),
+			status: Type.Union([Type.Literal("done"), Type.Literal("in_progress"), Type.Literal("blocked")]),
+			evidence: Type.Optional(Type.String({ description: "Command run and its result that proves the done criterion" })),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const r = init(ctx);
+			if (!r.pinned) return { content: [{ type: "text", text: "No pinned plan yet. Call baton_plan first." }], details: { ok: false } };
+			const step = r.pinned.reply.plan.find((x) => x.id === params.id);
+			if (!step) return { content: [{ type: "text", text: `Unknown step ${params.id}. Steps: ${r.pinned.reply.plan.map((x) => x.id).join(", ")}` }], details: { ok: false } };
+			r.stepStatus[params.id] = params.status;
+			r.journal.record("note", r.turn, `step ${params.id}: ${params.status}${params.evidence ? ` — ${params.evidence}` : ""}`, { step: params.id, status: params.status });
+			const checkpoint = params.status === "done" && (r.pinned.reply.checkpoints ?? []).includes(params.id);
+			const left = r.pinned.reply.plan.filter((x) => r.stepStatus[x.id] !== "done").map((x) => x.id);
+			const next = checkpoint
+				? `Checkpoint ${params.id} reached: call baton_review now.`
+				: left.length
+					? `Next: ${left[0]} — ${r.pinned.reply.plan.find((x) => x.id === left[0])!.done_when ? `done when ${r.pinned.reply.plan.find((x) => x.id === left[0])!.done_when}` : ""}`
+					: "All steps done: call baton_review.";
+			return { content: [{ type: "text", text: `Step ${params.id} → ${params.status}. ${next}` }], details: { ok: true, step: params.id, status: params.status, checkpoint } };
+		},
+	});
+
 	const verbatim = (r: Runtime, e: JournalEvent, maxChars = 6000): VerbatimCall => ({
 		event: e,
 		args: e.argsDigest ?? "",
@@ -195,18 +243,21 @@ export default function baton(pi: ExtensionAPI) {
 	async function runAdvisor(kind: AdvisorKind, extra: Partial<PackInput>, ctx: ExtensionContext, signal?: AbortSignal) {
 		const r = init(ctx);
 		const task = r.userPrompts[0]?.text ?? "";
-		const base: PackInput = { kind, task, userPrompts: r.userPrompts, previousPlan: r.lastPlan, ...extra };
+		const pinnedText = r.pinned ? renderPinned(r.pinned, r.stepStatus) : r.lastPlan;
+		const base: PackInput = { kind, task, userPrompts: r.userPrompts, previousPlan: pinnedText, ...extra };
 		const tools = r.journal.toolEvents();
+		const excludes = packExcludes(r.cfg.journalDir, r.cfg.pack.excludePaths);
+		base.agentsMd = readAgentsMd(ctx.cwd);
 
 		if (kind === "review") {
-			base.diffStat = (await git(exec, ["diff", "--stat", "HEAD"])) ?? (await git(exec, ["diff", "--stat"]));
-			base.diff = (await git(exec, ["diff", "HEAD"])) ?? (await git(exec, ["diff"])) ?? "";
-			base.changedFiles = await changedFiles(exec, ctx.cwd);
+			base.diffStat = await packDiff(exec, ["--stat"], excludes);
+			base.diff = (await packDiff(exec, [], excludes)) ?? "";
+			base.changedFiles = await changedFiles(exec, ctx.cwd, 400, excludes);
 			const lt = [...tools].reverse().find((e) => e.test);
 			if (lt) base.lastTest = verbatim(r, lt, 8000);
-			base.previousPlan = undefined; // review sees only the artefacts
+			// review sees artefacts + the pinned plan (as a contract), never the executor's narrative
 		} else if (kind === "help") {
-			base.diffStat = (await git(exec, ["diff", "--stat", "HEAD"])) ?? undefined;
+			base.diffStat = await packDiff(exec, ["--stat"], excludes);
 			const last = tools.slice(-r.cfg.help.lastCalls);
 			base.lastCalls = last.map((e) => verbatim(r, e));
 			const sigs = new Set(last.flatMap((e) => (e.errSig ? [e.errSig] : [])));
@@ -221,7 +272,8 @@ export default function baton(pi: ExtensionAPI) {
 			if (r.cfg.judge.enabled) judge = jevJudge(ctx, r.cfg.judge.model);
 			base.timeline = (await filterEvents(tools.slice(-120), task, judge, r.cfg.judge.minConfidence, signal)).kept.filter((e) => !lastIds.has(e.evt)).slice(-60);
 		} else {
-			base.agentsMd = readAgentsMd(ctx.cwd);
+			base.diffStat = await packDiff(exec, ["--stat"], excludes);
+			base.timeline = tools.filter((e) => (e.importance ?? 0) >= 1).slice(-60);
 			const files = ((await git(exec, ["ls-files"])) ?? "").split("\n").filter(Boolean).slice(0, 2000);
 			const { readFileSync } = await import("node:fs");
 			base.repoMap = repoMap(files, (p) => {
@@ -233,8 +285,29 @@ export default function baton(pi: ExtensionAPI) {
 			}, 16_000);
 		}
 
+		if (r.cfg.pack.skills.enabled) {
+			const all = discoverSkills(ctx.cwd, r.cfg.pack.skills.dirs);
+			if (all.length) {
+				const hay = [
+					kind,
+					task,
+					...r.userPrompts.map((p) => p.text),
+					base.question ?? "",
+					base.diff ?? "",
+					...(base.changedFiles ?? []).map((f) => `${f.path}\n${f.content.slice(0, 4000)}`),
+					base.repoMap ?? "",
+					base.hypothesis ?? "",
+					...(base.lastCalls ?? []).map((c) => `${c.args}\n${c.output.slice(0, 1000)}`),
+				].join("\n");
+				const pick = selectSkills(all, hay, Math.floor(r.cfg.packBudgetTokens * r.cfg.pack.skills.budgetRatio), {
+					maxSkills: r.cfg.pack.skills.maxSkills,
+					prefer: kind === "review" ? /review/i : undefined,
+				});
+				base.skills = pick.skills;
+			}
+		}
 		const pack = buildPack(base, r.cfg.packBudgetTokens);
-		r.journal.record("note", r.turn, `baton_${kind} pack built: ${pack.tokens} tok`, { sections: pack.sections });
+		r.journal.record("note", r.turn, `baton_${kind} pack built: ${pack.tokens} tok`, { sections: pack.sections, skills: base.skills?.map((k) => k.name) ?? [] });
 		const res: AdvisorResult = await callAdvisor(ctx, r.cfg.advisor, pack.text, r.cfg.advisorMaxTokens, signal);
 		return { r, pack, res };
 	}
@@ -257,7 +330,7 @@ export default function baton(pi: ExtensionAPI) {
 	const descriptions: Record<AdvisorKind, string> = {
 		review: "Ask the stronger advisor model to review the current work (task, user prompts, git diff, changed files, last test run). Required before git commit. Appends the advisor's plan.",
 		help: "Ask the stronger advisor model for help when stuck (same error repeated, unclear failure). Sends your last tool calls verbatim plus your hypothesis and attempts. Afterwards your context is reset to task + plan + last turns.",
-		plan: "Ask the stronger advisor model for a plan (task, AGENTS.md, repo map). Afterwards your context is reset to task + plan + last turns.",
+		plan: "Ask the stronger advisor model for a plan (task, project skills, AGENTS.md, repo map, your exploration findings). Call it after exploring and before writing code. The plan is pinned into every request; afterwards your context is reset to task + plan + last turns.",
 	};
 
 	for (const kind of ["review", "help", "plan"] as const) {
@@ -285,7 +358,11 @@ export default function baton(pi: ExtensionAPI) {
 				const plan = renderPlan(res.reply, `baton_${kind}`, res.truncated);
 				r.lastPlan = plan;
 				r.journal.record("advisor", r.turn, `baton_${kind}: ${res.reply.verdict}`, { ...res.reply, usage: res.usage, attempts: res.attempts, packTokens: pack.tokens });
-				r.triggers = onAdvisor(r.triggers, kind, res.reply.verdict);
+				r.triggers = onAdvisor(r.triggers, kind, res.reply.verdict, res.reply.plan.length);
+				if (res.reply.plan.length && res.reply.verdict !== "done") {
+					r.pinned = { reply: res.reply, label: `baton_${kind}` };
+					r.stepStatus = {};
+				}
 				let tail = "";
 				if (kind !== "review") {
 					const diffStat = (await git(exec, ["diff", "--stat", "HEAD"])) ?? undefined;
@@ -320,7 +397,8 @@ export default function baton(pi: ExtensionAPI) {
 				[
 					`Baton: ${r.journal.events.length} events in ${r.cfg.journalDir}`,
 					`tool calls ${t.toolCalls}, since advisor ${t.toolCalls - t.lastAdvisorAt}, review passed: ${t.reviewPassed}`,
-					`last request: masked ${s.masked}, duplicate ${s.deduped}, stale ${s.stale}, ~${Math.round(s.charsSaved / 4)} tok saved`,
+					`last request: masked ${s.masked}, duplicate ${s.deduped}, stale ${s.stale}, ~${Math.round(s.charsSaved / 3.2)} tok saved`,
+					`plan: ${r.pinned ? `${r.pinned.label}, ${Object.values(r.stepStatus).filter((x) => x === "done").length}/${r.pinned.reply.plan.length} steps done` : "none"}`,
 					`advisor ${r.cfg.advisor}, judge ${r.cfg.judge.enabled ? r.cfg.judge.model : "off"}`,
 				].join("\n"),
 				"info",

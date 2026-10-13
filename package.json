@@ -1,6 +1,6 @@
 {
   "name": "pi-baton",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Baton: journal, output masking, advisor (review/help/plan) and safety triggers for the pi coding agent",
   "type": "module",
   "keywords": [

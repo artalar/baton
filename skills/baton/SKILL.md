@@ -1,6 +1,6 @@
 ---
 name: baton
-description: When and how to use Baton's advisor tools (baton_plan, baton_help, baton_review) and baton_recall while coding with pi.
+description: When and how to use Baton's advisor tools (baton_plan, baton_help, baton_review), baton_step and baton_recall while coding with pi.
 ---
 
 # Baton: working with the advisor
@@ -14,13 +14,16 @@ Call it at these moments:
 
 | Situation | Tool | What happens next |
 |---|---|---|
-| Starting a non-trivial task, or unsure how to approach it | `baton_plan` | You get a plan; your context resets to task + plan + last 2 turns |
+| After a short exploration (repo, package.json, project skills), before writing code | `baton_plan` | You get a plan with invariants and skill rules; it is pinned into every request; your context resets to task + plan + last 2 turns |
+| You finished a plan step | `baton_step` (`id`, `status`, `evidence`) | Progress is tracked; at a checkpoint you are told to call `baton_review` |
 | The same error twice, or a failure you cannot explain | `baton_help` (give `hypothesis`, `attempts`, `importantEvts`) | You get corrected facts and a plan; context resets |
-| You believe a milestone or the whole task is done | `baton_review` | The verdict and fixes are appended; follow them |
+| First milestone (core works, tests/build green), a plan checkpoint, or the task is done | `baton_review` | The verdict and fixes are appended; follow them |
 | Before `git commit` | `baton_review` | Commits are blocked until a review returns `on_track` or `done` |
 
 Rules:
 - Do not call an advisor more than once per ~8 tool calls unless you are stuck.
 - Be honest in `baton_help`: list what failed, not what you hoped would work.
 - After a plan arrives, work step by step; each step has a `done when` criterion. Run the test command it names.
-- Baton nudges (messages starting with `Baton:`) are deterministic safety triggers: context ≥60%, the same error 3×, 25 calls without a check. Follow them.
+- Skill files and reference docs (SKILL.md, AGENTS.md, README.md) are never masked; read them before planning.
+- The first write without a plan is blocked once: call `baton_plan`, or retry the write if the task is trivial.
+- Baton nudges (messages starting with `Baton:`) are deterministic triggers: exploration done without a plan, first milestone, context ≥60%, the same error 3×, 12 calls without a check, 20 calls without `baton_step`. Follow them.

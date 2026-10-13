@@ -13,6 +13,14 @@ export interface TriggerConfig {
 	remindEvery: number;
 	/** Minimum tool calls between two automatic nudges (cooldown). */
 	minGapCalls: number;
+	/** Nudge baton_review at the first milestone (first green test run or successful build after edits). */
+	milestoneReview: boolean;
+	/** Nudge baton_plan after this many exploration (read-only) calls without a plan (0 = off). */
+	autoPlanAfterReads: number;
+	/** Block the first write/edit once (soft gate) until baton_plan was called. Retrying the write passes. */
+	planBeforeWrite: boolean;
+	/** With a plan pinned: nudge after this many tool calls without baton_step (0 = off). */
+	driftCalls: number;
 }
 
 export interface JudgeConfig {
@@ -30,6 +38,14 @@ export interface BatonConfig {
 	advisorMaxTokens: number;
 	judge: JudgeConfig;
 	packBudgetTokens: number;
+	pack: {
+		/** Globs never included in the pack diff / changed files (in addition to journalDir), regardless of .gitignore. */
+		excludePaths: string[];
+		/** Include relevant project skills (SKILL.md) in advisor packs. */
+		skills: { enabled: boolean; budgetRatio: number; maxSkills: number; dirs: string[] };
+		/** Pin the latest advisor plan into every request (never masked). */
+		pinPlan: boolean;
+	};
 	triggers: TriggerConfig;
 	mask: {
 		enabled: boolean;
@@ -37,6 +53,8 @@ export interface BatonConfig {
 		exemptTools: string[];
 		dedupReads: boolean;
 		staleReads: boolean;
+		/** Reads (read tool, or bash cat/sed/head of a path) matching these globs are never masked: skills and reference docs. */
+		neverMaskPaths: string[];
 	};
 	help: { lastCalls: number };
 	reset: { keepTurns: number };
@@ -51,12 +69,55 @@ export const DEFAULT_CONFIG: BatonConfig = {
 	advisorMaxTokens: 4096,
 	judge: { enabled: false, model: "typesafe/jev-latest", minConfidence: 0.7 },
 	packBudgetTokens: 40_000,
-	triggers: { contextRatio: 0.6, sameErrorCount: 3, reviewBeforeCommit: true, remindEvery: 25, minGapCalls: 5 },
+	pack: {
+		excludePaths: [
+			".pi/baton/**",
+			"**/node_modules/**",
+			"**/dist/**",
+			"**/package-lock.json",
+			"**/npm-shrinkwrap.json",
+			"**/pnpm-lock.yaml",
+			"**/yarn.lock",
+			"**/bun.lock",
+			"**/bun.lockb",
+			"**/Cargo.lock",
+			"**/poetry.lock",
+			"**/uv.lock",
+			"**/go.sum",
+			"**/composer.lock",
+			"**/Gemfile.lock",
+		],
+		skills: { enabled: true, budgetRatio: 0.35, maxSkills: 4, dirs: [".agents/skills", ".pi/skills", ".claude/skills", "skills"] },
+		pinPlan: true,
+	},
+	triggers: {
+		contextRatio: 0.6,
+		sameErrorCount: 3,
+		reviewBeforeCommit: true,
+		remindEvery: 12,
+		minGapCalls: 5,
+		milestoneReview: true,
+		autoPlanAfterReads: 8,
+		planBeforeWrite: true,
+		driftCalls: 20,
+	},
 	mask: {
 		enabled: true,
-		exemptTools: ["baton_review", "baton_help", "baton_plan"],
+		exemptTools: ["baton_review", "baton_help", "baton_plan", "baton_step"],
 		dedupReads: true,
 		staleReads: true,
+		neverMaskPaths: [
+			"**/SKILL.md",
+			".agents/skills/**",
+			".pi/skills/**",
+			".claude/skills/**",
+			"skills/**/*.md",
+			"**/AGENTS.md",
+			"**/CLAUDE.md",
+			"**/README.md",
+			"**/REFERENCE.md",
+			"docs/**/*.md",
+		],
 	},
 	help: { lastCalls: 8 },
 	reset: { keepTurns: 2 },
