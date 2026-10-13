@@ -17,8 +17,8 @@ const start = () => {
 describe("0.12.1 baton_read: the helper reads, the lead gets the outputs verbatim in one tool result", () => {
 	it("on by default; system note prefers baton_read for studying, baton_edit for edits", () => {
 		expect(cfg.readTool).toBe(true);
-		expect(LEAD_EDIT_TOOL_NOTE).toMatch(/prefer baton_read/);
-		expect(LEAD_EDIT_TOOL_NOTE).toMatch(/ALWAYS call baton_edit/);
+		expect(LEAD_EDIT_TOOL_NOTE).toMatch(/baton_read\(\{request\}\) — to study code/);
+		expect(LEAD_EDIT_TOOL_NOTE).toMatch(/baton_edit\(\{request\}\) — to change files/);
 	});
 	it("baton_read → followup with the request; edits are blocked while the helper reads", () => {
 		const { s, d } = start();

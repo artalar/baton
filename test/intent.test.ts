@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type Call, DEFAULT_SWITCH, decideTurn, initialSwitchState, intentFiles, LEAD_SYSTEM_NOTE, parseEditIntent, type TurnInput } from "../src/pi/switch-core.ts";
+import { type Call, DEFAULT_SWITCH, decideTurn, initialSwitchState, intentFiles, LEAD_INTENT_NOTE, parseEditIntent, type TurnInput } from "../src/pi/switch-core.ts";
 
 const cfg = DEFAULT_SWITCH;
 const c = (id: string, name: string, args: Record<string, unknown> = {}): Call => ({ id, name, args });
@@ -9,8 +9,8 @@ const INTENT = "Plan done.\n<edit-intent>\nfiles: src/game/profiles.ts, src/game
 
 describe("0.11.1 edit intents: the lead states the edit, the helper performs it", () => {
 	it("system note asks for the intent block", () => {
-		expect(LEAD_SYSTEM_NOTE).toMatch(/<edit-intent>/);
-		expect(LEAD_SYSTEM_NOTE).toMatch(/interruption summary/);
+		expect(LEAD_INTENT_NOTE).toMatch(/<edit-intent>/);
+		expect(LEAD_INTENT_NOTE).toMatch(/interruption summary/);
 	});
 	it("parses the block and its files", () => {
 		const i = parseEditIntent(INTENT)!;

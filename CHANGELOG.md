@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.2
+
+- The lead's system note and the `baton_read` / `baton_edit` tool descriptions now explain why to use them:
+  - One call replaces many turns, and every turn resends the whole context.
+  - `baton_read` returns the raw outputs verbatim, deduplicated, with skills in full; nothing is lost and the lead can call again.
+  - With `baton_edit` the lead stays the author and gets the diff summary plus tsc/test status in one result. The mechanical write → check → fix loop runs without it, and the lead can always fix things itself.
+- The edit-intent paragraph moved to `LEAD_INTENT_NOTE`. It is appended only with `BATON_EDIT=intent`, so it no longer competes with `baton_edit`.
+- `MSG.lead` now points to `baton_edit` / `baton_read`; `baton_delegate implement` stays for whole multi-file specs.
+
 ## 0.12.1
 
 **`baton_read`: the lead studies code through the helper (switch, default on)**

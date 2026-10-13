@@ -17,7 +17,7 @@ const start = () => {
 describe("0.12 baton_edit: the lead edits through a tool, the helper performs it in the same session", () => {
 	it("on by default; the system note asks to always use it", () => {
 		expect(cfg.editTool).toBe(true);
-		expect(LEAD_EDIT_TOOL_NOTE).toMatch(/ALWAYS call baton_edit/);
+		expect(LEAD_EDIT_TOOL_NOTE).toMatch(/baton_edit\(\{request\}\) — to change files/);
 		expect(LEAD_EDIT_TOOL_NOTE).toMatch(/write\/edit/);
 	});
 	it("baton_edit → implement with the free-text request as spec", () => {

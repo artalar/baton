@@ -15,7 +15,7 @@ import { openRouterComplete, openRouterModelId } from "../core/openrouter.ts";
 import { parseModelRef } from "./config.ts";
 import { buildState, buildSummary, CALL_QUESTIONS, callSummary, gateFromAnswers, recordCall, summaryPrompt, TURN_QUESTIONS, turnJevFromAnswers, type TurnJev } from "./jev-policy.ts";
 import { classifyEffects, diffSnaps, revertTo, type Snap, snapshot } from "./fsguard.ts";
-import { addCost, anchorCache, applyJevGate, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_EDIT_TOOL_NOTE, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
+import { addCost, anchorCache, applyJevGate, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_EDIT_TOOL_NOTE, LEAD_INTENT_NOTE, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
 
 /** Test files under cwd (skips node_modules, dot dirs, dist). */
 export function hasTestFiles(dir: string, depth = 5): boolean {
@@ -213,11 +213,11 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			st.phase = "lead";
 			await setModelFor(ctx, "lead");
 			log("switch", { from: "-", to: "lead", reason: "resume: BATON_SWITCH_START=lead" });
-			return { systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE + (cfg!.editTool ? LEAD_EDIT_TOOL_NOTE : "") };
+			return { systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE + (cfg!.editTool || cfg!.readTool ? LEAD_EDIT_TOOL_NOTE : cfg!.editIntents ? LEAD_INTENT_NOTE : "") };
 		}
 		await setModelFor(ctx, "read");
 		log("switch", { from: "-", to: "read", reason: "session start: helper reads first" });
-		return { message: { customType: "baton-switch-helper", content: MSG.read, display: true }, systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE + (cfg!.editTool ? LEAD_EDIT_TOOL_NOTE : "") };
+		return { message: { customType: "baton-switch-helper", content: MSG.read, display: true }, systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE + (cfg!.editTool || cfg!.readTool ? LEAD_EDIT_TOOL_NOTE : cfg!.editIntents ? LEAD_INTENT_NOTE : "") };
 	});
 
 	pi.on("tool_call", async (e, ctx) => {
@@ -506,7 +506,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		name: "baton_read",
 		label: "Baton read",
 		description:
-			"Study code through the cheaper helper model (same session, no edits). request = free text: what to find out or read (files, APIs, where to look). The result is the helper's tool outputs verbatim, deduplicated, skills in full, without its reasoning — one tool result.",
+			"Study code in ONE call instead of many read turns (each of your turns resends the whole context; a cheap helper reads instead). request = free text: what to find out or read and where to look. Returns the helper's raw tool outputs verbatim in one result — deduplicated, skills in full, no helper commentary — so nothing is lost; call again for more.",
 		parameters: Type.Object({ request: Type.String({ description: "What to find out / read and where to look, in your own words." }) }),
 		async execute() {
 			return { content: [{ type: "text" as const, text: "baton_read: the helper is reading…" }], details: {} };
@@ -516,7 +516,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		name: "baton_edit",
 		label: "Baton edit",
 		description:
-			"Change files through the cheaper helper model (same session, same context). request = free text: what to change and why. Baton runs typecheck+tests and the fix loop; the result lists changed files/definitions, a compressed diff and the check status, or says the helper failed (then edit yourself).",
+			"Change files without typing them yourself: you stay the author, the cheap helper makes the edit in this same session and runs the write → typecheck/test → fix loop. request = free text: what to change and why (files, behaviour, key names, tests). Returns one result: changed files/definitions, compressed diff, tsc/test status — or NOT DONE (then fix it yourself with write/edit).",
 		parameters: Type.Object({ request: Type.String({ description: "What to change and why, in your own words (files, behaviour, important names, tests)." }) }),
 		async execute() {
 			// placeholder: replaced in the lead's view by the outcome when the helper hands back (st.stubs)
