@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.1
+
+- **Lead cache keepalive.** Arm I: a 270 s implement stretch let the Opus 5-min prompt cache expire (TTL counts from the lead's request *start*), and the next lead turn rewrote ~80k tokens for $0.41 — ~30 % of the run. During helper phases Baton now replays the last lead payload byte-identically with `max_tokens: 1` once the lead has been idle `cacheKeepaliveMs` (230 s): a cache read (~$0.04) instead of a rewrite. Journal event `cache_keepalive`; its cost counts toward the budget.
+- `maxImplementMs` (480 s) caps implement stretches separately from `maxHelperMs`, since the cache no longer forces a short stretch.
+
 ## 0.10.0 — 2026-10-13
 Goal: the helper (GLM) does a large share of the work early, within a $1.5 budget (G/H: GLM cost $0.023/$0.006).
 - **Reading (verbatim)**: the read prompt names the task, requires reading EVERY SKILL.md/REFERENCE.md in full (skills over node_modules) and ≥6 calls (follow-ups ≥3); a READ DONE below the minimum gets one "read more" nudge (G/H: follow-ups ended after 1 turn). Read outputs reach the lead verbatim (tool results only, no helper reasoning); clip threshold 20k → 50k chars, report cap 160k → 250k; skills never clipped (0.9.1).

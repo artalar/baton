@@ -113,7 +113,8 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	};
 	const jevSummary = () =>
 		st && { enabled: cfg!.jev.enabled, model: cfg!.jev.model, fallbackModel: cfg!.jev.fallbackModel, jevCalls: st.jev.calls, jevGateCalls: st.jev.gateCalls, jevTurnCalls: st.jev.turnCalls, jevFallbacks: st.jev.fallbacks, jevFallbackModel: st.jev.fallbackModel, jevCached: st.jev.cached, jevBlocks: st.jev.blocks, jevHandoffs: st.jev.handoffs, jevSwitches: st.jev.switches, jevCost: st.jev.cost, jevAvgLatMs: st.jev.calls + st.jev.fallbacks ? Math.round(st.jev.latMs / (st.jev.calls + st.jev.fallbacks)) : 0, jevMaxLatMs: Math.round(st.jev.maxLatMs), summaryCalls: st.jev.summaryCalls, summaryCost: st.jev.summaryCost, summaryText: st.track.text };
-	const extraCost = () => (st ? st.jev.cost + st.jev.summaryCost : 0);
+	let keepaliveCost = 0;
+	const extraCost = () => (st ? st.jev.cost + st.jev.summaryCost : 0) + keepaliveCost;
 	/** Ask Jev; updates stats and journals one `jev` event. Undefined = fall back to the 0.8.1 rules. */
 	const askJev = async (point: "call" | "turn", questions: JevQuestions, proposed: { model: string; call: string }, extra: Record<string, unknown> = {}): Promise<JevResult | undefined> => {
 		if (!st || !cfg?.jev.enabled) return undefined;
@@ -317,6 +318,46 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		return undefined;
 	});
 
+	// 0.10.1: keep the lead's prompt cache warm during long helper stretches.
+	// Replays the last lead payload byte-identically with max_tokens 1, so the
+	// cached prefix is read (≈0.1× price) instead of expiring and being rewritten (1.25×).
+	let lastLeadPayload: unknown = null;
+	let lastLeadAt = 0;
+	let keepaliveBusy = false;
+	const keepaliveTick = async () => {
+		if (!st || !cfg || !isHelper(st.phase) || !lastLeadPayload || keepaliveBusy || budgetStopped) return;
+		if (!cfg.cacheKeepaliveMs || Date.now() - lastLeadAt < cfg.cacheKeepaliveMs) return;
+		const key = process.env.OPENROUTER_API_KEY;
+		if (!key) return;
+		keepaliveBusy = true;
+		const t0 = Date.now();
+		try {
+			const { stream: _s, stream_options: _so, ...rest } = lastLeadPayload as Record<string, unknown>;
+			const body = { ...rest, max_tokens: 1, usage: { include: true } };
+			delete (body as Record<string, unknown>).max_completion_tokens;
+			delete (body as Record<string, unknown>).reasoning;
+			delete (body as Record<string, unknown>).reasoning_effort;
+			const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+				method: "POST",
+				headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+				body: JSON.stringify(body),
+				signal: AbortSignal.timeout(30_000),
+			});
+			const j = (await r.json().catch(() => ({}))) as { usage?: { cost?: number; prompt_tokens_details?: { cached_tokens?: number } } };
+			const cost = Number(j.usage?.cost ?? 0);
+			keepaliveCost += cost;
+			lastLeadAt = t0;
+			log("cache_keepalive", { status: r.status, ms: Date.now() - t0, cost, cachedTokens: j.usage?.prompt_tokens_details?.cached_tokens ?? null, phase: st.phase });
+		} catch (err) {
+			log("cache_keepalive", { error: String((err as Error).name), phase: st?.phase });
+			lastLeadAt = Date.now();
+		} finally {
+			keepaliveBusy = false;
+		}
+	};
+	const keepaliveTimer = setInterval(() => void keepaliveTick(), 10_000);
+	(keepaliveTimer as { unref?: () => void }).unref?.();
+
 	pi.on("context", (e, ctx) => {
 		if (!st) return undefined;
 		const forLead = !isHelper(st.phase);
@@ -338,6 +379,8 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		}
 		prevLeadLen = len;
 		if (plan.capReasoning) out = capReasoning(out, cfg!.thinkingCap);
+		lastLeadPayload = out;
+		lastLeadAt = Date.now();
 		const o = out as { reasoning?: unknown; reasoning_effort?: unknown; max_tokens?: unknown; max_completion_tokens?: unknown };
 		log("lead_request", { phase: st.phase, planning: plan.planning, reasoning: o.reasoning ?? null, reasoning_effort: o.reasoning_effort ?? null, max_tokens: o.max_tokens ?? o.max_completion_tokens ?? null, cacheControls: countCacheControl(out), messages: len });
 		return out;
