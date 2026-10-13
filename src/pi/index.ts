@@ -6,9 +6,9 @@
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { callAdvisor } from "./advisor.ts";
+import { callAdvisor, toPiContext } from "./advisor.ts";
 import { collectPackInput } from "../core/pack/collect.ts";
-import { type BatonConfig, loadConfig } from "./config.ts";
+import { type BatonConfig, loadConfig, parseModelRef } from "./config.ts";
 import { commitAllowedByGate, finalizeGate, gateOnAdvisor, gateReleaseFinalize, type GateState, helpGate, initialGateState, reviewGate } from "./gate.ts";
 import { Journal, type JournalEvent, eventLine, normPath } from "../core/journal.ts";
 import { cutLoops, type DeferredItem, deferFire, deferredEditGate, initialLoopState, type LoopState, loopKeys, loopNote, observeLoop, renderDeferred, resolveDeferred } from "./loop.ts";
@@ -64,6 +64,12 @@ interface Runtime {
 	pendingHandoff?: { kind: AdvisorKind; reason: string; question: string };
 	/** Review gating / finalize mode. */
 	gate: GateState;
+	/** 0.11: the system prefix of the first advisor call, reused verbatim by every later call (cache hit). */
+	frozenSystem?: string;
+	/** 0.11: advisor cache keepalive state. */
+	advisorAt?: number;
+	keepalives?: number;
+	keepaliveCtx?: ExtensionContext;
 }
 
 /** Pure: the text pinned into every request (plan with progress, then deferred items). */
@@ -124,6 +130,34 @@ export default function baton(pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		rt = undefined;
 	});
+
+	// 0.11: keep the advisor's shared system prefix cached while the executor works and another advisor
+	// call is expected (a pinned plan that is not done → a review will follow). Same model, same cache
+	// retention, no reasoning (as the real call), max 1 output token; see advisorKeepaliveWorthIt.
+	let keepaliveBusy = false;
+	const keepaliveTimer = setInterval(async () => {
+		const r = rt;
+		if (!r || keepaliveBusy || !r.frozenSystem || !r.keepaliveCtx || r.advisorAt === undefined) return;
+		const ka = r.cfg.advisor.keepalive;
+		if (!ka.everyMs || r.cfg.advisor.cache !== "short") return;
+		const expectNext = !!r.pinned && r.pinned.reply.verdict !== "done";
+		if (!expectNext || (r.keepalives ?? 0) >= ka.max || Date.now() - r.advisorAt < ka.everyMs * ((r.keepalives ?? 0) + 1)) return;
+		keepaliveBusy = true;
+		try {
+			const ref = parseModelRef(r.cfg.advisor.model);
+			const model = ref && r.keepaliveCtx.modelRegistry.find(ref.provider, ref.id);
+			if (!model) return;
+			const res = await r.keepaliveCtx.modelRegistry.complete(model, toPiContext([{ role: "system", content: r.frozenSystem }, { role: "user", content: "Cache keepalive. Reply with {}." }]) as any, { maxTokens: 1, cacheRetention: r.cfg.advisor.cache });
+			r.keepalives = (r.keepalives ?? 0) + 1;
+			r.journal.record("note", r.turn, `advisor cache keepalive #${r.keepalives}`, { keepalive: true, usage: res.usage });
+		} catch (err) {
+			r.journal.record("note", r.turn, `advisor cache keepalive failed: ${(err as Error).name}`, { keepalive: true });
+			r.keepalives = ka.max;
+		} finally {
+			keepaliveBusy = false;
+		}
+	}, 10_000);
+	(keepaliveTimer as { unref?: () => void }).unref?.();
 	pi.on("turn_start", (e, ctx) => {
 		init(ctx).turn = e.turnIndex;
 	});
@@ -378,9 +412,13 @@ export default function baton(pi: ExtensionAPI) {
 			budgetTokens: r.cfg.pack.budgetTokens,
 			skills: { enabled: r.cfg.pack.skills.enabled, dirs: r.cfg.pack.skills.dirs, maxSkills: r.cfg.pack.skills.maxSkills, budgetTokens: Math.floor(r.cfg.pack.budgetTokens * r.cfg.pack.skills.budgetRatio) },
 		});
-		const pack = buildReviewPack(input, { budgetTokens: r.cfg.pack.budgetTokens });
+		const pack = buildReviewPack(input, { budgetTokens: r.cfg.pack.budgetTokens, frozenSystem: r.cfg.advisor.cache !== "none" ? r.frozenSystem : undefined });
 		r.journal.record("note", r.turn, `baton_${kind} pack built: ${pack.tokens} tok (stable prefix ${pack.stableTokens})`, { sections: pack.sections, skills: input.skills?.map((k) => k.name) ?? [] });
 		const res = await callAdvisor(ctx, r.cfg.advisor.model, pack.messages, { maxTokens: r.cfg.advisor.maxTokens, cache: r.cfg.advisor.cache, signal });
+		if (res.usage) r.frozenSystem ??= pack.messages[0]!.content;
+		r.advisorAt = Date.now();
+		r.keepalives = 0;
+		r.keepaliveCtx = ctx;
 		return { r, pack, res };
 	}
 

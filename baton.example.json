@@ -2,7 +2,11 @@
   "advisor": {
     "model": "openrouter/anthropic/claude-opus-5.5",
     "maxTokens": 8192,
-    "cache": "short"
+    "cache": "short",
+    "keepalive": {
+      "everyMs": 240000,
+      "max": 5
+    }
   },
   "pack": {
     "budgetTokens": 40000,

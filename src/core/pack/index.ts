@@ -36,12 +36,16 @@ export const DEFAULT_PACK_BUDGET = 40_000;
  * across calls of one kind on one repo, so it caches) and one user message with everything else,
  * ordered plan → task → artefacts → executor claims (unverified) → instructions + schema last.
  */
-export function buildReviewPack(input: PackInput, opts: { budgetTokens?: number } = {}): ReviewPack {
+export function buildReviewPack(input: PackInput, opts: { budgetTokens?: number; frozenSystem?: string } = {}): ReviewPack {
 	const budget = opts.budgetTokens ?? DEFAULT_PACK_BUDGET;
-	const { sections, clipped } = fitSections(packSections(input), budget);
-	const stable = sections.filter((x) => x.stable);
+	const all = packSections(input);
+	// 0.11: a frozen system prefix (from the session's first advisor call) is reused verbatim, so every
+	// later plan/review/help call hits the cache; only the user message is fitted into the rest of the budget.
+	const frozen = opts.frozenSystem;
+	const { sections, clipped } = frozen !== undefined ? fitSections(all.filter((x) => !x.stable), Math.max(1000, budget - estimateTokens(frozen))) : fitSections(all, budget);
+	const stable = frozen !== undefined ? [] : sections.filter((x) => x.stable);
 	const rest = sections.filter((x) => !x.stable);
-	const system = render(stable);
+	const system = frozen ?? render(stable);
 	const user = `<baton_pack v="3" kind="${input.kind}"${input.reason ? ` reason="${input.reason}"` : ""}>\n${render(rest)}\n</baton_pack>`;
 	const stableTokens = estimateTokens(system);
 	const tokens = stableTokens + estimateTokens(user);

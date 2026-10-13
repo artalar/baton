@@ -272,6 +272,8 @@ export interface SwitchState {
 	stretchEdits: { path: string; intent: string }[];
 	stretchChecks: Partial<Record<VerifyKind, { cmd: string; ok: boolean; tail: string }>>;
 	stretchFlags: Flag[];
+	/** 0.11: write/edit calls blocked in the current reading stretch. */
+	stretchEditBlocks?: number;
 	lastHelperText: string;
 	/** All guardrail hits of the session. */
 	flags: Flag[];
@@ -590,8 +592,17 @@ export function applyJevGate(s: SwitchState, c: Call, d: { action: "allow" | "al
 export function gateCallRules(s: SwitchState, c: Call, fileExists: (p: string) => boolean, readFile?: (p: string) => string | undefined): { block: true; reason: string } | undefined {
 	if (!isHelper(s.phase)) return undefined;
 	if ((BATON_TOOLS as readonly string[]).includes(c.name)) return { block: true, reason: `${c.name} is for the lead model only.` };
-	// reading phases: any tool is allowed; the fs guard (src/pi/fsguard.ts) reverts file changes and hands over
-	if (s.phase === "read" || s.phase === "followup") return undefined;
+	// reading phases: edit tools are blocked up front (arm J2: Jev's "routine ahead" sent the helper to a
+	// follow-up, it started implementing, the fs guard reverted it and ended the stretch 5 times). Bash stays
+	// allowed (tests/builds/tsc are reading); the fs guard reverts real source changes made through bash.
+	if (s.phase === "read" || s.phase === "followup") {
+		if (c.name === "write" || c.name === "edit") {
+			s.stretchEditBlocks = (s.stretchEditBlocks ?? 0) + 1;
+			if (s.stretchEditBlocks >= 3) s.wantLead = "helper kept trying to edit during reading";
+			return { block: true, reason: "Reading phase: do not change files. Report what you found (verbatim facts, paths, signatures) and end with READ DONE; the lead decides the edits." };
+		}
+		return undefined;
+	}
 	// debug / review: no new files (implement: the lead's spec names new files)
 	if (c.name === "write" && s.phase !== "implement") {
 		const p = c.args.path ?? c.args.file_path;
@@ -763,6 +774,7 @@ function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: Sw
 	s.stretchEdits = [];
 	s.stretchChecks = {};
 	s.stretchFlags = [];
+	s.stretchEditBlocks = 0;
 	s.stretchGuard = [];
 	s.leadReadTurns = 0;
 	s.lastHelperText = "";

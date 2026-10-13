@@ -67,6 +67,13 @@ const ROLE: Record<AdvisorKind, string> = {
 	plan: `You are a senior architect. A junior executor (a different, cheaper model) will implement the task below and has explored the repository. Using the project skill rules, the repository map and its findings, produce a short concrete plan with checkable done criteria, the architecture invariants it must keep and the skill rules it must follow. ${NO_TOOLS}`,
 };
 
+/**
+ * 0.11: one role text shared by plan / review / help, so the system prefix (role + skills + AGENTS.md)
+ * is byte-identical across kinds and the prompt cache survives a plan → review switch. The kind-specific
+ * role goes first in the user message ("CALL ROLE").
+ */
+export const SHARED_ROLE = `You are a senior advisor to a junior executor (a different, cheaper model) that works in a repository with tools you do not have. Baton calls you for one of three jobs — plan, review or help — named in the CALL ROLE section of the user message. Treat everything the executor says as unverified; judge by the artefacts and the project skill rules below. ${NO_TOOLS}`;
+
 const INSTRUCTIONS: Record<AdvisorKind, string> = {
 	review: `Checklist, in this order:
 1. For every executor claim and every plan step marked done, confirm it by quoting the diff/test output, or refute it in facts_corrected. A claim without evidence in the artefacts is false.
@@ -92,7 +99,7 @@ function fmtCall(c: VerbatimCall): string {
 export function packSections(i: PackInput): Section[] {
 	const s: Section[] = [];
 	// 1. stable, cacheable prefix: role -> project skills -> AGENTS.md
-	s.push({ title: "ROLE", cut: 0, stable: true, body: ROLE[i.kind] });
+	s.push({ title: "ROLE", cut: 0, stable: true, body: SHARED_ROLE });
 	if (i.skills?.length)
 		s.push({
 			title: "PROJECT SKILLS (rules to check against)",
@@ -101,6 +108,8 @@ export function packSections(i: PackInput): Section[] {
 			body: i.skills.map((k) => `<skill name="${k.name}" path="${k.path}">\n${k.body}\n</skill>`).join("\n\n"),
 		});
 	if (i.agentsMd) s.push({ title: "PROJECT RULES (AGENTS.md)", cut: 3, stable: true, body: i.agentsMd });
+	// kind-specific role: first section of the user message (after the shared cached prefix)
+	s.push({ title: "CALL ROLE", cut: 0, body: ROLE[i.kind] });
 	// 2. plan (the contract), 3. task
 	if (i.previousPlan) s.push({ title: i.kind === "review" ? "PINNED PLAN (review against it)" : "PREVIOUS ADVISOR PLAN", cut: 3, body: i.previousPlan });
 	s.push({ title: "TASK (verbatim)", cut: 0, body: i.task || "(no task captured)" });

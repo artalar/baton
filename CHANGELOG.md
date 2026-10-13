@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.0
+
+**Switch fs guard**
+- The guard ignores build and test artefacts: `dist`, `build`, `coverage`, `.vite`, `.vitest`, `.cache`, `.turbo`, `*.tsbuildinfo`, vite timestamp files and similar, even when `.gitignore` misses them. Gitignored paths were already excluded through `git status`.
+- The node_modules signature now comes from the package managers' install markers (`.package-lock.json`, `.modules.yaml`, …). The directory mtime is no longer used, because vite and vitest create `node_modules/.vite` and `.cache` on every run.
+- **Real cause in arm J2.** The followups ended 5 times with "helper changed the working tree during reading". The trigger was not tests: after Jev's "routine ahead", GLM started *implementing* (`write src/game/profiles.ts` …), and the guard reverted it. Reading phases now block `write`/`edit` at the gate with a "report, READ DONE" nudge. A third blocked edit hands control back to the lead. Bash stays allowed, and the guard still reverts source changes made through bash.
+
+**Advisor mode (GLM leads): prompt cache**
+- One role text (`SHARED_ROLE`) is shared by plan, review and help, so the system prefix (role + skills + AGENTS.md) is byte-identical across kinds. The kind-specific role becomes the first user section, `CALL ROLE`. Arm K2: 3 of 4 Opus calls missed the cache because plan and review had different system prefixes.
+- The system prefix of the session's first advisor call is frozen and reused verbatim. Later skill re-selection or clipping cannot change it, and the user message fits into the remaining budget. `cache_control` stays on the system message, which is the end of the shared prefix.
+- Keepalive: `advisor.keepalive {everyMs: 240000, max: 5}`. While a next call is expected (a pinned plan that is not done), Baton pings the same model with the same cache retention and no reasoning, as the real call does: the frozen system prefix, a 1-token reply, recorded as a journal note with usage.
+- `advisorKeepaliveWorthIt(pings, p)`: keepalive pays off when pings·0.1 < p·(1.25 − 0.1). At one ping per 4 min that means gaps up to about 46 min when the next call is certain, and about 23 min at p = 0.5.
+
 ## 0.10.3
 
 - **Keepalive fixed.** Arm J: the 0.10.1 keepalive stripped `reasoning` and set `max_tokens: 1`. Changing thinking params invalidates Anthropic's message cache, so it *wrote* the cache instead of reading it (cached 0, $0.195). It now replays the lead payload byte-identically (streamed) and aborts after the first model chunk. The budget counts `cacheKeepaliveCostUsd` (0.06) per keepalive.

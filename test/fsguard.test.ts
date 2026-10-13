@@ -80,10 +80,10 @@ let t = 0;
 const turn = (p: Partial<TurnInput>): TurnInput => ({ turn: t++, now: 1000 + t, text: "", calls: [], results: [], empty: false, ...p });
 
 describe("switch 0.8.1 wiring", () => {
-	it("reading: any tool passes the gate (baton tools still lead-only)", () => {
+	it("reading: bash passes the gate, write/edit are blocked (0.11), baton tools lead-only", () => {
 		const s = initialSwitchState(0);
 		expect(gateCall(s, c("1", "bash", { command: "npm --version && node -e 'console.log(1)'" }), () => true)).toBeUndefined();
-		expect(gateCall(s, c("2", "write", { path: "x.ts" }), () => false)).toBeUndefined();
+		expect(gateCall(s, c("2", "write", { path: "x.ts" }), () => false)?.block).toBe(true);
 		expect(gateCall(s, c("3", "baton_optimize"), () => true)?.block).toBe(true);
 	});
 	it("a reverted call is dropped from both views and its guard note reaches the lead report", () => {

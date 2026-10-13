@@ -31,7 +31,7 @@ describe("state machine", () => {
 	it("reading → lead when the helper stops reading or tries to edit; planning gets full thinking once", () => {
 		const s = initialSwitchState(0);
 		expect(decideTurn(s, turn({ calls: [c("r1", "read", { path: "a.md" })] }), cfg).to).toBe("read");
-		expect(gateCall(s, c("e1", "edit", { path: "x" }), () => true)).toBeUndefined(); // 0.8.1: any tool; the fs guard reverts
+		expect(gateCall(s, c("e1", "edit", { path: "x" }), () => true)?.block).toBe(true); // 0.11: edits blocked while reading
 		s.wantLead = "helper changed the working tree during reading (fs guard)";
 		s.dropped.push("e1");
 		const d = decideTurn(s, turn({ calls: [c("e1", "edit")] }), cfg);

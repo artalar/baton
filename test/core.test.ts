@@ -47,7 +47,7 @@ describe("buildReviewPack (pi-independent)", () => {
 		expect(sys.indexOf("## ROLE")).toBeLessThan(sys.indexOf("PROJECT SKILLS"));
 		expect(sys.indexOf("PROJECT SKILLS")).toBeLessThan(sys.indexOf("AGENTS.md"));
 		expect(sys).not.toContain("TASK");
-		expect(sys).toContain("junior's work");
+		expect(sys).toContain("senior advisor"); // 0.11: shared role; the kind role is in the user message
 		expect(sys).toContain("NO tools and everything you need is below");
 		expect(p.sections.filter((s) => s.stable).map((s) => s.title)).toEqual(["ROLE", "PROJECT SKILLS (rules to check against)", "PROJECT RULES (AGENTS.md)"]);
 		expect(p.stableTokens).toBeLessThan(p.tokens);

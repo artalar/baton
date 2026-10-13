@@ -33,6 +33,8 @@ export interface BatonConfig {
 		maxTokens: number;
 		/** Prompt caching of the stable prefix (role + skills + AGENTS.md): "short" (5 min), "long" (1 h), "none". */
 		cache: "short" | "long" | "none";
+		/** 0.11: refresh the cached shared system prefix while a next advisor call is expected (everyMs 0 = off). */
+		keepalive: { everyMs: number; max: number };
 	};
 	/** Context preparation for the advisor. */
 	pack: {
@@ -73,7 +75,7 @@ export interface BatonConfig {
 }
 
 export const DEFAULT_CONFIG: BatonConfig = {
-	advisor: { model: "openrouter/anthropic/claude-opus-5.5", maxTokens: 8192, cache: "short" },
+	advisor: { model: "openrouter/anthropic/claude-opus-5.5", maxTokens: 8192, cache: "short", keepalive: { everyMs: 240_000, max: 5 } },
 	pack: {
 		budgetTokens: 40_000,
 		excludePaths: [
@@ -189,4 +191,15 @@ export function loadConfig(cwd: string, warn: (m: string) => void = () => {}): B
 	cfg = deepMerge(cfg, readJson(join(agentDir(), "baton.json"), warn));
 	cfg = deepMerge(cfg, readJson(join(cwd, ".pi", "baton.json"), warn));
 	return cfg;
+}
+
+/**
+ * Pure: is keeping the advisor cache warm worth it? Anthropic prices (× base input): cache write 1.25,
+ * cache read 0.1. Without keepalive the next call rewrites the prefix (1.25·S, from the 2nd call on);
+ * with it, k pings read it (k·0.1·S) and the call reads it too (0.1·S). With probability p that the
+ * next call happens: worth it iff k·0.1 < p·(1.25 − 0.1), i.e. k < 11.5·p. Ping every 4 min → for
+ * p = 1 it pays for gaps up to ~46 min; for p = 0.5 up to ~23 min. Default max 5 pings (20 min).
+ */
+export function advisorKeepaliveWorthIt(pings: number, pNextCall: number): boolean {
+	return pings * 0.1 < pNextCall * (1.25 - 0.1);
 }

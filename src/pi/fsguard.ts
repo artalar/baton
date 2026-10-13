@@ -49,6 +49,16 @@ export function parseStatusV2(out: string): { head: string; entries: [string, st
 	return { head, entries };
 }
 
+/**
+ * 0.11: build / test / tool artefacts are never "changes". git status already drops gitignored paths; this
+ * also covers repos whose .gitignore misses them (dist, coverage, .vite, vitest/jest caches, tsbuildinfo …).
+ */
+export const ARTIFACT = /(^|\/)(dist|build|out|coverage|\.nyc_output|\.vite|\.vitest|\.turbo|\.next|\.nuxt|\.parcel-cache|\.cache|\.eslintcache|\.pi|__snapshots__\/.*\.snap\.tmp)(\/|$)|\.tsbuildinfo$|(^|\/)vite\.config\.[cm]?[jt]s\.timestamp-[^/]*$|(^|\/)\.DS_Store$/;
+
+/** node_modules signature: the package managers' own install markers, not the directory mtime
+ * (vite/vitest create node_modules/.vite and .cache on every run, which bumps the directory mtime). */
+const NM_MARKERS = [".package-lock.json", ".modules.yaml", ".yarn-integrity", ".yarn-state.yml"];
+
 export function snapshot(cwd: string, opts: { contents?: boolean; maxBytes?: number } = {}): Snap {
 	const t0 = performance.now();
 	let head = "";
@@ -59,6 +69,7 @@ export function snapshot(cwd: string, opts: { contents?: boolean; maxBytes?: num
 		head = r.head;
 		if (opts.contents) contents = new Map();
 		for (const [p, xy] of r.entries) {
+			if (ARTIFACT.test(p)) continue;
 			files.set(p, sig(cwd, p, xy));
 			if (contents) {
 				try {
@@ -74,7 +85,15 @@ export function snapshot(cwd: string, opts: { contents?: boolean; maxBytes?: num
 	}
 	let nodeModules = "-";
 	try {
-		nodeModules = String(Math.round(statSync(join(cwd, "node_modules")).mtimeMs));
+		statSync(join(cwd, "node_modules"));
+		nodeModules = NM_MARKERS.map((m) => {
+			try {
+				const st = statSync(join(cwd, "node_modules", m));
+				return `${m}:${st.size}:${Math.round(st.mtimeMs)}`;
+			} catch {
+				return "";
+			}
+		}).join("|") || "present";
 	} catch {
 		/* none */
 	}
