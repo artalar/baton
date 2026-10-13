@@ -87,6 +87,8 @@ export function loadSwitchConfig(cwd: string): SwitchConfig & { journalDir: stri
 	if (be === "intent") Object.assign(over, { editTool: false, editIntents: true });
 	else if (be === "off" || be === "0") Object.assign(over, { editTool: false, editIntents: false });
 	else if (be === "tool") Object.assign(over, { editTool: true });
+	// 0.12.1: BATON_READ=tool (default) | off
+	if (process.env.BATON_READ === "off" || process.env.BATON_READ === "0") Object.assign(over, { readTool: false });
 	return { ...DEFAULT_SWITCH, ...over, jev, journalDir };
 }
 
@@ -498,6 +500,16 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			if (params.kind === "reads") return delegateReads(params.instruction ?? "");
 			if (params.kind === "implement") return { content: [{ type: "text" as const, text: "The helper implements the spec now; checks run automatically and you get the diff for review." }], details: {} };
 			return { content: [{ type: "text" as const, text: "The helper takes over the verify/fix loop now." }], details: {} };
+		},
+	});
+	pi.registerTool({
+		name: "baton_read",
+		label: "Baton read",
+		description:
+			"Study code through the cheaper helper model (same session, no edits). request = free text: what to find out or read (files, APIs, where to look). The result is the helper's tool outputs verbatim, deduplicated, skills in full, without its reasoning — one tool result.",
+		parameters: Type.Object({ request: Type.String({ description: "What to find out / read and where to look, in your own words." }) }),
+		async execute() {
+			return { content: [{ type: "text" as const, text: "baton_read: the helper is reading…" }], details: {} };
 		},
 	});
 	pi.registerTool({

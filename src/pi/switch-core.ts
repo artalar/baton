@@ -27,6 +27,10 @@ export interface SwitchConfig {
 	editIntents: boolean;
 	/** 0.12: the lead edits through the baton_edit tool (BATON_EDIT=tool, default in switch). */
 	editTool: boolean;
+	/** 0.12.1: the lead reads through the baton_read tool. */
+	readTool: boolean;
+	/** 0.12.1: max baton_read calls per session (then the lead reads itself). */
+	maxReadTool: number;
 	/** 0.11.1: after this many failed intents the lead edits itself. */
 	maxIntentFailures: number;
 	/** Replay the lead payload (max_tokens 1) when the lead was idle this long during a helper stretch (ms, 0 = off). */
@@ -81,6 +85,8 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	maxImplementMs: 0,
 	editIntents: true,
 	editTool: true,
+	readTool: true,
+	maxReadTool: 8,
 	maxIntentFailures: 2,
 	cacheKeepaliveMs: 230_000,
 	cacheKeepaliveCostUsd: 0.06,
@@ -306,6 +312,9 @@ export interface SwitchState {
 	pendingEdit?: { id: string; request: string };
 	/** 0.12: baton_edit stats. */
 	editTool?: { calls: number; ok: number; failed: number };
+	/** 0.12.1: the open baton_read call and stats. */
+	pendingRead?: { id: string; request: string };
+	readTool?: { calls: number; chars: number };
 	/** 0.9: Jev rolling summary inputs (ring buffer of recent calls, counters, helper-written note). */
 	track: JevTrack;
 	jev: JevStats;
@@ -379,7 +388,7 @@ export function initialSwitchState(now: number): SwitchState {
 	};
 }
 
-export const BATON_TOOLS = ["delegate_reads", "baton_delegate", "baton_optimize", "baton_edit"] as const;
+export const BATON_TOOLS = ["delegate_reads", "baton_delegate", "baton_optimize", "baton_edit", "baton_read"] as const;
 
 /** Short, neutral description of the harness tools for the lead's system prompt (no instruction to use them). */
 export const LEAD_SYSTEM_NOTE = `
@@ -396,6 +405,7 @@ Baton hands the intent to the helper, runs the checks and gives you an "[Baton h
 
 /** 0.12: appended to the lead's system prompt when the baton_edit tool is on (BATON_EDIT=tool, default). */
 export const LEAD_EDIT_TOOL_NOTE = `
+To study code, prefer baton_read({request}): free text — what to find out or read (files, APIs, where to look). The helper reads in this same session (no edits) and the tool result gives you its tool outputs verbatim, deduplicated, skills in full, without its reasoning. Ask for everything you need in one call; plain read/bash remain a fallback.
 To change files, ALWAYS call baton_edit({request}) instead of write/edit. request = free text: what to change and why (files, behaviour, names/signatures that matter, tests to add); no need to spell out every line. The helper model makes the edit in this same session (it sees everything you see), Baton runs typecheck+tests and the fix loop, and the tool result tells you what changed (files, definitions, compressed diff, check status) or that the helper failed — then do it yourself with write/edit. Batch related changes into one baton_edit.`;
 
 export const MSG = {
@@ -672,7 +682,12 @@ export function harnessReport(s: SwitchState, from: Phase, why: string, cfg: Swi
 			const prev = lastSkill.get(k);
 			if (prev === undefined || o.text.length >= s.stretchOutputs[prev]!.text.length) lastSkill.set(k, i);
 		});
+		// 0.12.1: identical outputs (same call, same text) appear once
+		const seen = new Set<string>();
 		for (const [i, o] of s.stretchOutputs.entries()) {
+			const sig = `${o.label}\u0000${o.text}`;
+			if (seen.has(sig)) continue;
+			seen.add(sig);
 			const k = skillKey(o.label);
 			if (k) {
 				if (lastSkill.get(k) !== i) continue;
@@ -818,6 +833,15 @@ function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: Sw
 			it.selfNext = true;
 			reason = `${reason} — the helper did NOT finish your edit intent: make that edit yourself now (no new intent needed)`;
 		}
+	}
+	const pr = s.pendingRead;
+	if (pr && next === "lead" && isHelper(from)) {
+		s.pendingRead = undefined;
+		s.readTool ??= { calls: 0, chars: 0 };
+		const res = report || "baton_read: the helper made no reads (nothing returned). Read it yourself.";
+		s.readTool.chars += res.length;
+		s.stubs[pr.id] = res;
+		return { to: next, reason, message: { audience: "lead", text: `[baton switch → lead] baton_read finished — the outputs are in its tool result.` }, compacted, report: reportInfo, continue: inp.calls.length === 0 };
 	}
 	const pe = s.pendingEdit;
 	if (pe && next === "lead" && isHelper(from)) {
@@ -1026,6 +1050,21 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 			if (inp.lengthStop && !real.length) {
 				s.metrics.lengthStops++;
 				return { to: s.phase, reason: "lead hit the output cap", message: { audience: "lead", text: MSG.lengthStop }, continue: true };
+			}
+			// 0.12.1: baton_read tool call → the helper reads in this same session; outputs verbatim in the tool result
+			const br = cfg.readTool ? real.find((c) => c.name === "baton_read") : undefined;
+			if (br && !real.some((c) => c.name === "baton_edit")) {
+				s.readTool ??= { calls: 0, chars: 0 };
+				if (s.readTool.calls < cfg.maxReadTool) {
+					s.readTool.calls++;
+					const request = String(br.args.request ?? "").trim() || text;
+					s.pendingRead = { id: br.id, request };
+					const d = to(s, inp, "followup", `baton_read #${s.readTool.calls} → helper reads`, cfg);
+					d.message = { audience: "helper", text: MSG.followup(request) };
+					d.continue = true;
+					return d;
+				}
+				s.stubs[br.id] = `baton_read: limit of ${cfg.maxReadTool} calls reached — read it yourself with read/bash.`;
 			}
 			// 0.12: baton_edit tool call → the helper performs the request in this same session
 			const be = cfg.editTool ? real.find((c) => c.name === "baton_edit") : undefined;

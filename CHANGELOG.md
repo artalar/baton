@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.12.1
+
+**`baton_read`: the lead studies code through the helper (switch, default on)**
+- New lead-only tool `baton_read({request})`. `request` is free text: what to find out or read (files, APIs, where to look).
+- The helper reads in the same session (followup phase). Edits are blocked at the gate (0.11) and the fs guard is on.
+- On hand-back, the **tool result** contains the helper's tool outputs verbatim:
+  - without its reasoning;
+  - deduplicated (identical call + output appears once; new in this release);
+  - skill files in full (the longest read wins).
+  
+  The lead gets a one-line "baton_read finished" message. The placeholder result was never sent to the lead, so the lead's prompt cache stays intact.
+- Limit: `maxReadTool` (8) calls per session. After that the tool result says "read it yourself". `BATON_READ=off` turns the tool off.
+- The lead's system note now says: prefer `baton_read` for studying code and `baton_edit` for edits; plain read/bash/write/edit are the fallback.
+- **Offline estimate** (Opus turns made only of read-like calls; consecutive turns collapse into one `baton_read`):
+
+| Arm | Read-only turns | Runs of turns | Opus requests saved | Saving |
+|---|---|---|---|---|
+| A | 11 | 6 | 5 | ≈ $0.23 (8 % of Opus) |
+| J | 1 | — | 0 | — |
+| J2 | 5 | 4 | 1 | ≈ $0.02 |
+
+  The real gain is larger when the lead itself reads skills and node_modules (A, early arms). With switch, most reading already went to the helper.
+
 ## 0.12.0
 
 **`baton_edit`: the lead changes files through a Baton tool (switch, default on)**
