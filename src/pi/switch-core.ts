@@ -823,7 +823,8 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 				s.track.routineHandoffs++;
 				s.jev.switches++;
 				const d = to(s, inp, "followup", `jev: routine ahead ${inp.jev.routine.toFixed(2)} after ${s.track.consecutiveNonWrite} non-write calls`, cfg);
-				d.message = { audience: "helper", text: MSG.followup("continue the lead's reads/checks above and anything they obviously lead to") };
+				const last = real.map((c) => (c.name === "bash" ? `$ ${String(c.args.command ?? "").replace(/\s+/g, " ").slice(0, 200)}` : `${c.name} ${JSON.stringify(c.args).slice(0, 200)}`)).join("\n- ");
+				d.message = { audience: "helper", text: MSG.followup(`the lead was exploring with these calls:\n- ${last}\nContinue this exploration: read/search the related files, types and docs the lead will need next (at least 3 calls) before replying READ DONE`) };
 				return d;
 			}
 			if (s.leadReadTurns >= 2 && s.followups < cfg.maxFollowups) {

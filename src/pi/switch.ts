@@ -117,7 +117,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		s0.track.textTurn = turn;
 		const sum = buildSummary(s0.track, { activeModel: isHelper(s0.phase) ? cfg.helper : cfg.lead, phase: s0.phase, redSame: s0.red.same, redTotal: s0.red.total, checksRed: !s0.lastVerifyGreen && s0.red.total > 0, guardFlags: s0.stretchFlags.map((f) => f.why) });
 		const t0 = Date.now();
-		openRouterComplete({ model: openRouterModelId(cfg.helper), maxTokens: 600, cache: false }, { signal: AbortSignal.timeout(30_000) })([{ role: "user", content: summaryPrompt(s0.track, sum, cfg.jev.summaryChars) }])
+		openRouterComplete({ model: openRouterModelId(cfg.helper), maxTokens: 1200, cache: false, extra: { reasoning: { effort: "low" } } }, { signal: AbortSignal.timeout(30_000) })([{ role: "user", content: summaryPrompt(s0.track, sum, cfg.jev.summaryChars) }])
 			.then((r) => {
 				const cost = (r.usage as { cost?: number } | undefined)?.cost ?? 0;
 				s0.jev.summaryCalls++;

@@ -175,6 +175,9 @@ describe("switch-core integration", () => {
 		const d = decideTurn(s, turn({ calls, jev: { routine: 0.7, stuck: 0 } }), DEFAULT_SWITCH);
 		expect(d.to).toBe("followup");
 		expect(d.reason).toMatch(/^jev: routine ahead/);
+		// the helper gets the lead's last calls (arm F: a bare "continue" made GLM reply READ DONE at once)
+		expect(d.message?.text).toContain('read {"path":"a.ts"}');
+		expect(d.message?.text).toContain("at least 3 calls");
 		expect(s.jev.switches).toBe(1);
 		// low routine or no jev → 0.8.1 rule (one read turn is not enough)
 		expect(decideTurn(mk(), turn({ calls, jev: { routine: 0.3, stuck: 0 } }), DEFAULT_SWITCH).to).toBe("lead");

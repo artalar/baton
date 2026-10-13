@@ -13,6 +13,8 @@ export interface OpenRouterOptions {
 	cache?: boolean;
 	/** "1h" uses Anthropic's extended TTL. Default 5 min. */
 	cacheTtl?: "5m" | "1h";
+	/** Extra request fields (e.g. `reasoning: {effort: "low"}`). */
+	extra?: Record<string, unknown>;
 }
 
 export function supportsCacheControl(model: string): boolean {
@@ -31,6 +33,7 @@ export function buildOpenRouterRequest(messages: ChatMessage[], o: OpenRouterOpt
 				: { role: m.role, content: m.content },
 		),
 		usage: { include: true },
+		...(o.extra ?? {}),
 	};
 }
 
