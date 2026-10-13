@@ -137,7 +137,7 @@ export function onAdvisor(s: TriggerState, kind: "review" | "help" | "plan", ver
  * `minGapCalls` tool calls of the previous nudge or advisor call. Same-error ignores cooldown
  * only when it reaches the threshold for the first time.
  */
-export function evaluate(s: TriggerState, cfg: TriggerConfig, contextRatio: number | null): { nudge?: Nudge; state: TriggerState } {
+export function evaluate(s: TriggerState, cfg: TriggerConfig, contextRatio: number | null, compact = false): { nudge?: Nudge; state: TriggerState } {
 	const sinceAnchor = s.toolCalls - Math.max(s.lastNudgeAt, s.lastAdvisorAt);
 	const cooled = sinceAnchor >= cfg.minGapCalls;
 	const fire = (nudge: Nudge, patch: Partial<TriggerState>) => ({ nudge, state: { ...s, ...patch, lastNudgeAt: s.toolCalls } });
@@ -164,11 +164,13 @@ export function evaluate(s: TriggerState, cfg: TriggerConfig, contextRatio: numb
 			{ autoPlanNudged: true },
 		);
 	if (!cooled) return { state: s };
-	if (contextRatio !== null && cfg.contextRatio > 0 && contextRatio >= cfg.contextRatio && !s.ctxNudged)
-		return fire(
-			{ kind: "context", ratio: contextRatio, message: `Baton: context is at ${Math.round(contextRatio * 100)}%. Call baton_plan (or baton_help if stuck) now; Baton will reset the context to task + plan.` },
-			{ ctxNudged: true },
-		);
+	if (contextRatio !== null && cfg.contextRatio > 0 && contextRatio >= cfg.contextRatio && !s.ctxNudged) {
+		const pct = Math.round(contextRatio * 100);
+		const message = compact
+			? `Baton: context is at ${pct}%. Call baton_plan (or baton_help if stuck) now; Baton will reset the context to task + plan.`
+			: `Baton: context is at ${pct}%. Call baton_plan (or baton_help if stuck) now.`;
+		return fire({ kind: "context", ratio: contextRatio, message }, { ctxNudged: true });
+	}
 	if (cfg.driftCalls > 0 && s.hasPlan && !s.driftNudged && s.toolCalls - s.lastStepAt >= cfg.driftCalls)
 		return fire(
 			{ kind: "drift", calls: s.toolCalls - s.lastStepAt, message: `Baton: ${s.toolCalls - s.lastStepAt} tool calls without baton_step. Check the pinned plan: mark finished steps with baton_step (with evidence); if the plan no longer fits, call baton_review or baton_plan.` },
