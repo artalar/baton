@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 — 2026-10-13
+
+- **Review gating** (`src/gate.ts`, config `review`). Experiment C4 showed review ping-pong: Opus returned `course_correct` with 3-4 tiny steps, GLM did one in 7-13 s and called `baton_review` again (8 handoffs at ~$0.2, ~3 useful). A self-invoked `baton_review` is now refused unless all review-verified steps of the previous review are closed (`baton_step` done/deferred) or enough change accumulated: `review.minCalls` = 15 executor tool calls or `review.minDiffLines` = 80 changed lines since the review (numstat between `git stash create` snapshots). Forced handoffs (loop, context pressure, pi auto-compaction) bypass it. `baton_help` stays available, rate-limited to `review.helpMinCalls` = 5 calls after any advisor reply.
+- **`verify: "self" | "review"`** on advisor steps (default `review`). The review prompt asks to prefer `self` for small/mechanical fixes and to batch all fixes into one reply instead of drip-feeding. `self` steps neither require nor permit a review; a review whose steps are all `self` permits `git commit` once they are closed.
+- **Finalize mode** after verdict `done` (`review.finalizeAfterDone`): the first edit/write or non-verification bash is blocked once with a "commit now" message; tsc/test/build, inspection and git add/commit pass; `baton_review` is refused until a successful commit or a new user prompt; the commit gate (`reviewBeforeCommit`) does not block in finalize mode even after edits.
+- C4 replay test: reviews #5, #6, #8 would be refused (5 of 8 handoffs remain).
+- System prompt, SKILL.md, tool descriptions, `/baton` status updated.
+
 ## 0.4.0 — 2026-10-13
 
 - **Compaction only at handoffs** (`mask.mode: "handoff"`, the new default). The executor's context is no longer masked on every request: between advisor calls nothing is rewritten (no masking, no duplicate/stale read removal, no loop cuts). In experiment C v3 the per-turn masking made GLM re-read `pieces.ts` 8 times and call `baton_recall` (evt 59–76).

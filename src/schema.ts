@@ -10,6 +10,8 @@ export const AdvisorStep = Type.Object({
 	done_when: Type.String({ minLength: 1 }),
 	avoid: Type.Optional(Type.String()),
 	escalate_if: Type.Optional(Type.String()),
+	/** "self": small/mechanical fix, the executor verifies it and marks it done, no re-review. Default "review". */
+	verify: Type.Optional(Type.Union([Type.Literal("self"), Type.Literal("review")])),
 });
 
 export const AdvisorReply = Type.Object({
@@ -46,7 +48,7 @@ export const REPLY_SCHEMA_TEXT = `{
   "assessment": "1-3 sentences: where we are and what is wrong",
   "verdict": "on_track | course_correct | replan | done | need_user",
   "facts_corrected": [{"claim": "what the executor believes", "truth": "what is actually true", "evt": [12]}],
-  "plan": [{"id": "S1", "action": "what to do", "files": ["src/a.ts"], "done_when": "checkable criterion (command/test)", "avoid": "what not to do", "escalate_if": "when to call the advisor again"}],
+  "plan": [{"id": "S1", "action": "what to do", "files": ["src/a.ts"], "done_when": "checkable criterion (command/test)", "avoid": "what not to do", "escalate_if": "when to call the advisor again", "verify": "self | review"}],
   "do_not_retry": ["approach X - evt 40-52"],
   "test_cmd": "command that proves the work, or null",
   "questions_for_user": [],
@@ -164,7 +166,7 @@ export function renderPlan(r: AdvisorReply, label: string, truncated = false): s
 	if (r.plan.length) {
 		out.push("Steps:");
 		for (const s of r.plan) {
-			out.push(`- [${s.id}] ${s.action}${s.files?.length ? ` (files: ${s.files.join(", ")})` : ""}`);
+			out.push(`- [${s.id}]${s.verify === "self" ? " (verify: self — no re-review)" : ""} ${s.action}${s.files?.length ? ` (files: ${s.files.join(", ")})` : ""}`);
 			out.push(`  done when: ${s.done_when}`);
 			if (s.avoid) out.push(`  avoid: ${s.avoid}`);
 			if (s.escalate_if) out.push(`  escalate if: ${s.escalate_if}`);

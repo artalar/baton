@@ -30,6 +30,30 @@ export async function packDiff(exec: Exec, args: string[], excludes: readonly st
 	return (await git(exec, ["diff", ...args, "HEAD", ...spec])) ?? (await git(exec, ["diff", ...args, ...spec]));
 }
 
+/** Commit-ish of the current working tree (tracked files) without touching it: `git stash create`, or HEAD when clean. */
+export async function treeSnapshot(exec: Exec): Promise<string | undefined> {
+	const s = (await git(exec, ["stash", "create"]))?.trim();
+	return s || (await git(exec, ["rev-parse", "HEAD"]))?.trim() || undefined;
+}
+
+/** Pure: sum of added+deleted lines in `git diff --numstat` output (binary files count 0). */
+export function numstatLines(out: string): number {
+	let n = 0;
+	for (const l of out.split("\n")) {
+		const m = l.match(/^(\d+)\s+(\d+)\s/);
+		if (m) n += Number(m[1]) + Number(m[2]);
+	}
+	return n;
+}
+
+/** Changed lines between a snapshot and the current tree, with the pack excludes. */
+export async function diffLinesSince(exec: Exec, from: string, excludes: readonly string[]): Promise<number | undefined> {
+	const to = await treeSnapshot(exec);
+	if (!to) return undefined;
+	const out = await git(exec, ["diff", "--numstat", from, to, ...excludePathspec(excludes)]);
+	return out === undefined ? undefined : numstatLines(out);
+}
+
 export async function changedFiles(exec: Exec, cwd: string, maxLines = 400, excludes: readonly string[] = [".pi/baton/**"]): Promise<{ path: string; content: string }[]> {
 	const tracked = (await git(exec, ["diff", "--name-only", "HEAD"])) ?? (await git(exec, ["diff", "--name-only"])) ?? "";
 	const untracked = (await git(exec, ["ls-files", "--others", "--exclude-standard"])) ?? "";

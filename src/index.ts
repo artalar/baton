@@ -7,6 +7,7 @@ import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@eare
 import { Type } from "typebox";
 import { type AdvisorResult, callAdvisor } from "./advisor.ts";
 import { type BatonConfig, loadConfig } from "./config.ts";
+import { commitAllowedByGate, finalizeGate, gateOnAdvisor, gateReleaseFinalize, type GateState, helpGate, initialGateState, reviewGate } from "./gate.ts";
 import { Journal, type JournalEvent, eventLine, normPath } from "./journal.ts";
 import { filterEvents, type JudgeProvider } from "./judge.ts";
 import { jevJudge } from "./judge-jev.ts";
@@ -14,10 +15,10 @@ import { cutLoops, type DeferredItem, deferFire, deferredEditGate, initialLoopSt
 import { applyHandoff, type HandoffSnapshot, handoffSnapshot, maskMessages, type MsgLike, pinPlan } from "./mask.ts";
 import { type AdvisorKind, buildPack, type PackInput, type VerbatimCall } from "./pack.ts";
 import { autoCompactSummary, pickFirstKept, pickFirstKeptForCalls, resetSummary } from "./reset.ts";
-import { changedFiles, type Exec, git, packDiff, packExcludes, readAgentsMd, repoMap } from "./repo.ts";
+import { changedFiles, diffLinesSince, type Exec, git, treeSnapshot, packDiff, packExcludes, readAgentsMd, repoMap } from "./repo.ts";
 import { discoverSkills, selectSkills } from "./skills.ts";
 import { type AdvisorReply, renderPlan } from "./schema.ts";
-import { callFacts, commitGate, evaluate, initialTriggerState, onAdvisor, onToolResult, planGate, type TriggerState } from "./triggers.ts";
+import { callFacts, commitGate, isGitCommit, evaluate, initialTriggerState, onAdvisor, onToolResult, planGate, type TriggerState } from "./triggers.ts";
 import { clip } from "./util.ts";
 
 export const SYSTEM_SNIPPET = `Baton is active. Your context is not rewritten while you work. Only at a handoff (an advisor call: baton_review/help/plan, or an automatic one on a loop or a full context) is it reset to task + plan + advisor reply + your last calls; older tool outputs become stubs like "[baton: output masked. evt#12 …]"; call baton_recall({"evt":12}) when you need the full text again.
@@ -25,7 +26,9 @@ Use the advisor tools (a stronger model, one call each, costly — do not spam).
 - baton_plan: after a short exploration (read the project skills and the repo first), before writing code; again when the context is getting long. The plan is pinned into every request; follow it.
 - baton_step: mark a plan step done/blocked with evidence (command + result). Cheap, no advisor call.
 - baton_help: when stuck — the same error twice, or you do not understand a failure. Give your hypothesis, what you tried, and important evt numbers. Resets your context to task + plan.
-- baton_review: at the first milestone (core model works, tests/build green), at the plan's checkpoints, and always before git commit. Its plan is appended; follow it.
+- baton_review: at the first milestone (core model works, tests/build green), at the plan's checkpoints, and before git commit. Its plan is appended; follow it.
+Review gating: baton_review is refused until ALL review-verified steps of the last review are closed (baton_step done/deferred), or ~15 tool calls / ~80 changed lines accumulated. Do all the fixes, then ONE review — never one fix per review. Steps marked "verify: self" need no re-review: do them, mark them done; if only such steps were left, git commit directly.
+Verdict done = finished: only git add/commit (and final tsc/test/build). Do not edit further or ask for another review; optional nits wait.
 Stuck rule: if one bug or test still fails after ~3 fix attempts, STOP. Mark the step blocked (baton_step status "blocked", or call baton_help once), treat the item as DEFERRED and move on to the next plan step. Deferred items are resolved only after the reviewer (baton_review) or the user confirms. Baton's loop detector enforces this: when it reports "⚠ Loop detected", do not touch that item again until it is unblocked.
 Skill files (SKILL.md) and reference docs are never masked.`;
 
@@ -53,6 +56,8 @@ interface Runtime {
 	handoff?: HandoffSnapshot;
 	/** An automatic handoff to run at the end of the current turn. */
 	pendingHandoff?: { kind: AdvisorKind; reason: string; question: string };
+	/** Review gating / finalize mode. */
+	gate: GateState;
 }
 
 /** Pure: the text pinned into every request (plan with progress, then deferred items). */
@@ -81,17 +86,24 @@ export default function baton(pi: ExtensionAPI) {
 			maskStats: { masked: 0, deduped: 0, stale: 0, charsSaved: 0 },
 			loop: initialLoopState(),
 			deferred: [],
+			gate: initialGateState(),
 		};
 		const snap = [...rt.journal.events].reverse().find((e) => e.kind === "note" && (e.data as { deferred?: unknown } | undefined)?.deferred);
 		if (snap) rt.deferred = (snap.data as { deferred: DeferredItem[] }).deferred;
 		const ho = [...rt.journal.events].reverse().find((e) => e.kind === "note" && (e.data as { handoff?: unknown } | undefined)?.handoff);
 		if (ho) rt.handoff = (ho.data as { handoff: HandoffSnapshot }).handoff;
+		const gs = [...rt.journal.events].reverse().find((e) => e.kind === "note" && (e.data as { gate?: unknown } | undefined)?.gate);
+		if (gs) rt.gate = (gs.data as { gate: GateState }).gate;
 		rt.userPrompts = rt.journal.events.filter((e) => e.kind === "user_prompt").map((e) => ({ evt: e.evt, text: e.text ?? "" }));
 		return rt;
 	};
 
 	const saveDeferred = (r: Runtime, text: string, extra?: Record<string, unknown>) => {
 		r.journal.record("note", r.turn, text, { ...extra, deferred: r.deferred });
+	};
+
+	const saveGate = (r: Runtime, text: string) => {
+		r.journal.record("note", r.turn, text, { gate: r.gate });
 	};
 
 	const exec: Exec = async (cmd, args) => {
@@ -115,6 +127,10 @@ export default function baton(pi: ExtensionAPI) {
 		if (e.messageType === "user" && e.prompt) {
 			const ev = r.journal.record("user_prompt", r.turn, e.prompt);
 			r.userPrompts.push({ evt: ev.evt, text: e.prompt });
+			if (r.gate.finalize) {
+				r.gate = gateReleaseFinalize(r.gate); // the user intervened
+				saveGate(r, "finalize mode ended: new user prompt");
+			}
 		}
 		return undefined;
 	});
@@ -134,8 +150,15 @@ export default function baton(pi: ExtensionAPI) {
 			r.journal.record("note", r.turn, `deferred gate: blocked ${e.toolName} ${String(p)}`);
 			return dg;
 		}
-		if (e.toolName !== "bash") return undefined;
-		const cmd = String((e.input as { command?: unknown }).command ?? "");
+		const cmd = e.toolName === "bash" ? String((e.input as { command?: unknown }).command ?? "") : undefined;
+		const fg = finalizeGate(e.toolName, cmd, r.gate);
+		if (fg) {
+			r.gate = { ...r.gate, finalizeWarned: true };
+			saveGate(r, `finalize gate: blocked ${e.toolName} once`);
+			return fg;
+		}
+		if (cmd === undefined) return undefined;
+		if (commitAllowedByGate(r.gate, r.stepStatus)) return undefined; // after done / all-self steps closed
 		return commitGate(cmd, r.triggers, r.cfg.triggers);
 	});
 
@@ -154,6 +177,10 @@ export default function baton(pi: ExtensionAPI) {
 			cwd: ctx.cwd,
 		});
 		const cmd = typeof (e.input as { command?: unknown }).command === "string" ? String((e.input as { command: string }).command) : undefined;
+		if (cmd && ev.exit === 0 && isGitCommit(cmd) && r.gate.finalize) {
+			r.gate = gateReleaseFinalize(r.gate);
+			saveGate(r, "finalize mode ended: commit");
+		}
 		r.triggers = onToolResult(r.triggers, e.toolName, ev.errSig, (ev.filesWritten?.length ?? 0) > 0, callFacts(e.toolName, cmd, ev.exit, ev.test));
 		const usage = ctx.getContextUsage();
 		const ratio = usage && usage.tokens !== null && usage.contextWindow ? usage.tokens / usage.contextWindow : null;
@@ -316,6 +343,8 @@ export default function baton(pi: ExtensionAPI) {
 				? `Checkpoint ${params.id} reached: call baton_review now.`
 				: left.length
 					? `Next: ${left[0]} — ${r.pinned.reply.plan.find((x) => x.id === left[0])!.done_when ? `done when ${r.pinned.reply.plan.find((x) => x.id === left[0])!.done_when}` : ""}`
+					: commitAllowedByGate(r.gate, r.stepStatus)
+					? "All steps done (verify:self): run the checks and git commit; no re-review needed."
 					: "All steps done: call baton_review.";
 			return { content: [{ type: "text", text: `Step ${params.id} → ${params.status}. ${next}` }], details: { ok: true, step: params.id, status: params.status, checkpoint } };
 		},
@@ -433,6 +462,8 @@ export default function baton(pi: ExtensionAPI) {
 		r.lastPlan = plan;
 		r.journal.record("advisor", r.turn, `baton_${kind}: ${res.reply.verdict}`, { ...res.reply, usage: res.usage, attempts: res.attempts, packTokens: pack.tokens, reason: extra.reason });
 		r.triggers = onAdvisor(r.triggers, kind, res.reply.verdict, res.reply.plan.length);
+		r.gate = gateOnAdvisor(r.gate, kind, res.reply.verdict, res.reply.plan, executorCalls(r).length, kind === "review" ? await treeSnapshot(exec) : undefined, r.cfg.review);
+		saveGate(r, `gate after baton_${kind}: ${res.reply.verdict}${r.gate.finalize ? " → finalize mode" : ""}`);
 		if (res.reply.deferred_rulings?.length && r.deferred.length) {
 			r.deferred = resolveDeferred(r.deferred, res.reply.deferred_rulings, "reviewer");
 			saveDeferred(r, `deferred rulings from baton_${kind}: ${res.reply.deferred_rulings.map((d) => `${d.id}=${d.ruling}`).join(", ")}`);
@@ -443,7 +474,15 @@ export default function baton(pi: ExtensionAPI) {
 		}
 		const handoffMode = r.cfg.mask.mode !== "continuous";
 		let tail = "";
-		if (kind === "review") tail = r.triggers.reviewPassed ? "\nReview passed: git commit is allowed." : "\nReview did not pass: fix the steps above, then call baton_review again.";
+		const selfN = res.reply.plan.filter((s) => s.verify === "self").length;
+		if (kind === "review")
+			tail = r.gate.finalize
+				? "\nVerdict done: FINALIZE. Run git add + git commit now (final tsc/test/build allowed). No more edits, no further baton_review until you commit."
+				: r.triggers.reviewPassed
+					? `\nReview passed: git commit is allowed.${selfN ? " Do the verify:self steps first and mark them done." : ""}`
+					: selfN === res.reply.plan.length && selfN
+						? "\nAll fixes are verify:self: do them, mark each done with baton_step, then git commit (no re-review needed)."
+						: "\nReview did not pass: do ALL the steps above (verify:self ones need no re-review), mark each with baton_step, then call baton_review once.";
 		if (handoffMode || kind !== "review") {
 			const diffStat = (await git(exec, ["diff", "--stat", "HEAD"])) ?? undefined;
 			r.pendingReset = { kind, summary: resetSummary({ task: r.userPrompts[0]?.text ?? "", userPrompts: r.userPrompts.map((p) => p.text), plan, diffStat, note: renderDeferred(r.deferred) || undefined }) };
@@ -472,8 +511,8 @@ export default function baton(pi: ExtensionAPI) {
 	};
 
 	const descriptions: Record<AdvisorKind, string> = {
-		review: "Ask the stronger advisor model to review the current work (task, user prompts, git diff, changed files, last test run). Required before git commit. Appends the advisor's plan.",
-		help: "Ask the stronger advisor model for help when stuck (same error repeated, unclear failure). Sends your last tool calls verbatim plus your hypothesis and attempts. Afterwards your context is reset to task + plan + your last calls; older outputs become evt# stubs.",
+		review: "Ask the stronger advisor model to review the current work (task, user prompts, git diff, changed files, last test run). Required before git commit. Appends the advisor's plan. Refused while review-verified steps of the last review are open (unless ~15 calls / ~80 changed lines accumulated) and after a done verdict until you commit: batch all fixes into one review.",
+		help: "Ask the stronger advisor model for help when stuck (same error repeated, unclear failure; not right after another advisor reply — apply it first). Sends your last tool calls verbatim plus your hypothesis and attempts. Afterwards your context is reset to task + plan + your last calls; older outputs become evt# stubs.",
 		plan: "Ask the stronger advisor model for a plan (task, project skills, AGENTS.md, repo map, your exploration findings). Call it after exploring and before writing code. The plan is pinned into every request; afterwards your context is reset to task + plan + last turns.",
 	};
 
@@ -489,6 +528,25 @@ export default function baton(pi: ExtensionAPI) {
 					kind === "help"
 						? { hypothesis: params.hypothesis, attempts: params.attempts, importantEvts: params.importantEvts, question: params.question, reason: "self:stuck" }
 						: { question: params.question ?? params.note, reason: `self:${kind}` };
+				const r = init(ctx);
+				const calls = executorCalls(r).length;
+				let refusal: string | undefined;
+				if (kind === "review") {
+					let d = reviewGate(r.gate, r.cfg.review, { calls, status: r.stepStatus });
+					if (!d.allow && d.needDiff) {
+						const from = r.gate.lastReview?.tree;
+						const diffLines = from ? await diffLinesSince(exec, from, packExcludes(r.cfg.journalDir, r.cfg.pack.excludePaths)) : undefined;
+						d = reviewGate(r.gate, r.cfg.review, { calls, status: r.stepStatus, diffLines: diffLines ?? 0 });
+					}
+					if (!d.allow) refusal = d.reason;
+				} else if (kind === "help") {
+					const d = helpGate(r.gate, r.cfg.review, calls);
+					if (!d.allow) refusal = d.reason;
+				}
+				if (refusal) {
+					r.journal.record("note", r.turn, `baton_${kind} refused by gate`, { refused: kind, reason: refusal });
+					return { content: [{ type: "text", text: refusal }], details: { ok: false, refused: true } };
+				}
 				const out = await handoff(kind, extra, ctx, signal);
 				return { content: [{ type: "text", text: out.text }], details: out.details, usage: out.usage as any };
 			},
@@ -520,7 +578,7 @@ export default function baton(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				[
 					`Baton: ${r.journal.events.length} events in ${r.cfg.journalDir}`,
-					`tool calls ${t.toolCalls}, since advisor ${t.toolCalls - t.lastAdvisorAt}, review passed: ${t.reviewPassed}`,
+					`tool calls ${t.toolCalls}, since advisor ${t.toolCalls - t.lastAdvisorAt}, review passed: ${t.reviewPassed}, finalize: ${r.gate.finalize}, open review steps: ${(r.gate.lastReview?.steps ?? []).filter((x) => x.verify === "review" && r.stepStatus[x.id] !== "done" && r.stepStatus[x.id] !== "deferred").map((x) => x.id).join(",") || "none"}`,
 					`mode ${r.cfg.mask.mode}, handoffs ${r.handoff?.n ?? 0}; last request: stubbed ${s.masked}, duplicate ${s.deduped}, stale ${s.stale}, ~${Math.round(s.charsSaved / 2.4)} tok saved`,
 					`plan: ${r.pinned ? `${r.pinned.label}, ${Object.values(r.stepStatus).filter((x) => x === "done").length}/${r.pinned.reply.plan.length} steps done` : "none"}`,
 					`deferred: ${r.deferred.length ? r.deferred.map((d) => `${d.id} ${d.status} (${d.target})`).join("; ") : "none"}`,

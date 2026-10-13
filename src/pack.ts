@@ -69,6 +69,9 @@ const INSTRUCTIONS: Record<AdvisorKind, string> = {
 2. Walk through the PROJECT SKILLS rules that apply to the changed code and list each violation with the offending line (non-idiomatic patterns count: e.g. raw timers/listeners/global mutable state where the skill prescribes its own primitives).
 3. Check the task and every user prompt are satisfied; check the done criteria and invariants of the pinned plan.
 4. If tests did not run after the last edits, the verdict cannot be "done".
+5. Batch: put ALL fixes you want into this one reply (the executor cannot call you again until the review-verified steps are closed or a lot of code changed). Do not drip-feed 1-2 tiny steps per review.
+6. Mark each step's verify: "self" for small/mechanical fixes (rename, cast removal, one-line fix, add a test the executor can run, docs, optional nits) — the executor does them, runs the check and marks them done, no re-review; "review" only for changes whose correctness you must see. Prefer "self".
+7. Optional nits never block "done": if the work satisfies the task, return verdict done (any remaining nits as verify:"self" steps); after done the executor only commits.
 verdict: done = complete and correct; on_track = correct so far; course_correct = fixable issues (put fixes in plan); replan = the approach is wrong.`,
 	help: "Explain the root cause in assessment, correct wrong executor beliefs in facts_corrected (cite evt numbers), list approaches that must not be retried, and give the next steps.",
 	plan: "Base the architecture on the PROJECT SKILLS rules (name the skill in each rule). Put architecture decisions in invariants, skill rules in rules, and the ids of steps after which a review is due in checkpoints (at least one, early: right after the core model works).",

@@ -19,9 +19,14 @@ Call it at these moments:
 | You finished a plan step | `baton_step` (`id`, `status`, `evidence`) | Progress is tracked; at a checkpoint you are told to call `baton_review` |
 | The same error twice, or a failure you cannot explain | `baton_help` (give `hypothesis`, `attempts`, `importantEvts`) | You get corrected facts and a plan; context resets to task + plan + your last 8 calls |
 | First milestone (core works, tests/build green), a plan checkpoint, or the task is done | `baton_review` | The verdict and fixes are appended; follow them |
-| Before `git commit` | `baton_review` | Commits are blocked until a review returns `on_track` or `done` |
+| Before `git commit` | `baton_review` | Commits are blocked until a review returns `on_track` or `done` (or all its fixes were `verify: self` and are done) |
+| Review returned verdict `done` | `git add` + `git commit` | Finalize mode: no edits, no more reviews until you commit |
 
 Rules:
+- **Review gating.** `baton_review` is refused until every review-verified step of the last review is closed (`baton_step` done/deferred), unless ~15 tool calls or ~80 changed lines accumulated since. Do ALL the fixes, mark each, then call review once. Never one fix per review.
+- **verify: self.** Steps marked `(verify: self — no re-review)` are small fixes: do them, run the check, mark them done. They neither require nor allow a review; if only such steps were left, commit directly.
+- **Finalize after done.** After verdict `done`, only commit (final tsc/test/build are fine). The first edit is blocked once; optional reviewer nits wait. `baton_review` is refused until the commit (or a new user message).
+- `baton_help` is refused within 5 tool calls of an advisor reply: apply the reply first.
 - Do not call an advisor more than once per ~8 tool calls unless you are stuck.
 - Be honest in `baton_help`: list what failed, not what you hoped would work.
 - After a plan arrives, work step by step; each step has a `done when` criterion. Run the test command it names.

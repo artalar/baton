@@ -70,6 +70,7 @@ export type Nudge =
 	| { kind: "drift"; calls: number; message: string };
 
 const READ_ONLY_TOOLS = new Set(["read", "ls", "grep", "find", "baton_recall"]);
+export const BASH_INSPECT_SEG = /^\s*(ls|cat|head|tail|sed -n|find|grep|rg|tree|wc|pwd|git (status|log|show|diff|ls-files)|npm (ls|view)|node -v)\b/;
 const BASH_INSPECT = /^\s*(ls|cat|head|tail|sed -n|find|grep|rg|tree|wc|pwd|git (status|log|show|diff|ls-files)|npm (ls|view)|node -v|npx -y skills list)\b/;
 const BUILD_CMD = /\b(tsc|vite build|npm run (build|typecheck|check)|pnpm (build|typecheck)|cargo (build|check)|go build)\b/;
 

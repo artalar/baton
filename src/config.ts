@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { ReviewGateConfig } from "./gate.ts";
 import type { LoopConfig } from "./loop.ts";
 
 export interface TriggerConfig {
@@ -48,6 +49,8 @@ export interface BatonConfig {
 		pinPlan: boolean;
 	};
 	triggers: TriggerConfig;
+	/** Review gating and finalize mode (see src/gate.ts). */
+	review: ReviewGateConfig;
 	/** Deterministic stuck-loop detector (see src/loop.ts). */
 	loop: LoopConfig;
 	mask: {
@@ -111,6 +114,8 @@ export const DEFAULT_CONFIG: BatonConfig = {
 		planBeforeWrite: true,
 		driftCalls: 20,
 	},
+	// C4: 8 handoffs, 3 of them ping-pong reviews 5-11 calls apart; these refuse exactly those.
+	review: { enabled: true, minDiffLines: 80, minCalls: 15, helpMinCalls: 5, finalizeAfterDone: true },
 	// Calibrated on experiment C v2: fires at call 324 (8 edit→run→fail hops on the lock-delay test,
 	// 21 calls after its first failure); max hop count on any signature before that loop: 1.
 	loop: {
