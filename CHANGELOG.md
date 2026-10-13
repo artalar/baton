@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0
+- New mode **switch** (`-e src/pi/switch.ts` or `BATON_MODE=switch`): in-session model switching in one pi session, the lead (Opus) leads. Helper (GLM) does adaptive reading (read-only tool gate; non-read tool / long text / cap / 4.5 min → back to lead), up to 2 delegated follow-up read rounds (`delegate_reads` or "lead issued only reads"), verify/debug loops (escalates after 6 same-failure red cycles, 12 total, or a new file), and the final review; lead does an optional short final check.
+- Lead context: helper turns are reduced to tool calls + results (no text/thinking, blocked calls dropped), helper instructions hidden, empty replies dropped; lead messages untouched (signed reasoning kept). Compaction frozen only at helper→lead handoffs (dedup reads, clip huge reads, stub old verify outputs).
+- Lead reasoning capped at 1024 tokens outside planning turns; lead max_tokens capped (16k); empty 200 responses retried (3×).
+- Journal `.pi/baton/switch.jsonl` (every switch, blocked call, usage per message) + `switch-summary.json` (cost per model).
+
 ## 0.6.0 — 2026-10-13
 
 Repositioned as an **efficient review agent**: the core value is context preparation for an expensive, tool-less reviewer.

@@ -157,3 +157,8 @@ No test calls a paid model: transports are faked and the request shape is assert
 ## License
 
 MIT
+
+## Mode `switch` (in-session model switching)
+
+`pi --model openrouter/z-ai/glm-5.3-flash -e src/pi/switch.ts "<task>"` (or `BATON_MODE=switch` with `src/pi/index.ts`).
+One session, the lead model (default `openrouter/anthropic/claude-opus-5.5`) plans and writes code; the helper (default `openrouter/z-ai/glm-5.3-flash`) reads, runs verify/fix loops and the final review. Configure in `.pi/baton.json` under `"switch"` (see `DEFAULT_SWITCH` in `src/pi/switch-core.ts`). Journal: `.pi/baton/switch.jsonl`, `switch-summary.json`.

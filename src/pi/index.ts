@@ -19,6 +19,7 @@ import { diffLinesSince, type Exec, git, treeSnapshot, packExcludes } from "../c
 import { type AdvisorReply, renderPlan } from "../core/schema.ts";
 import { callFacts, commitGate, isGitCommit, evaluate, initialTriggerState, onAdvisor, onToolResult, planGate, type TriggerState } from "./triggers.ts";
 import { clip } from "../core/util.ts";
+import batonSwitch from "./switch.ts";
 
 const SNIPPET_COMPACT = `Baton compaction is ON. Your context is not rewritten while you work. Only at a handoff (an advisor call: baton_review/help/plan, or an automatic one on a loop or a full context) is it reset to task + plan + advisor reply + your last calls; older tool outputs become stubs like "[baton: output masked. evt#12 …]"; call baton_recall({"evt":12}) when you need the full text again. Skill files (SKILL.md) and reference docs are never masked.`;
 
@@ -76,6 +77,7 @@ function textOf(content: readonly { type: string; text?: string }[] | undefined)
 }
 
 export default function baton(pi: ExtensionAPI) {
+	if (process.env.BATON_MODE === "switch") return batonSwitch(pi);
 	let rt: Runtime | undefined;
 
 	const init = (ctx: ExtensionContext): Runtime => {
