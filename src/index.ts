@@ -274,17 +274,17 @@ export default function baton(pi: ExtensionAPI) {
 						: { question: params.question ?? params.note, reason: `self:${kind}` };
 				const { r, pack, res } = await runAdvisor(kind, extra, ctx, signal);
 				if (!res.ok || !res.reply) {
-					r.journal.record("advisor", r.turn, `baton_${kind} failed: ${(res.errors ?? []).join("; ")}`, { raw: res.raw });
+					r.journal.record("advisor", r.turn, `baton_${kind} failed: ${(res.errors ?? []).join("; ")}`, { raw: res.raw, usage: res.usage, attempts: res.attempts });
 					const fallback = res.raw ? `\nRaw advisor reply (unvalidated):\n${clip(res.raw, 8000)}` : "";
 					return {
 						content: [{ type: "text", text: `Baton ${kind}: advisor call failed (${(res.errors ?? ["unknown"]).join("; ")}).${fallback}` }],
-						details: { ok: false, packTokens: pack.tokens },
+						details: { ok: false, packTokens: pack.tokens, attempts: res.attempts, usage: res.usage },
 						usage: res.usage as any,
 					};
 				}
 				const plan = renderPlan(res.reply, `baton_${kind}`, res.truncated);
 				r.lastPlan = plan;
-				r.journal.record("advisor", r.turn, `baton_${kind}: ${res.reply.verdict}`, res.reply);
+				r.journal.record("advisor", r.turn, `baton_${kind}: ${res.reply.verdict}`, { ...res.reply, usage: res.usage, attempts: res.attempts, packTokens: pack.tokens });
 				r.triggers = onAdvisor(r.triggers, kind, res.reply.verdict);
 				let tail = "";
 				if (kind !== "review") {
@@ -296,7 +296,7 @@ export default function baton(pi: ExtensionAPI) {
 				}
 				return {
 					content: [{ type: "text", text: `${plan}${tail}` }],
-					details: { ok: true, verdict: res.reply.verdict, packTokens: pack.tokens, model: res.model },
+					details: { ok: true, verdict: res.reply.verdict, packTokens: pack.tokens, model: res.model, attempts: res.attempts, usage: res.usage },
 					usage: res.usage as any,
 				};
 			},
