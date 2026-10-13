@@ -586,7 +586,23 @@ export function harnessReport(s: SwitchState, from: Phase, why: string, cfg: Swi
 		if (!s.stretchOutputs.length) return `[Baton harness] Reading was intercepted and performed by automation (helper model); it read nothing useful. (${why})${guardNotes(s)}`;
 		let budget = cfg.reportChars;
 		const parts: string[] = [];
-		for (const o of s.stretchOutputs) {
+		// skill files go to the lead verbatim (never clipped, never omitted), once per file — the longest read wins
+		// (a later partial read with offset/limit must not replace a full one; ties → the latest)
+		const lastSkill = new Map<string, number>();
+		s.stretchOutputs.forEach((o, i) => {
+			const k = skillKey(o.label);
+			if (!k) return;
+			const prev = lastSkill.get(k);
+			if (prev === undefined || o.text.length >= s.stretchOutputs[prev]!.text.length) lastSkill.set(k, i);
+		});
+		for (const [i, o] of s.stretchOutputs.entries()) {
+			const k = skillKey(o.label);
+			if (k) {
+				if (lastSkill.get(k) !== i) continue;
+				budget -= o.text.length;
+				parts.push(`--- ${o.label} (skill file, verbatim) ---\n${o.text}`);
+				continue;
+			}
 			const body = o.text.length > cfg.clipChars ? `${o.text.slice(0, Math.floor(cfg.clipChars * 0.75))}\n[… ${o.text.length - cfg.clipChars} chars clipped — re-read with offset/limit]\n${o.text.slice(-Math.floor(cfg.clipChars * 0.25))}` : o.text;
 			if (budget - body.length < 0) {
 				parts.push(`--- ${o.label} ---\n[omitted: report size cap — read it yourself if needed]`);
@@ -611,6 +627,17 @@ export function harnessReport(s: SwitchState, from: Phase, why: string, cfg: Swi
 		`SUSPICIOUS EDITS (guardrail flags):\n${flags || "(none)"}`,
 		`Helper's last note: ${oneLine(s.lastHelperText, 600) || "(none)"}`,
 	].join("\n\n") + guardNotes(s);
+}
+
+/** Skill documents: SKILL.md / REFERENCE.md anywhere, or any file under a skills directory (.agents/skills, .pi/skills, .claude/skills, skills/). */
+export const SKILL_PATH = /(?:^|\/)(?:SKILL|REFERENCE)\.md$|(?:^|\/)(?:\.agents|\.pi|\.claude)\/skills\/|(?:^|\/)skills\/[^\s]+\.md$/;
+
+/** Pure: dedup key of a read output whose label is a skill file (read path or `$ cat <one skill file>`), else undefined. */
+export function skillKey(label: string): string | undefined {
+	const p = label.startsWith("$ ") ? /^\$ cat\s+(\S+)\s*$/.exec(label)?.[1] : label;
+	if (!p) return undefined;
+	const norm = p.replace(/^\.\//, "").replace(/^.*?((?:\.agents|\.pi|\.claude)\/skills\/|skills\/)/, "$1");
+	return SKILL_PATH.test(p) ? norm : undefined;
 }
 
 function guardNotes(s: SwitchState): string {

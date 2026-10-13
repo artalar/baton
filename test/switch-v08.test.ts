@@ -294,3 +294,33 @@ describe("9. budget stop", () => {
 		expect(budgetExceeded(rows, "anthropic/claude-opus-5.5", { ...b, budgetUsd: 0 }).stop).toBe(false);
 	});
 });
+
+describe("0.9.1: skill files reach the lead verbatim, deduplicated", () => {
+	const big = (tag: string) => `${tag}\n${"reatom skill line\n".repeat(3000)}END-${tag}`;
+	it("skill reads are never clipped or omitted; dups dropped; other reads still clipped", () => {
+		const s = initialSwitchState(0);
+		s.stretchOutputs = [
+			{ label: ".agents/skills/reatom/SKILL.md", text: big("S1") },
+			{ label: "/abs/repo/.agents/skills/reatom/REFERENCE.md", text: big("R1") },
+			{ label: "src/big.ts", text: "x".repeat(50_000) },
+			{ label: "$ cat .agents/skills/reatom/SKILL.md", text: big("S1") },
+			{ label: "/abs/repo/.agents/skills/reatom/SKILL.md", text: "partial" },
+			{ label: "node_modules/@reatom/jsx/README.md", text: "y".repeat(30_000) },
+		];
+		const r = harnessReport(s, "read", "done", { ...cfg, clipChars: 20_000, reportChars: 30_000 });
+		expect(r).toContain("END-S1");
+		expect(r).toContain("END-R1");
+		expect(r.split("(skill file, verbatim)").length - 1).toBe(2);
+		expect(r).not.toContain("--- /abs/repo/.agents/skills/reatom/SKILL.md");
+		expect(r).toMatch(/src\/big\.ts ---\n[\s\S]*chars clipped|src\/big\.ts ---\n\[omitted/);
+		expect(r).toContain("node_modules/@reatom/jsx/README.md ---\n[omitted");
+	});
+	it("skillKey", async () => {
+		const { skillKey } = await import("../src/pi/switch-core.ts");
+		expect(skillKey("/w/x/.agents/skills/a/SKILL.md")).toBe(".agents/skills/a/SKILL.md");
+		expect(skillKey("$ cat .agents/skills/a/REFERENCE.md")).toBe(".agents/skills/a/REFERENCE.md");
+		expect(skillKey("$ cat a.md b.md")).toBeUndefined();
+		expect(skillKey("src/model.ts")).toBeUndefined();
+		expect(skillKey("node_modules/x/README.md")).toBeUndefined();
+	});
+});

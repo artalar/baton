@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.9.1 — 2026-10-13
+- **Skills reach the lead verbatim**: in the honest reading handoff, outputs of skill documents (`SKILL.md` / `REFERENCE.md` anywhere, any file under `.agents/skills`, `.pi/skills`, `.claude/skills`, `skills/*.md`; via `read` or a single-file `cat`) are passed to the lead unchanged — never clipped, never omitted by the report size cap — and deduplicated per file (longest read wins, so a later partial read does not replace a full one). Other read outputs are clipped/capped as before. `skillKey`, `SKILL_PATH` exported.
+
 ## 0.9.0 — 2026-10-13
 Switch mode gets a **Jev supervisor** (decision model via OpenRouter `/api/alpha/decisions`), per `baton-jev-research.md` §5:
 - **`src/core/jev.ts`** (no pi dependency): `decide(state, questions, {model, fallbackModel, timeoutMs})` — fetch client, key only from `OPENROUTER_API_KEY` (never logged/returned), strict validation of every answer's `type` (missing / wrong type / choice outside criteria / noul outside [0,1] = error), LRU cache (256), per-attempt timeout, fallback decision model (`microsoft/microsoft-decision-1`, id verified against the live API).
