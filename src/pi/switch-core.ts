@@ -81,7 +81,7 @@ export interface Result {
 }
 
 const READ_TOOLS = new Set(["read", "grep", "find", "ls", "glob"]);
-const READ_CMD = /^(ls|cat|head|tail|wc|tree|find|grep|rg|fd|file|stat|pwd|echo|nl|less|more|sort|uniq|cut|awk|jq|du|sed\s+-n|git\s+(-C\s+\S+\s+)?(status|log|diff|show|ls-files|branch|rev-parse)|npm\s+(ls|view|info)|node\s+(-v|--version)|npx\s+tsc\s+--version)\b/;
+const READ_CMD = /^(ls|cat|head|tail|wc|tree|find|grep|rg|fd|file|stat|pwd|echo|nl|less|more|sort|uniq|cut|awk|jq|du|sed\s+-n|git\s+(-C\s+\S+\s+)?(status|log|diff|show|ls-files|branch|rev-parse)|npm\s+(ls|view|info)|(node|npm|npx|pnpm|yarn|bun|git|tsc)\s+(-v|--version)|which|npx\s+tsc\s+--version)\b/;
 
 /** Pure: a read-only tool call (read/grep/find/ls, or a bash pipeline of read commands without redirects). */
 export function isReadOnly(c: Pick<Call, "name" | "args">): boolean {
@@ -141,7 +141,20 @@ export function isVerify(c: Pick<Call, "name" | "args">): boolean {
 export const isTestRun = (c: Pick<Call, "name" | "args">) => verifyKinds(c).includes("test");
 export const TEST_FILE = /(^|\/)[^/]*\.(test|spec)\.[cm]?[jt]sx?$/;
 
-const isEdit = (c: Call) => c.name === "edit" || c.name === "write";
+/** Pure: files a bash call writes (redirects / tee in executed segments, heredoc bodies ignored). */
+export function bashWriteTargets(c: Pick<Call, "name" | "args">): string[] {
+	if (c.name !== "bash" || typeof c.args.command !== "string") return [];
+	const out: string[] = [];
+	for (const seg of executedSegments(c.args.command)) {
+		for (const m of seg.matchAll(/(?:^|[^0-9&>])>{1,2}\s*([^\s&>]+)/g)) if (!/^\/dev\/(null|std)/.test(m[1]!)) out.push(m[1]!);
+		const tee = /^tee\s+(?:-a\s+)?(\S+)/.exec(seg);
+		if (tee) out.push(tee[1]!);
+	}
+	if (!out.length && /\bnode\s+-e\b/.test(c.args.command) && /writeFileSync|writeFile\(/.test(c.args.command)) out.push("(node -e script)");
+	return out.map((x) => x.replace(/^\.\//, ""));
+}
+/** Pure: a code-writing call — edit/write, or bash writing files (arm E: Opus wrote every file via `cat > f <<'EOF'`). */
+export const isEdit = (c: Call) => c.name === "edit" || c.name === "write" || bashWriteTargets(c).length > 0;
 
 /** Pure: a stable signature of a failing run (error-ish lines, numbers/durations/paths' line:col normalised). */
 export function failSignature(text: string): string {
@@ -399,11 +412,13 @@ function readPath(c: Call): string | undefined {
 }
 
 const editPath = (c: Call) => {
+	if (c.name === "bash") return bashWriteTargets(c).join(", ");
 	const p = c.args.path ?? c.args.file_path;
 	return typeof p === "string" ? p.replace(/^\.\//, "") : "";
 };
 const editPairs = (c: Call): { oldText: string; newText: string }[] => {
 	if (c.name === "write") return [{ oldText: "", newText: String(c.args.content ?? "") }];
+	if (c.name === "bash") return [];
 	const edits = Array.isArray(c.args.edits) ? (c.args.edits as { oldText?: string; newText?: string }[]) : [{ oldText: c.args.oldText as string, newText: c.args.newText as string }];
 	return edits.map((e) => ({ oldText: String(e.oldText ?? ""), newText: String(e.newText ?? "") }));
 };

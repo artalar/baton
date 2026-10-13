@@ -82,6 +82,31 @@ describe("2. tests are written by the lead; debug only after tests exist / ran",
 	});
 });
 
+describe("read-only classifier (arm E)", () => {
+	it("version probes are reads", async () => {
+		const { isReadOnly } = await import("../src/pi/switch-core.ts");
+		expect(isReadOnly(bash("a", "cat /x/.gitignore /x/skills-lock.json; ls -R /x/.pi 2>/dev/null | head -30; cat /x/.pi/* 2>/dev/null | head -50; node --version; npm --version; ls /x/node_modules 2>/dev/null | head"))).toBe(true);
+	});
+});
+
+describe("bash writes count as code writes", () => {
+	it("heredoc / redirect / tee writes are edits; reads and /dev/null are not", async () => {
+		const { bashWriteTargets } = await import("../src/pi/switch-core.ts");
+		expect(bashWriteTargets(bash("a", T18))).toEqual(["src/tetris.ts", "src/main.tsx", "index.html", "vite.config.ts", "tsconfig.json", "(node -e script)"].filter((x) => x !== "(node -e script)"));
+		expect(bashWriteTargets(bash("a", "npx tsc 2>&1 | tail; ls > /dev/null"))).toEqual([]);
+		expect(bashWriteTargets(bash("a", "echo x | tee -a notes.md"))).toEqual(["notes.md"]);
+		expect(bashWriteTargets(bash("a", "node -e 'require(\"fs\").writeFileSync(\"a\",\"b\")'"))).toEqual(["(node -e script)"]);
+	});
+	it("a lead bash-heredoc write consumes planning and counts as a lead edit", () => {
+		const s = initialSwitchState(0);
+		decideTurn(s, turn({ text: "READ DONE" }), cfg);
+		decideTurn(s, turn({ calls: [bash("h", T18)] }), cfg);
+		expect(s.planningLeft).toBe(0);
+		expect(s.leadEditsInStretch).toBe(1);
+		expect(decideTurn(s, turn({ calls: [bash("v", "npx vitest run")], results: [{ id: "v", isError: true, text: "FAIL" }] }), cfg).to).toBe("debug");
+	});
+});
+
 describe("3/4. thinking cap via max_tokens; planning on the first writing turn", () => {
 	it("planning stays pending through read-only lead turns and is consumed by the first edit", () => {
 		const s = initialSwitchState(0);

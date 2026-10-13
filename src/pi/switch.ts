@@ -110,6 +110,13 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		started = Date.now();
 		st = initialSwitchState(Date.now());
 		log("start", { lead: cfg!.lead, helper: cfg!.helper, config: { ...cfg } });
+		if (process.env.BATON_SWITCH_START === "lead") {
+			// resume (`pi -c`): the context already holds the earlier work — the lead continues directly
+			st.phase = "lead";
+			await setModelFor(ctx, "lead");
+			log("switch", { from: "-", to: "lead", reason: "resume: BATON_SWITCH_START=lead" });
+			return { systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE };
+		}
 		await setModelFor(ctx, "read");
 		log("switch", { from: "-", to: "read", reason: "session start: helper reads first" });
 		return { message: { customType: "baton-switch-helper", content: MSG.read, display: true }, systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE };
