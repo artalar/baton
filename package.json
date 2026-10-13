@@ -1,6 +1,6 @@
 {
   "name": "pi-baton",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "Baton: an efficient review agent for pi \u2014 prepares a tool-less, cache-friendly review pack (diff, files, tests, project skills, pinned plan, unverified claims) for an expensive advisor model",
   "type": "module",
   "keywords": [

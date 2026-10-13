@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.1
+
+Speculation-length control. Each variant has its own flag (`BATON_SPEC=1` is still required); `BATON_SPEC_V2=1` turns all five on. Hard ceiling `spec.maxSteps` = 10.
+1. **Jev step gate** (`BATON_SPEC_GATE`, `spec.gate {free:3, thr:0.7}`): the first 3 helper steps run unchecked. Before every later step Jev answers `cont` ("the next call is still a routine continuation of the lead's plan"); p < 0.7 → back to the lead. Why 0.7: a kept step saves ≈ 1/1.8 of an Opus turn (≈ $0.03), and a drifted step costs about one Opus fix turn plus the summary (≈ $0.07). Continuing pays off when p·0.03 > (1−p)·0.07, that is p > 0.7. With the gate on, a run starts at 10 steps instead of 8/4 (the start thresholds 0.8 / 0.93 stay).
+2. **Free stops** (`BATON_SPEC_STOPS`): the first tool error, a repeated call (same name and arguments, including the lead's trigger call; blocked before it runs) or a text-only helper answer → back to the lead.
+3. **Step estimate** (`BATON_SPEC_EST`): in the same Jev request as `more_calls`, Jev gives P(≥3/6/10 more calls on the current sub-task). The first threshold reached at p ≥ 0.5 → ceiling 10/6/3, otherwise 2. Rule 1 can still cut a run shorter.
+4. **Phase change** (`BATON_SPEC_PHASE`): reads, searches and test/build runs are free. If the run started after a read-only lead turn, the helper's first edit (write/edit/bash redirect) is **blocked before it runs** and the run ends: the lead makes that edit. If the lead's trigger turn edited files, the helper may edit **only those files** (finishing the same plan: fixing the test it just ran, completing the edit). An edit to any other file ends the run the same way.
+5. **Adaptive ceiling** (`BATON_SPEC_ADAPT`, `spec.adapt {min:2, max:10, init:6}`): on the lead's first turn after a summary, an edit to a file the helper edited, a git checkout/restore/stash/reset, or a repeat of a helper call counts as **rework** (cap −2). Anything else counts as **continue** (cap +1). The run's starting N = min(base, estimate, cap).
+- The journal `switch-summary.json` now has `spec {stats, runs[{n, steps, why, p, est, cap}], adapt[], cap}`. Jev logs gain `est/p3/p6/p10/cap` and `spec_cont` entries. Tests: `test/spec.test.ts` (0.13.1 block).
+
 ## 0.13.0
 
 - **Speculative execution mode** (`BATON_SPEC=1` or `switch.spec.enabled`; off by default, other modes unchanged). Opus leads; after each lead turn with tool calls Jev answers `more_calls` ("will the lead make more tool calls after this one?"). If p ≥ `thr` the call runs as usual, then GLM continues in the same session for N steps with no fsguard, guardrails, Jev call gate or phases. After N steps, or when GLM stops, the harness cuts it off and gives control back to Opus with a `[Baton harness] … speculatively continued …` summary: the calls with ok/ERROR and an output line, the files touched, git diff --stat, the last check and the helper's last note. GLM turns are hidden from the lead view. Cooldown: 1 lead turn between runs.

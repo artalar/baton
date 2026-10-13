@@ -47,6 +47,17 @@ export const SPEC_QUESTIONS: JevQuestions = {
 	routine_ahead: Q.routine_ahead,
 };
 
+/** 0.13.1 v3: remaining-steps estimate, asked together with more_calls at the start of a run. */
+export const SPEC_EST_QUESTIONS: JevQuestions = {
+	more_3: { type: "noul", instructions: "After `proposed_call` the agent will make at least 3 more tool calls on the current sub-task (same plan, no new design decision) before it needs to rethink." },
+	more_6: { type: "noul", instructions: "After `proposed_call` the agent will make at least 6 more tool calls on the current sub-task (same plan, no new design decision) before it needs to rethink." },
+	more_10: { type: "noul", instructions: "After `proposed_call` the agent will make at least 10 more tool calls on the current sub-task (same plan, no new design decision) before it needs to rethink." },
+};
+/** 0.13.1 v1: asked before every speculative step after the free ones. */
+export const SPEC_CONT_QUESTIONS: JevQuestions = {
+	cont: { type: "noul", instructions: "The helper model is continuing the lead model's work. Its next tool call after `proposed_call` will still be a routine continuation of the lead's current plan (more reading, running checks, or the planned small edits) — not a new design decision, not a fix attempt for a new failure, not drifting from what the lead would do." },
+};
+
 /** All six questions — asked for every helper tool call. */
 export const CALL_QUESTIONS: JevQuestions = Q;
 /** Turn boundary: who should work next. */

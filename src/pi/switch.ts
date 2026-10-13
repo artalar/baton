@@ -13,9 +13,9 @@ import { Type } from "typebox";
 import { decide, type JevQuestions, type JevResult } from "../core/jev.ts";
 import { openRouterComplete, openRouterModelId } from "../core/openrouter.ts";
 import { parseModelRef } from "./config.ts";
-import { buildState, buildSummary, CALL_QUESTIONS, callSummary, gateFromAnswers, recordCall, summaryPrompt, SPEC_QUESTIONS, TURN_QUESTIONS, turnJevFromAnswers, type TurnJev } from "./jev-policy.ts";
+import { buildState, buildSummary, CALL_QUESTIONS, callSummary, gateFromAnswers, recordCall, summaryPrompt, SPEC_CONT_QUESTIONS, SPEC_EST_QUESTIONS, SPEC_QUESTIONS, TURN_QUESTIONS, turnJevFromAnswers, type TurnJev } from "./jev-policy.ts";
 import { classifyEffects, diffSnaps, revertTo, type Snap, snapshot } from "./fsguard.ts";
-import { addCost, anchorCache, applyJevGate, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_EDIT_TOOL_NOTE, LEAD_INTENT_NOTE, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
+import { addCost, anchorCache, applyJevGate, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_EDIT_TOOL_NOTE, LEAD_INTENT_NOTE, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, specEstimate, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
 
 /** Test files under cwd (skips node_modules, dot dirs, dist). */
 export function hasTestFiles(dir: string, depth = 5): boolean {
@@ -89,6 +89,18 @@ export function loadSwitchConfig(cwd: string): SwitchConfig & { journalDir: stri
 	else if (be === "tool") Object.assign(over, { editTool: true });
 	// 0.13: BATON_SPEC=1 → speculative execution mode (lead ⇄ spec only)
 	if (process.env.BATON_SPEC === "1" || process.env.BATON_SPEC === "on") over.spec = { ...DEFAULT_SWITCH.spec, ...((over.spec as object) ?? {}), enabled: true };
+	// 0.13.1: length-control variants, each its own flag; BATON_SPEC_V2=1 turns all five on
+	{
+		const all = process.env.BATON_SPEC_V2 === "1";
+		const on = (k: string) => all || process.env[k] === "1";
+		const sp = (over.spec ?? { ...DEFAULT_SWITCH.spec }) as SwitchConfig["spec"];
+		if (on("BATON_SPEC_GATE")) sp.gate = { ...DEFAULT_SWITCH.spec.gate, ...(sp.gate ?? {}), on: true };
+		if (on("BATON_SPEC_STOPS")) sp.freeStops = true;
+		if (on("BATON_SPEC_EST")) sp.estimate = true;
+		if (on("BATON_SPEC_PHASE")) sp.phase = true;
+		if (on("BATON_SPEC_ADAPT")) sp.adapt = { ...DEFAULT_SWITCH.spec.adapt, ...(sp.adapt ?? {}), on: true };
+		over.spec = { ...DEFAULT_SWITCH.spec, ...sp };
+	}
 	// 0.12.1: BATON_READ=tool (default) | off
 	if (process.env.BATON_READ === "off" || process.env.BATON_READ === "0") Object.assign(over, { readTool: false });
 	return { ...DEFAULT_SWITCH, ...over, jev, journalDir };
@@ -454,13 +466,31 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			}
 		}
 		let specP: number | undefined;
+		let specEst: number | undefined;
 		if (cfg!.spec.enabled && from === "lead" && realCalls.length && cfg!.jev.enabled) {
 			const last = realCalls[realCalls.length - 1]!;
-			const r = await askJev("turn", SPEC_QUESTIONS, { model: cfg!.lead, call: `(lead turn boundary — latest call) ${callSummary(last)}` });
+			const qs = cfg!.spec.estimate && (st.specCooldown ?? 0) === 0 ? { ...SPEC_QUESTIONS, ...SPEC_EST_QUESTIONS } : SPEC_QUESTIONS;
+			const r = await askJev("turn", qs, { model: cfg!.lead, call: `(lead turn boundary — latest call) ${callSummary(last)}` });
 			if (r) {
-				const a = r.answers.more_calls;
-				specP = a?.type === "noul" ? a.noul : undefined;
-				log("jev", { point: "spec", phase: from, pMore: specP, lat: Math.round(r.latMs), cost: r.usage.cost ?? 0, model: r.model, cached: r.cached, fallback: false });
+				const nv = (k: string) => {
+					const a = r.answers[k];
+					return a?.type === "noul" ? a.noul : undefined;
+				};
+				specP = nv("more_calls");
+				specEst = specEstimate(nv("more_3"), nv("more_6"), nv("more_10"));
+				log("jev", { point: "spec", phase: from, pMore: specP, est: specEst, p3: nv("more_3"), p6: nv("more_6"), p10: nv("more_10"), cap: st.specCap, lat: Math.round(r.latMs), cost: r.usage.cost ?? 0, model: r.model, cached: r.cached, fallback: false });
+			}
+		}
+		// 0.13.1 v1: before every speculative step after the free ones, Jev decides whether to go on
+		let specCont: number | undefined;
+		const run = st.specRun;
+		if (cfg!.spec.enabled && cfg!.spec.gate.on && from === "spec" && run && !run.stop && realCalls.length && run.steps + 1 >= cfg!.spec.gate.free && run.steps + 1 < run.n && cfg!.jev.enabled) {
+			const last = realCalls[realCalls.length - 1]!;
+			const r = await askJev("turn", SPEC_CONT_QUESTIONS, { model: cfg!.helper, call: `(speculative helper step ${run.steps + 1}/${run.n}) ${callSummary(last)}` });
+			if (r) {
+				const a = r.answers.cont;
+				specCont = a?.type === "noul" ? a.noul : undefined;
+				log("jev", { point: "spec_cont", phase: from, step: run.steps + 1, pCont: specCont, lat: Math.round(r.latMs), cost: r.usage.cost ?? 0, model: r.model, cached: r.cached, fallback: false });
 			}
 		}
 		refreshSummaryText();
@@ -474,7 +504,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			}
 		};
 		const autoCheck = () => runChecks(ctx.cwd, log);
-		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, jev, specP, budgetLeft, diffFull, autoCheck, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
+		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, jev, specP, specEst, specCont, budgetLeft, diffFull, autoCheck, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
 		const entries: SessionBoundaryDraft[] = [];
 		if (d.reason && d.to === from && d.continue) log(d.message ? "nudge" : "retry", { phase: from, reason: d.reason });
 		if (d.to !== from) {
