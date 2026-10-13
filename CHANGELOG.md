@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1 — 2026-10-13
+- **No allowlist in reading phases**: the helper may run any bash/tool while reading. A **file-system guard** (`src/pi/fsguard.ts`) snapshots the working tree before and after every helper call that can write (and every lead bash): HEAD + `git status --porcelain=v2 -z -uall` (node_modules/.git excluded) + size/mtime of dirty/untracked paths + node_modules mtime; in reading phases also the contents of dirty/untracked files. Overhead ≈2.6–3 ms per snapshot (≈5–6 ms per call) on the tetris repos. Journal `fs_guard` per call, `fs_guard_stats` at the end.
+- **Changes during reading are reverted**: clean tracked files from the index, dirty/untracked files from the saved contents (mtime restored), files created by the call removed (with emptied dirs); a backup (copies + `changes.patch`) goes to `<journalDir>/fsguard/<ts>-<id>/`. The call is dropped from history (both views) and the lead takes over with an honest `[Baton harness] File-system guard` note in its report.
+- **Not reverted**: package installs (`npm/pnpm/yarn/bun i|add|ci`, `npx`) are recorded only (no handover by themselves); package.json/lockfiles/node_modules changes, HEAD moves (`git commit/reset/checkout …`), downloads, `rm/mv/cp` with absolute paths are reported as NOT reverted and the lead decides.
+- **"The lead only reads" = two consecutive lead turns** whose calls are all read-like (read tools, read-only bash, or bash the guard saw change nothing) → helper follow-up reads. Replaces the "≥2 read calls in one turn" rule (arm E: 12 single-read Opus turns).
+- **Thinking cap on read-only lead turns while planning is pending**: full thinking only on the first lead turn after a handoff and on turns following a non-read turn; after a read-only lead turn the next request gets the reasoning cap and the non-write `max_tokens`.
+
 ## 0.8.0 — 2026-10-13
 Switch mode, after the arm-D independent review (section 5):
 - **Verify detection on executed commands only**: heredoc bodies and quoted strings (`node -e '…'`) are stripped, only command starts / segments after `&&` `||` `;` `|` newlines count (`executedSegments`, `verifyKinds`). The arm-D T18 scaffolding command (fixture) is no longer a verify run.

@@ -30,9 +30,9 @@ describe("state machine", () => {
 	it("reading → lead when the helper stops reading or tries to edit; planning gets full thinking once", () => {
 		const s = initialSwitchState(0);
 		expect(decideTurn(s, turn({ calls: [c("r1", "read", { path: "a.md" })] }), cfg).to).toBe("read");
-		const g = gateCall(s, c("e1", "edit", { path: "x" }), () => true);
-		expect(g?.block).toBe(true);
-		s.blocked.push("e1");
+		expect(gateCall(s, c("e1", "edit", { path: "x" }), () => true)).toBeUndefined(); // 0.8.1: any tool; the fs guard reverts
+		s.wantLead = "helper changed the working tree during reading (fs guard)";
+		s.dropped.push("e1");
 		const d = decideTurn(s, turn({ calls: [c("e1", "edit")] }), cfg);
 		expect(d.to).toBe("lead");
 		expect(d.message?.audience).toBe("lead");
@@ -56,7 +56,8 @@ describe("state machine", () => {
 		expect(d.to).toBe("followup");
 		expect(d.message?.text).toContain("src/x.ts");
 		decideTurn(s, turn({ text: "READ DONE" }), cfg);
-		expect(decideTurn(s, turn({ calls: [c("a", "read", { path: "a" }), c("b", "read", { path: "b" })] }), cfg).to).toBe("followup");
+		expect(decideTurn(s, turn({ calls: [c("a", "read", { path: "a" }), c("b", "read", { path: "b" })] }), cfg).to).toBe("lead"); // one read turn
+		expect(decideTurn(s, turn({ calls: [c("b2", "bash", { command: "rg atom src" })] }), cfg).to).toBe("followup"); // 2nd consecutive
 		decideTurn(s, turn({ text: "READ DONE" }), cfg);
 		expect(decideTurn(s, turn({ calls: [c("d2", "delegate_reads", { instruction: "more" })] }), cfg).to).toBe("lead"); // rounds exhausted
 		decideTurn(s, turn({ calls: [c("w", "write", { path: "a.ts" })] }), cfg);

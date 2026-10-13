@@ -225,6 +225,14 @@ export interface SwitchState {
 	wantLead?: string;
 	/** Helper calls blocked by the gate (removed from the lead's view). */
 	blocked: string[];
+	/** Calls removed from every view (helper changes reverted by the fs guard in a reading phase). */
+	dropped: string[];
+	/** Bash calls whose fs-guard snapshot showed no change (read-like). */
+	noChange: string[];
+	/** Consecutive lead turns with only read-like calls. */
+	leadReadTurns: number;
+	/** fs-guard notes of the current helper stretch (reverted / not reverted changes, installs). */
+	stretchGuard: string[];
 	/** Read calls seen: id → normalised path (for dedup at compaction). */
 	reads: [string, string][];
 	/** Read calls of the current helper stretch (only these may be compacted: older content is in the lead's prompt cache). */
@@ -272,6 +280,10 @@ export function initialSwitchState(now: number): SwitchState {
 		lastLeadWrote: false,
 		lastLeadLength: false,
 		blocked: [],
+		dropped: [],
+		noChange: [],
+		leadReadTurns: 0,
+		stretchGuard: [],
 		reads: [],
 		stretchReads: [],
 		stretchVerifies: [],
@@ -299,7 +311,7 @@ export const LEAD_SYSTEM_NOTE = `
 This session runs under Baton: a cheaper helper model may perform some steps (reading, running checks and small fixes, final review); you will then see an honest "[Baton harness]" report of what it did. Available harness tools: baton_delegate({kind:"reads"|"debug", instruction}) hands file reading, or the verify/fix loop, to the helper; baton_optimize({}) drops superseded read outputs from your context (one cache rewrite). delegate_reads({instruction}) = baton_delegate kind "reads".`;
 
 export const MSG = {
-	read: "[baton switch → helper: reading] Explore the repository and the project skills with read-only tools (read, ls, grep, find, or read-only bash such as cat/ls/rg/git log). Read everything the lead model will need to plan and write the code. Do NOT write code, edit files or explain at length. When you have read enough, reply only: READ DONE.",
+	read: "[baton switch → helper: reading] Explore the repository and the project skills (read, ls, grep, find, any bash that inspects — e.g. cat/rg/git log, `node -e` to inspect an installed API). Any change to project files is detected, reverted and ends your stretch. Read everything the lead model will need to plan and write the code. Do NOT write code, edit files or explain at length. When you have read enough, reply only: READ DONE.",
 	followup: (instr: string) =>
 		`[baton switch → helper: follow-up reads] The lead model asks you to read: ${instr}\nUse read-only tools only, read exactly what is needed, do not explain. Then reply only: READ DONE.`,
 	debug:
@@ -478,11 +490,8 @@ export function guardCheck(c: Call, readFile: (p: string) => string | undefined 
 export function gateCall(s: SwitchState, c: Call, fileExists: (p: string) => boolean, readFile?: (p: string) => string | undefined): { block: true; reason: string } | undefined {
 	if (!isHelper(s.phase)) return undefined;
 	if ((BATON_TOOLS as readonly string[]).includes(c.name)) return { block: true, reason: `${c.name} is for the lead model only.` };
-	if (s.phase === "read" || s.phase === "followup") {
-		if (isReadOnly(c)) return undefined;
-		s.wantLead = `helper tried ${c.name} in the reading phase`;
-		return { block: true, reason: "Reading phase: only read-only tools. The lead model takes over now; stop and reply READ DONE." };
-	}
+	// reading phases: any tool is allowed; the fs guard (src/pi/fsguard.ts) reverts file changes and hands over
+	if (s.phase === "read" || s.phase === "followup") return undefined;
 	// debug / review: no new files
 	if (c.name === "write") {
 		const p = c.args.path ?? c.args.file_path;
@@ -514,7 +523,7 @@ const oneLine = (t: string, n = 140) => t.replace(/\s+/g, " ").trim().slice(0, n
  */
 export function harnessReport(s: SwitchState, from: Phase, why: string, cfg: SwitchConfig, diffStat?: string): string {
 	if (from === "read" || from === "followup") {
-		if (!s.stretchOutputs.length) return `[Baton harness] Reading was intercepted and performed by automation (helper model); it read nothing useful. (${why})`;
+		if (!s.stretchOutputs.length) return `[Baton harness] Reading was intercepted and performed by automation (helper model); it read nothing useful. (${why})${guardNotes(s)}`;
 		let budget = cfg.reportChars;
 		const parts: string[] = [];
 		for (const o of s.stretchOutputs) {
@@ -526,7 +535,7 @@ export function harnessReport(s: SwitchState, from: Phase, why: string, cfg: Swi
 			budget -= body.length;
 			parts.push(`--- ${o.label} ---\n${body}`);
 		}
-		return `[Baton harness] Reading was intercepted and performed by automation (helper model), not by you. Its read-only tool outputs follow (${s.stretchOutputs.length}):\n${parts.join("\n")}`;
+		return `[Baton harness] Reading was intercepted and performed by automation (helper model), not by you. Its tool outputs follow (${s.stretchOutputs.length}):\n${parts.join("\n")}${guardNotes(s)}`;
 	}
 	const checks = Object.entries(s.stretchChecks)
 		.map(([k, v]) => `$ ${oneLine(v!.cmd, 160)}  → ${k}: ${v!.ok ? "PASS" : "FAIL"}\n${tail(v!.tail, 1200)}`)
@@ -541,7 +550,11 @@ export function harnessReport(s: SwitchState, from: Phase, why: string, cfg: Swi
 		`Helper edits (one line each):\n${edits || "(none)"}`,
 		`SUSPICIOUS EDITS (guardrail flags):\n${flags || "(none)"}`,
 		`Helper's last note: ${oneLine(s.lastHelperText, 600) || "(none)"}`,
-	].join("\n\n");
+	].join("\n\n") + guardNotes(s);
+}
+
+function guardNotes(s: SwitchState): string {
+	return s.stretchGuard.length ? `\n\n[Baton harness] File-system guard during this stretch:\n${s.stretchGuard.map((x) => `- ${x}`).join("\n")}` : "";
 }
 
 function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: SwitchConfig): Decision {
@@ -566,6 +579,8 @@ function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: Sw
 	s.stretchEdits = [];
 	s.stretchChecks = {};
 	s.stretchFlags = [];
+	s.stretchGuard = [];
+	s.leadReadTurns = 0;
 	s.lastHelperText = "";
 	s.wantLead = undefined;
 	s.editedSinceVerify = false;
@@ -582,7 +597,7 @@ function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: Sw
 /** Pure: the switch decision at a turn boundary. Mutates `s` (callers own it). */
 export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = DEFAULT_SWITCH): Decision {
 	const resById = new Map(inp.results.map((r) => [r.id, r]));
-	const blocked = new Set(s.blocked);
+	const blocked = new Set([...s.blocked, ...s.dropped]);
 	const real = inp.calls.filter((c) => !blocked.has(c.id));
 	const helper = isHelper(s.phase);
 	for (const c of real) {
@@ -641,7 +656,7 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 				s.stretchEdits.push({ path, intent: `${said || `${c.name} (${pairs.length} replacement(s))`}${r?.isError ? " [edit failed]" : ""} [${delta >= 0 ? "+" : ""}${delta} lines]` });
 			} else s.leadEditsInStretch++;
 		}
-		if (helper && (s.phase === "read" || s.phase === "followup") && isReadOnly(c) && r) {
+		if (helper && (s.phase === "read" || s.phase === "followup") && !isEdit(c) && r) {
 			const label = readPath(c) ?? (c.name === "bash" ? `$ ${oneLine(String(c.args.command ?? ""), 200)}` : `${c.name} ${oneLine(JSON.stringify(c.args), 200)}`);
 			s.stretchOutputs.push({ label, text: r.text });
 		}
@@ -734,8 +749,11 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 				if (dbg.args.instruction) d.message = { audience: "helper", text: `${MSG.debug}\nThe lead model adds: ${String(dbg.args.instruction)}` };
 				return d;
 			}
-			const reads = real.filter((c) => isReadOnly(c));
-			if (real.length >= 2 && reads.length === real.length && s.followups < cfg.maxFollowups) {
+			// "the lead only reads": two consecutive lead turns whose calls are all read-like
+			// (read tools, read-only bash, or bash the fs guard saw change nothing) → the helper reads instead
+			const readLike = (c: Call) => !isEdit(c) && !isVerify(c) && !(BATON_TOOLS as readonly string[]).includes(c.name) && (isReadOnly(c) || s.noChange.includes(c.id));
+			s.leadReadTurns = real.length && real.every(readLike) ? s.leadReadTurns + 1 : 0;
+			if (s.leadReadTurns >= 2 && s.followups < cfg.maxFollowups) {
 				s.followups++;
 				const d = to(s, inp, "followup", `lead issued only reads (round ${s.followups})`, cfg);
 				d.message = { audience: "helper", text: MSG.followup("continue the lead's reads above and anything they obviously lead to") };
@@ -776,8 +794,10 @@ function hasLeadCode(s: SwitchState): boolean {
 }
 
 /** Pure: which request shaping a lead request gets. */
-export function leadRequestPlan(s: Pick<SwitchState, "phase" | "planningLeft" | "lastLeadWrote" | "lastLeadLength">, cfg: SwitchConfig): { planning: boolean; capReasoning: boolean; maxTokens: number } {
-	const planning = s.phase === "lead" && s.planningLeft > 0;
+export function leadRequestPlan(s: Pick<SwitchState, "phase" | "planningLeft" | "lastLeadWrote" | "lastLeadLength" | "leadReadTurns">, cfg: SwitchConfig): { planning: boolean; capReasoning: boolean; maxTokens: number } {
+	// planning (full thinking) is pending until the first write, but read-only turns meanwhile stay capped:
+	// after a read-only lead turn the next one is predicted read-only too (arm E: 12 uncapped read turns)
+	const planning = s.phase === "lead" && s.planningLeft > 0 && !(s.leadReadTurns > 0);
 	const expectWrite = s.lastLeadWrote || s.lastLeadLength;
 	const capOut = !planning && !expectWrite && cfg.nonWriteMaxTokens > 0 && (s.phase === "final" || s.phase === "lead");
 	return { planning, capReasoning: !planning && cfg.thinkingCap > 0, maxTokens: capOut ? Math.min(cfg.leadMaxTokens, Math.max(cfg.nonWriteMaxTokens, cfg.thinkingCap + 2048)) : cfg.leadMaxTokens };
@@ -824,9 +844,9 @@ function isEmptyAssistant(m: Msg): boolean {
  * - for the lead: helper assistant messages and their tool results are dropped entirely (honest handoff: the
  *   lead's instruction carries a [Baton harness] report instead); blocked calls and helper instructions vanish.
  */
-export function shapeContext<T extends Msg>(messages: readonly T[], s: Pick<SwitchState, "stubs" | "clips" | "blocked">, forLead: boolean, leadModelId: string): T[] {
+export function shapeContext<T extends Msg>(messages: readonly T[], s: Pick<SwitchState, "stubs" | "clips" | "blocked"> & { dropped?: string[] }, forLead: boolean, leadModelId: string): T[] {
 	const blocked = new Set(s.blocked);
-	const dropped = new Set<string>();
+	const dropped = new Set<string>(s.dropped ?? []);
 	const out: T[] = [];
 	for (const m of messages) {
 		if (isEmptyAssistant(m)) continue;
@@ -837,8 +857,16 @@ export function shapeContext<T extends Msg>(messages: readonly T[], s: Pick<Swit
 			for (const b of (Array.isArray(m.content) ? m.content : []) as Block[]) if (b.type === "toolCall" && b.id) dropped.add(b.id);
 			continue;
 		}
+		if (!forLead && m.role === "assistant" && s.dropped?.length) {
+			const all = (Array.isArray(m.content) ? m.content : []) as Block[];
+			const kept = all.filter((b) => !(b.type === "toolCall" && b.id && dropped.has(b.id)));
+			if (kept.length !== all.length) {
+				if (kept.some((b) => b.type === "toolCall" || (b.type === "text" && b.text?.trim()))) out.push({ ...m, content: kept });
+				continue;
+			}
+		}
 		if (m.role === "toolResult" && m.toolCallId) {
-			if (forLead && (dropped.has(m.toolCallId) || blocked.has(m.toolCallId))) continue;
+			if (dropped.has(m.toolCallId) || (forLead && blocked.has(m.toolCallId))) continue;
 			const st = s.stubs[m.toolCallId];
 			const clip = s.clips[m.toolCallId];
 			if (st) {

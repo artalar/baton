@@ -11,7 +11,8 @@ import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseModelRef } from "./config.ts";
-import { addCost, anchorCache, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
+import { classifyEffects, diffSnaps, revertTo, type Snap, snapshot } from "./fsguard.ts";
+import { addCost, anchorCache, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
 
 /** Test files under cwd (skips node_modules, dot dirs, dist). */
 export function hasTestFiles(dir: string, depth = 5): boolean {
@@ -61,6 +62,8 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	let afterHelper = false;
 	let budgetStopped = false;
 	let cwd = "";
+	const pending = new Map<string, { pre: Snap; helper: boolean; phase: SwitchState["phase"]; name: string; command: string }>();
+	const guardMs: number[] = [];
 
 	const leadId = () => parseModelRef(cfg!.lead)!.id;
 	const log = (kind: string, data: Record<string, unknown>) => {
@@ -138,6 +141,48 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			log(g.reason.startsWith("Baton guardrail") ? "guardrail" : "blocked", { phase: st.phase, tool: c.name, reason: g.reason, args: JSON.stringify(c.args).slice(0, 300) });
 			return g;
 		}
+		// fs guard: snapshot before every helper call that can change files, and before lead bash calls (read-like detection)
+		const helper = isHelper(st.phase);
+		const mayWrite = !["read", "grep", "find", "ls", "glob"].includes(c.name);
+		if (mayWrite && (helper || c.name === "bash")) {
+			const reading = st.phase === "read" || st.phase === "followup";
+			pending.set(c.id, { pre: snapshot(ctx.cwd, { contents: helper && reading }), helper, phase: st.phase, name: c.name, command: typeof c.args.command === "string" ? c.args.command : "" });
+		}
+		return undefined;
+	});
+
+	pi.on("tool_result", (e, ctx) => {
+		const p = pending.get(e.toolCallId);
+		if (!p || !st) return undefined;
+		pending.delete(e.toolCallId);
+		const post = snapshot(ctx.cwd);
+		const d = diffSnaps(p.pre, post);
+		const ms = p.pre.ms + post.ms;
+		guardMs.push(ms);
+		const changed = d.changed.length > 0 || d.headChanged || d.nodeModulesChanged;
+		if (!changed) {
+			if (!p.helper && p.name === "bash") st.noChange.push(e.toolCallId);
+			log("fs_guard", { phase: p.phase, tool: p.name, ms: Math.round(ms * 10) / 10, changed: false });
+			return undefined;
+		}
+		const segs = p.command ? executedSegments(p.command) : [];
+		const cls = classifyEffects(d, segs);
+		const reading = p.phase === "read" || p.phase === "followup";
+		let reverted: ReturnType<typeof revertTo> | undefined;
+		if (p.helper && reading) {
+			if (cls.install) st.stretchGuard.push(`package install recorded, NOT reverted: \`${p.command.slice(0, 160)}\`${cls.keep.length ? ` (changed: ${cls.keep.join(", ")})` : ""}`);
+			if (cls.revert.length) {
+				reverted = revertTo(ctx.cwd, p.pre, cls.revert, join(dir, "fsguard", `${Date.now()}-${e.toolCallId.replace(/[^\w-]/g, "_")}`));
+				st.dropped.push(e.toolCallId);
+				st.stretchGuard.push(
+					`the helper's ${p.name} call${p.command ? ` \`${p.command.slice(0, 160)}\`` : ""} changed files during reading; reverted and removed from history: ${[...reverted.restored, ...reverted.removed].join(", ") || "-"}${reverted.failed.length ? `; could NOT revert: ${reverted.failed.join(", ")}` : ""} (backup: ${reverted.backupDir})`,
+				);
+			}
+			if (cls.nonIdempotent.length) st.stretchGuard.push(`non-revertible effects, NOT reverted — you decide: ${cls.nonIdempotent.join("; ")}${cls.keep.length && !cls.install ? ` (changed: ${cls.keep.join(", ")})` : ""}`);
+			else if (cls.keep.length && !cls.install) st.stretchGuard.push(`changed and NOT reverted (package manifest / lockfile): ${cls.keep.join(", ")}`);
+			if (cls.revert.length || cls.nonIdempotent.length || (cls.keep.length && !cls.install)) st.wantLead = "helper changed the working tree during reading (fs guard)";
+		}
+		log("fs_guard", { phase: p.phase, tool: p.name, ms: Math.round(ms * 10) / 10, changed: true, files: d.changed.slice(0, 30), headChanged: d.headChanged, nodeModulesChanged: d.nodeModulesChanged, install: cls.install, nonIdempotent: cls.nonIdempotent, reverted, kept: cls.keep });
 		return undefined;
 	});
 
@@ -229,6 +274,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", () => {
+		if (guardMs.length) log("fs_guard_stats", { calls: guardMs.length, avgMs: Math.round((guardMs.reduce((a, b) => a + b, 0) / guardMs.length) * 10) / 10, maxMs: Math.round(Math.max(...guardMs) * 10) / 10 });
 		if (st) log("end", { phase: st.phase, costs, metrics: st.metrics, flags: st.flags, budget: budgetSpend(costs, leadId(), cfg!.helperCostFactor), budgetStopped });
 		summary();
 	});
