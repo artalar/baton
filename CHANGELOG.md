@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.0
+
+- **Speculative execution mode** (`BATON_SPEC=1` or `switch.spec.enabled`; off by default, other modes unchanged). Opus leads; after each lead turn with tool calls Jev answers `more_calls` ("will the lead make more tool calls after this one?"). If p ≥ `thr` the call runs as usual, then GLM continues in the same session for N steps with no fsguard, guardrails, Jev call gate or phases. After N steps, or when GLM stops, the harness cuts it off and gives control back to Opus with a `[Baton harness] … speculatively continued …` summary: the calls with ok/ERROR and an output line, the files touched, git diff --stat, the last check and the helper's last note. GLM turns are hidden from the lead view. Cooldown: 1 lead turn between runs.
+- **N and threshold:** adaptive. p ≥ 0.93 → 8 steps; 0.8 ≤ p < 0.93 → 4 steps; below that, none. Offline data: P(next Opus turn has calls) is 0.98 for A, 0.97 for J2 and 1.0 for J3, so series length does not limit N; drift does. Model on A (47 turns, $0.057/turn; GLM step $0.0026; summary $0.012; ~1.8 GLM steps per Opus turn):
+  - Savings: N=4 saves 36–47 %, N=8 saves 44–58 %, N=12 saves 46–62 %.
+  - P(drift within a run) at N=8 is 0.34–0.57; past 8 the gain is ≤ 3 p.p. and drift goes above 50 %.
+- Config: `spec {enabled, thr, thrHigh, nLow, nHigh, cooldown, summaryChars}`. Tests: `test/spec.test.ts`.
+
 ## 0.12.3
 
 - The lead prompt and the `baton_read` / `baton_edit` descriptions now state the key advantage: both run the helper **inside this session with the lead's full context** (task, files read, decisions, history). A short request is therefore enough, unlike a subagent that starts empty and needs a long brief.

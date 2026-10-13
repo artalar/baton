@@ -41,6 +41,12 @@ export const Q = {
 	routine_ahead: { type: "noul", instructions: "The next five tool calls after `proposed_call` will most likely be routine reads, searches or test/build runs, with no file edits." },
 } as const satisfies JevQuestions;
 
+/** 0.13 speculative mode: asked after every lead turn with tool calls. Not part of CALL_QUESTIONS. */
+export const SPEC_QUESTIONS: JevQuestions = {
+	more_calls: { type: "noul", instructions: "After `proposed_call` (the agent's latest tool call) the agent will make more tool calls before it gives its final answer — the task is not finished yet." },
+	routine_ahead: Q.routine_ahead,
+};
+
 /** All six questions — asked for every helper tool call. */
 export const CALL_QUESTIONS: JevQuestions = Q;
 /** Turn boundary: who should work next. */

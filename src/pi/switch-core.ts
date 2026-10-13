@@ -6,8 +6,8 @@
 
 import { DEFAULT_JEV, initialTrack, type JevConfig, type JevTrack, type TurnJev } from "./jev-config.ts";
 
-export type Phase = "read" | "lead" | "followup" | "implement" | "debug" | "review" | "final" | "done";
-export const HELPER_PHASES: readonly Phase[] = ["read", "followup", "implement", "debug", "review"];
+export type Phase = "read" | "lead" | "followup" | "implement" | "debug" | "review" | "final" | "done" | "spec";
+export const HELPER_PHASES: readonly Phase[] = ["read", "followup", "implement", "debug", "review", "spec"];
 export const isHelper = (p: Phase) => HELPER_PHASES.includes(p);
 
 export interface SwitchConfig {
@@ -27,6 +27,12 @@ export interface SwitchConfig {
 	editIntents: boolean;
 	/** 0.12: the lead edits through the baton_edit tool (BATON_EDIT=tool, default in switch). */
 	editTool: boolean;
+	/**
+	 * 0.13 speculative execution (BATON_SPEC=1): after a lead turn with tool calls Jev estimates
+	 * P(more tool calls follow); p ≥ thrHigh → the helper continues for nHigh steps, p ≥ thr → nLow steps,
+	 * with no phases / guardrails / fs guard. Then the lead gets a summary. cooldown = lead turns between runs.
+	 */
+	spec: { enabled: boolean; thr: number; thrHigh: number; nLow: number; nHigh: number; cooldown: number; summaryChars: number };
 	/** 0.12.1: the lead reads through the baton_read tool. */
 	readTool: boolean;
 	/** 0.12.1: max baton_read calls per session (then the lead reads itself). */
@@ -85,6 +91,7 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	maxImplementMs: 0,
 	editIntents: true,
 	editTool: true,
+	spec: { enabled: false, thr: 0.8, thrHigh: 0.93, nLow: 4, nHigh: 8, cooldown: 1, summaryChars: 6000 },
 	readTool: true,
 	maxReadTool: 8,
 	maxIntentFailures: 2,
@@ -312,6 +319,10 @@ export interface SwitchState {
 	pendingEdit?: { id: string; request: string };
 	/** 0.12: baton_edit stats. */
 	editTool?: { calls: number; ok: number; failed: number };
+	/** 0.13 speculative runs. */
+	specRun?: { n: number; steps: number; p: number; calls: { name: string; arg: string; ok: boolean; out: string }[]; note: string };
+	specCooldown?: number;
+	specStats?: { runs: number; steps: number; skipped: number };
 	/** 0.12.1: the open baton_read call and stats. */
 	pendingRead?: { id: string; request: string };
 	readTool?: { calls: number; chars: number };
@@ -432,6 +443,8 @@ export const MSG = {
 };
 
 export interface TurnInput {
+	/** 0.13: Jev P(more tool calls follow the lead's latest call). */
+	specP?: number;
 	turn: number;
 	now: number;
 	text: string;
@@ -632,6 +645,7 @@ export function applyJevGate(s: SwitchState, c: Call, d: { action: "allow" | "al
 /** Pure: the tool_call gate — deterministic rules only. */
 export function gateCallRules(s: SwitchState, c: Call, fileExists: (p: string) => boolean, readFile?: (p: string) => string | undefined): { block: true; reason: string } | undefined {
 	if (!isHelper(s.phase)) return undefined;
+	if (s.phase === "spec") return undefined; // 0.13: speculative runs are not policed (by design)
 	if ((BATON_TOOLS as readonly string[]).includes(c.name)) return { block: true, reason: `${c.name} is for the lead model only.` };
 	// reading phases: edit tools are blocked up front (arm J2: Jev's "routine ahead" sent the helper to a
 	// follow-up, it started implementing, the fs guard reverted it and ended the stretch 5 times). Bash stays
@@ -887,11 +901,97 @@ export function intentFiles(intent: string): string[] {
 	return [...new Set(line.split(/[\s,;]+/).map((x) => x.replace(/[`'"()]/g, "")).filter((x) => /[\w-]+\.[\w]+$|\//.test(x)))];
 }
 
+/** Pure (0.13): the number of speculative helper steps for Jev's P(more calls); 0 = no speculation. */
+export function specSteps(p: number | undefined, c: SwitchConfig["spec"]): number {
+	if (p === undefined || !Number.isFinite(p)) return 0;
+	return p >= c.thrHigh ? c.nHigh : p >= c.thr ? c.nLow : 0;
+}
+
+const specArg = (c: Call) => {
+	const a = c.args;
+	const v = a.command ?? a.path ?? a.file_path ?? a.pattern ?? a.request ?? a.instruction ?? "";
+	return String(v).replace(/\s+/g, " ").slice(0, 160);
+};
+
+/** Pure (0.13): the "[Baton harness]" insert the lead sees after a speculative run. */
+export function specSummary(run: NonNullable<SwitchState["specRun"]>, why: string, diffStat: string | undefined, maxChars: number): string {
+	const lines = run.calls.map((c, i) => `${i + 1}. ${c.name} ${c.arg ? `\`${c.arg}\`` : ""} → ${c.ok ? "ok" : "ERROR"}${c.out ? ` | ${c.out}` : ""}`);
+	const edited = [...new Set(run.calls.filter((c) => c.name === "write" || c.name === "edit").map((c) => c.arg))];
+	const checks = [...run.calls].reverse().find((c) => c.name === "bash" && /\b(tsc|vitest|jest|test|build|typecheck)\b/.test(c.arg));
+	let body = [
+		`[Baton harness] To save your context, the harness speculatively continued your work with a helper model (same session, it saw everything you saw): ${run.steps} step(s), ${run.calls.length} tool call(s) after your last tool call (${why}). These actions were taken by automation, not by you; verify anything that matters before relying on it.`,
+		`Tool calls:\n${lines.join("\n") || "(none)"}`,
+		`Files written/edited by the helper: ${edited.join(", ") || "none"}`,
+		`Working tree now (git diff --stat vs HEAD):\n${diffStat?.trim() || "(unavailable)"}`,
+		checks ? `Last check run: \`${checks.arg}\` → ${checks.ok ? "exit 0" : "FAILED"}${checks.out ? ` | ${checks.out}` : ""}` : "Last check run: none in this run",
+		run.note ? `Helper's last note: ${run.note}` : "",
+		"Continue the task from here.",
+	]
+		.filter(Boolean)
+		.join("\n\n");
+	if (body.length > maxChars) body = `${body.slice(0, maxChars - 200)}\n[… summary clipped]\n\nContinue the task from here.`;
+	return body;
+}
+
+/** Pure (0.13): the speculative-mode decision (lead ⇄ spec only, no other phases). */
+export function decideSpec(s: SwitchState, inp: TurnInput, cfg: SwitchConfig, real: Call[]): Decision {
+	const c = cfg.spec;
+	s.specStats ??= { runs: 0, steps: 0, skipped: 0 };
+	const resById = new Map(inp.results.map((r) => [r.id, r]));
+	const go = (next: Phase, reason: string, message?: Decision["message"]): Decision => {
+		s.switches.push({ turn: inp.turn, from: s.phase, to: next, reason, ts: inp.now });
+		s.phase = next;
+		s.stretchStart = inp.now;
+		return { to: next, reason, message, continue: inp.calls.length === 0 && next !== "done" };
+	};
+	if (s.phase === "spec") {
+		const run = s.specRun!;
+		run.steps++;
+		s.specStats.steps++;
+		for (const x of real) {
+			const r = resById.get(x.id);
+			const out = (r?.text ?? "").trim();
+			const firstErr = out.split("\n").find((l) => /error|fail|✗|×/i.test(l));
+			run.calls.push({ name: x.name, arg: specArg(x), ok: !r?.isError, out: (firstErr ?? out.split("\n").filter(Boolean).slice(-1)[0] ?? "").slice(0, 200) });
+		}
+		const text = inp.text.trim();
+		if (text) run.note = text.replace(/\s+/g, " ").slice(0, 400);
+		if (!real.length || run.steps >= run.n) {
+			const why = !real.length ? "the helper stopped" : `step limit ${run.n}`;
+			s.specCooldown = c.cooldown;
+			const summary = specSummary(run, why, inp.diffStat?.(), c.summaryChars);
+			s.specRun = undefined;
+			const d = go("lead", `speculative run ended: ${why}`, { audience: "lead", text: summary });
+			d.continue = true;
+			return d;
+		}
+		return { to: "spec" };
+	}
+	// lead
+	if (!real.length) return go("done", "lead finished");
+	if ((s.specCooldown ?? 0) > 0) {
+		s.specCooldown!--;
+		return { to: "lead" };
+	}
+	const n = specSteps(inp.specP, c);
+	if (!n) {
+		s.specStats.skipped++;
+		return { to: "lead" };
+	}
+	s.specStats.runs++;
+	s.specRun = { n, steps: 0, p: inp.specP!, calls: [], note: "" };
+	return go("spec", `jev: P(more calls) ${inp.specP!.toFixed(2)} → speculative helper run, ${n} steps`, {
+		audience: "helper",
+		text: `[baton: speculative continuation] Continue the lead model's work from exactly where it stopped, as it would: next tool calls toward the user's task (up to ${n} steps). Do not restart, do not explain at length. If the task is finished or you are unsure what the lead intended next, stop and reply with one short line.`,
+	});
+}
+
 /** Pure: the switch decision at a turn boundary. Mutates `s` (callers own it). */
 export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = DEFAULT_SWITCH): Decision {
 	const resById = new Map(inp.results.map((r) => [r.id, r]));
 	const blocked = new Set([...s.blocked, ...s.dropped]);
 	const real = inp.calls.filter((c) => !blocked.has(c.id));
+	if (cfg.spec.enabled) return decideSpec(s, inp, cfg, real);
 	const helper = isHelper(s.phase);
 	for (const c of real) {
 		const p = readPath(c);
@@ -1172,6 +1272,8 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 		}
 		case "done":
 			return { to: "done" };
+		case "spec":
+			return decideSpec(s, inp, cfg, real);
 	}
 }
 

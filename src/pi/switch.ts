@@ -13,7 +13,7 @@ import { Type } from "typebox";
 import { decide, type JevQuestions, type JevResult } from "../core/jev.ts";
 import { openRouterComplete, openRouterModelId } from "../core/openrouter.ts";
 import { parseModelRef } from "./config.ts";
-import { buildState, buildSummary, CALL_QUESTIONS, callSummary, gateFromAnswers, recordCall, summaryPrompt, TURN_QUESTIONS, turnJevFromAnswers, type TurnJev } from "./jev-policy.ts";
+import { buildState, buildSummary, CALL_QUESTIONS, callSummary, gateFromAnswers, recordCall, summaryPrompt, SPEC_QUESTIONS, TURN_QUESTIONS, turnJevFromAnswers, type TurnJev } from "./jev-policy.ts";
 import { classifyEffects, diffSnaps, revertTo, type Snap, snapshot } from "./fsguard.ts";
 import { addCost, anchorCache, applyJevGate, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_EDIT_TOOL_NOTE, LEAD_INTENT_NOTE, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
 
@@ -87,6 +87,8 @@ export function loadSwitchConfig(cwd: string): SwitchConfig & { journalDir: stri
 	if (be === "intent") Object.assign(over, { editTool: false, editIntents: true });
 	else if (be === "off" || be === "0") Object.assign(over, { editTool: false, editIntents: false });
 	else if (be === "tool") Object.assign(over, { editTool: true });
+	// 0.13: BATON_SPEC=1 → speculative execution mode (lead ⇄ spec only)
+	if (process.env.BATON_SPEC === "1" || process.env.BATON_SPEC === "on") over.spec = { ...DEFAULT_SWITCH.spec, ...((over.spec as object) ?? {}), enabled: true };
 	// 0.12.1: BATON_READ=tool (default) | off
 	if (process.env.BATON_READ === "off" || process.env.BATON_READ === "0") Object.assign(over, { readTool: false });
 	return { ...DEFAULT_SWITCH, ...over, jev, journalDir };
@@ -208,6 +210,12 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		st = initialSwitchState(Date.now());
 		st.track.task = String((e as { prompt?: string }).prompt ?? "").slice(0, 400);
 		log("start", { lead: cfg!.lead, helper: cfg!.helper, config: { ...cfg } });
+		if (cfg!.spec.enabled) {
+			st.phase = "lead";
+			await setModelFor(ctx, "lead");
+			log("switch", { from: "-", to: "lead", reason: "speculative mode: the lead works, the helper continues speculatively" });
+			return undefined;
+		}
 		if (process.env.BATON_SWITCH_START === "lead") {
 			// resume (`pi -c`): the context already holds the earlier work — the lead continues directly
 			st.phase = "lead";
@@ -237,7 +245,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			return g;
 		}
 		// 0.9: Jev gates every helper call (after the deterministic rules; errors/timeouts → rules only)
-		if (isHelper(st.phase) && cfg!.jev.gateCalls) {
+		if (isHelper(st.phase) && st.phase !== "spec" && cfg!.jev.gateCalls) {
 			const phase = st.phase;
 			const r = await askJev("call", CALL_QUESTIONS, { model: cfg!.helper, call: callSummary(c) });
 			if (r && st.phase === phase) {
@@ -255,7 +263,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		// fs guard: snapshot before every helper call that can change files, and before lead bash calls (read-like detection)
 		const helper = isHelper(st.phase);
 		const mayWrite = !["read", "grep", "find", "ls", "glob"].includes(c.name);
-		if (mayWrite && (helper || c.name === "bash")) {
+		if (mayWrite && (helper || c.name === "bash") && st.phase !== "spec" && !cfg!.spec.enabled) {
 			const reading = st.phase === "read" || st.phase === "followup";
 			pending.set(c.id, { pre: snapshot(ctx.cwd, { contents: helper && reading }), helper, phase: st.phase, name: c.name, command: typeof c.args.command === "string" ? c.args.command : "" });
 		}
@@ -437,12 +445,22 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		// 0.9: Jev at the turn boundary (lead: routine ahead → helper; helper debug/review: stuck → lead)
 		let jev: TurnJev | undefined;
 		const realCalls = calls.filter((c) => !st!.blocked.includes(c.id) && !st!.dropped.includes(c.id));
-		if (cfg!.jev.gateTurns && realCalls.length && !st.wantLead && (from === "lead" || from === "debug" || from === "review")) {
+		if (cfg!.jev.gateTurns && !cfg!.spec.enabled && realCalls.length && !st.wantLead && (from === "lead" || from === "debug" || from === "review")) {
 			const last = realCalls[realCalls.length - 1]!;
 			const r = await askJev("turn", TURN_QUESTIONS, { model: isHelper(from) ? cfg!.helper : cfg!.lead, call: `(turn boundary — last call of the turn) ${callSummary(last)}` });
 			if (r) {
 				jev = turnJevFromAnswers(r.answers);
 				log("jev", { point: "turn", phase: from, probs: jev, consecutiveNonWrite: st.track.consecutiveNonWrite, lat: Math.round(r.latMs), cost: r.usage.cost ?? 0, model: r.model, cached: r.cached, fallback: false, fallbackModel: r.attempt === "fallback" });
+			}
+		}
+		let specP: number | undefined;
+		if (cfg!.spec.enabled && from === "lead" && realCalls.length && cfg!.jev.enabled) {
+			const last = realCalls[realCalls.length - 1]!;
+			const r = await askJev("turn", SPEC_QUESTIONS, { model: cfg!.lead, call: `(lead turn boundary — latest call) ${callSummary(last)}` });
+			if (r) {
+				const a = r.answers.more_calls;
+				specP = a?.type === "noul" ? a.noul : undefined;
+				log("jev", { point: "spec", phase: from, pMore: specP, lat: Math.round(r.latMs), cost: r.usage.cost ?? 0, model: r.model, cached: r.cached, fallback: false });
 			}
 		}
 		refreshSummaryText();
@@ -456,7 +474,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			}
 		};
 		const autoCheck = () => runChecks(ctx.cwd, log);
-		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, jev, budgetLeft, diffFull, autoCheck, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
+		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, jev, specP, budgetLeft, diffFull, autoCheck, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
 		const entries: SessionBoundaryDraft[] = [];
 		if (d.reason && d.to === from && d.continue) log(d.message ? "nudge" : "retry", { phase: from, reason: d.reason });
 		if (d.to !== from) {
