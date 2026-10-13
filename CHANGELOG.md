@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0 — 2026-10-13
+Goal: the helper (GLM) does a large share of the work early, within a $1.5 budget (G/H: GLM cost $0.023/$0.006).
+- **Reading (verbatim)**: the read prompt names the task, requires reading EVERY SKILL.md/REFERENCE.md in full (skills over node_modules) and ≥6 calls (follow-ups ≥3); a READ DONE below the minimum gets one "read more" nudge (G/H: follow-ups ended after 1 turn). Read outputs reach the lead verbatim (tool results only, no helper reasoning); clip threshold 20k → 50k chars, report cap 160k → 250k; skills never clipped (0.9.1).
+- **One read-only lead turn** (was 2) → helper follow-up with the lead's exact calls and "skills/REFERENCE.md first"; follow-up rounds 2 → 4.
+- **New phase `implement`**: `baton_delegate({kind:"implement", instruction:<spec>})` — the helper writes the files of the lead's spec (new files allowed; guardrails, fs journal and Jev gate on every call; Jev P(allow_handoff) alone does not end the stretch, weakens/tampers still block). When it reports IMPLEMENTED, **Baton runs the checks itself** (`runChecks`: typecheck script or `tsc --noEmit`, then `test`; 120 s each, killed on timeout; journal `auto_check`): red → helper debug loop with the failure output, green → lead.
+- **Edits come back as a short "[Baton harness] interruption summary"** (user decision): what was done, files changed (new/modified, +/− lines) with the definitions touched (`diffDigest`: functions, consts, classes, types), check status, guardrail flags, the helper's last note, `git diff --stat`; no edit calls, no helper reasoning, no raw diff (`reviewDiffChars` = 0; details on request — the lead reads files / runs git diff). Applies to implement, debug and review hand-backs.
+- **Lead prompt prescribes the split**: the lead writes plan, module boundaries, key types/interfaces and tricky core logic; routine files (UI, wiring, boilerplate, tests from its list) go to `implement`.
+- `reserveUsd` 0.5 → 0.25 (largest single lead turn seen in D–H: $0.197).
+
 ## 0.9.3 — 2026-10-13
 - **Only a red verify hands the lead's work to the helper**: lead → debug after writing now requires a failing verify in the turn. Arm G: Opus ran green tests mid-work (logic + model done, no UI yet) → GLM took the verify loop, found nothing to fix, tried to create `Tetris.tsx`, was blocked by the "new files are the lead's job" rule and escalated 11 s before the budget stop (~1 min of wall time lost; the debug stretch itself cost ≈$0.035, so the block rule was not the money sink).
 - **Endgame**: when budget left (`budgetUsd − reserveUsd − estimate − Jev`) < `endgameUsd` (0.3), the lead keeps working: no lead → debug / follow-up / Jev routine hand-offs (each hand-back costs a cache write and wall time the lead needs to finish files).

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { anchorCache, capMaxTokens, capReasoning, DEFAULT_SWITCH, decideTurn, failSignature, gateCall, initialSwitchState, isReadOnly, isVerify, shapeContext, type Call, type TurnInput } from "../src/pi/switch-core.ts";
 
-const cfg = { ...DEFAULT_SWITCH };
+// pre-0.10 thresholds (0.10 defaults are covered in test/switch-v010.test.ts)
+const cfg = { ...DEFAULT_SWITCH, leadReadTurnsToDelegate: 2, minReadCalls: 0, minFollowupCalls: 0, maxFollowups: 2 };
 const c = (id: string, name: string, args: Record<string, unknown> = {}): Call => ({ id, name, args });
 let t = 0;
 const turn = (p: Partial<TurnInput>): TurnInput => ({ turn: t++, now: 1000 + t, text: "", calls: [], results: [], empty: false, ...p });

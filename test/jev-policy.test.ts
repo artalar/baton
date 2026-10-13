@@ -5,6 +5,7 @@ import { buildState, buildSummary, CALL_QUESTIONS, callKind, callSummary, DEFAUL
 import { applyJevGate, type Call, DEFAULT_SWITCH, decideTurn, gateCall, guardCheck, initialSwitchState, type TurnInput } from "../src/pi/switch-core.ts";
 
 const thr = DEFAULT_JEV.thr;
+const LEGACY = { ...DEFAULT_SWITCH, leadReadTurnsToDelegate: 2, minReadCalls: 0, minFollowupCalls: 0 };
 const KEY = "sk-or-test-SECRET-should-never-leak";
 const ans = (o: { weakens?: number; tampers?: number; handoff?: number; block?: number; stuck?: number; routine?: number; phase?: string } = {}): JevAnswers => ({
 	phase: { type: "choice", choice: o.phase ?? "read", probabilities: { read: 1, debug: 0, write: 0 } },
@@ -136,7 +137,7 @@ describe("jev-policy: state", () => {
 		const s = initialSwitchState(0);
 		s.phase = "lead";
 		s.track = t;
-		expect(decideTurn(s, turn({ calls: [c("l1", "read", { path: "b" })], jev: { routine: 0.9, stuck: 0 } }), DEFAULT_SWITCH).to).toBe("lead");
+		expect(decideTurn(s, turn({ calls: [c("l1", "read", { path: "b" })], jev: { routine: 0.9, stuck: 0 } }), LEGACY).to).toBe("lead");
 	});
 	it("call kinds", () => {
 		expect(callKind(c("a", "bash", { command: "npm i -D vitest" }))).toBe("write");
@@ -183,7 +184,7 @@ describe("switch-core integration", () => {
 		};
 		const calls = [c("r1", "read", { path: "a.ts" })];
 		const s = mk();
-		const d = decideTurn(s, turn({ calls, jev: { routine: 0.7, stuck: 0 } }), DEFAULT_SWITCH);
+		const d = decideTurn(s, turn({ calls, jev: { routine: 0.7, stuck: 0 } }), LEGACY);
 		expect(d.to).toBe("followup");
 		expect(d.reason).toMatch(/^jev: routine ahead/);
 		// the helper gets the lead's last calls (arm F: a bare "continue" made GLM reply READ DONE at once)
@@ -191,25 +192,25 @@ describe("switch-core integration", () => {
 		expect(d.message?.text).toContain("at least 3 calls");
 		expect(s.jev.switches).toBe(1);
 		// low routine or no jev → 0.8.1 rule (one read turn is not enough)
-		expect(decideTurn(mk(), turn({ calls, jev: { routine: 0.3, stuck: 0 } }), DEFAULT_SWITCH).to).toBe("lead");
-		expect(decideTurn(mk(), turn({ calls }), DEFAULT_SWITCH).to).toBe("lead");
+		expect(decideTurn(mk(), turn({ calls, jev: { routine: 0.3, stuck: 0 } }), LEGACY).to).toBe("lead");
+		expect(decideTurn(mk(), turn({ calls }), LEGACY).to).toBe("lead");
 		// writes never trigger it
-		expect(decideTurn(mk(), turn({ calls: [c("w", "write", { path: "a.ts", content: "" })], jev: { routine: 0.99, stuck: 0 } }), DEFAULT_SWITCH).to).toBe("lead");
+		expect(decideTurn(mk(), turn({ calls: [c("w", "write", { path: "a.ts", content: "" })], jev: { routine: 0.99, stuck: 0 } }), LEGACY).to).toBe("lead");
 		// capped
 		const s4 = mk();
 		s4.track.routineHandoffs = DEFAULT_JEV.maxRoutineHandoffs;
-		expect(decideTurn(s4, turn({ calls, jev: { routine: 0.99, stuck: 0 } }), DEFAULT_SWITCH).to).toBe("lead");
+		expect(decideTurn(s4, turn({ calls, jev: { routine: 0.99, stuck: 0 } }), LEGACY).to).toBe("lead");
 	});
 	it("helper debug: stuck ≥ 0.9 → lead before the red-cycle rule; red cycles still a ceiling without jev", () => {
 		const s = initialSwitchState(0);
 		s.phase = "debug";
 		const v = c("v", "bash", { command: "npx vitest run" });
-		const d = decideTurn(s, turn({ calls: [v], results: [{ id: "v", isError: true, text: "FAIL x" }], jev: { routine: 0, stuck: 0.93 } }), DEFAULT_SWITCH);
+		const d = decideTurn(s, turn({ calls: [v], results: [{ id: "v", isError: true, text: "FAIL x" }], jev: { routine: 0, stuck: 0.93 } }), LEGACY);
 		expect(d.to).toBe("lead");
 		expect(d.reason).toMatch(/^jev: stuck 0.93/);
 		const s2 = initialSwitchState(0);
 		s2.phase = "debug";
-		expect(decideTurn(s2, turn({ calls: [v], results: [{ id: "v", isError: true, text: "FAIL x" }], jev: { routine: 0, stuck: 0.5 } }), DEFAULT_SWITCH).to).toBe("debug");
+		expect(decideTurn(s2, turn({ calls: [v], results: [{ id: "v", isError: true, text: "FAIL x" }], jev: { routine: 0, stuck: 0.5 } }), LEGACY).to).toBe("debug");
 	});
 });
 

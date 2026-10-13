@@ -5,7 +5,7 @@
  * Load with `-e src/pi/switch.ts`, or `-e src/pi/index.ts` with BATON_MODE=switch.
  * Config: `.pi/baton.json` → { "switch": { …SwitchConfig } }. Journal: `<journalDir>/switch.jsonl`, summary in switch-summary.json.
  */
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
@@ -31,6 +31,36 @@ export function hasTestFiles(dir: string, depth = 5): boolean {
 		if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "node_modules" && e.name !== "dist" && hasTestFiles(join(dir, e.name), depth - 1)) return true;
 	}
 	return false;
+}
+
+/**
+ * 0.10: Baton runs the project's checks itself (after an implement stretch): `typecheck`/`tsc` script or `npx tsc --noEmit`
+ * when a tsconfig exists, then the `test` script. 120 s each, process group killed on timeout.
+ */
+export function runChecks(cwd: string, log?: (k: string, d: Record<string, unknown>) => void): { ok: boolean; text: string } | undefined {
+	let pkg: { scripts?: Record<string, string> } = {};
+	try {
+		pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8"));
+	} catch {
+		return undefined;
+	}
+	const sc = pkg.scripts ?? {};
+	const cmds: string[] = [];
+	if (sc.typecheck) cmds.push("npm run -s typecheck");
+	else if (existsSync(join(cwd, "tsconfig.json"))) cmds.push("npx tsc --noEmit");
+	if (sc.test && !/no test specified/.test(sc.test)) cmds.push("npm test --silent");
+	if (!cmds.length) return undefined;
+	let ok = true;
+	const out: string[] = [];
+	const t0 = Date.now();
+	for (const cmd of cmds) {
+		const r = spawnSync("bash", ["-c", `${cmd} 2>&1`], { cwd, encoding: "utf8", timeout: 120_000, killSignal: "SIGKILL", maxBuffer: 20_000_000, env: { ...process.env, CI: "1" } });
+		const pass = r.status === 0;
+		ok &&= pass;
+		out.push(`$ ${cmd} → ${pass ? "PASS" : r.error ? `ERROR ${r.error.message}` : `FAIL (exit ${r.status})`}\n${String(r.stdout ?? "").slice(-2500)}`);
+	}
+	log?.("auto_check", { ok, cmds, ms: Date.now() - t0 });
+	return { ok, text: out.join("\n") };
 }
 
 export function loadSwitchConfig(cwd: string): SwitchConfig & { journalDir: string } {
@@ -351,7 +381,15 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		refreshSummaryText();
 		const b0 = budgetSpend(costs, leadId(), cfg!.helperCostFactor);
 		const budgetLeft = cfg!.budgetUsd > 0 ? cfg!.budgetUsd - cfg!.reserveUsd - b0.estimate - extraCost() : undefined;
-		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, jev, budgetLeft, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
+		const diffFull = () => {
+			try {
+				return execSync("git add -N . 2>/dev/null; git diff HEAD -- . ':!package-lock.json'", { cwd: ctx.cwd, encoding: "utf8", timeout: 10_000, maxBuffer: 20_000_000 });
+			} catch {
+				return "";
+			}
+		};
+		const autoCheck = () => runChecks(ctx.cwd, log);
+		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, jev, budgetLeft, diffFull, autoCheck, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
 		const entries: SessionBoundaryDraft[] = [];
 		if (d.reason && d.to === from && d.continue) log(d.message ? "nudge" : "retry", { phase: from, reason: d.reason });
 		if (d.to !== from) {
@@ -389,10 +427,11 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		name: "baton_delegate",
 		label: "Baton delegate",
 		description:
-			"Hand work to the cheaper helper model. kind \"reads\": it reads/searches what you list and you get a harness report with the outputs (limited rounds). kind \"debug\": it runs typecheck/tests/build and fixes failures with small edits, then hands back with a report.",
-		parameters: Type.Object({ kind: Type.Union([Type.Literal("reads"), Type.Literal("debug")]), instruction: Type.Optional(Type.String({ description: "What to read, or extra notes for the fix loop." })) }),
+			"Hand work to the cheaper helper model. kind \"reads\": it reads/searches what you list and you get a harness report with the outputs verbatim (limited rounds). kind \"implement\": it writes the files of your spec (may create files); Baton then runs typecheck+tests itself, red → the helper fixes, then you get the full diff to review. kind \"debug\": it runs typecheck/tests/build and fixes failures with small edits, then hands back with a report.",
+		parameters: Type.Object({ kind: Type.Union([Type.Literal("reads"), Type.Literal("implement"), Type.Literal("debug")]), instruction: Type.Optional(Type.String({ description: "What to read; for implement: the precise spec (files, exports, signatures, behaviour, tests); or extra notes for the fix loop." })) }),
 		async execute(_id, params) {
 			if (params.kind === "reads") return delegateReads(params.instruction ?? "");
+			if (params.kind === "implement") return { content: [{ type: "text" as const, text: "The helper implements the spec now; checks run automatically and you get the diff for review." }], details: {} };
 			return { content: [{ type: "text" as const, text: "The helper takes over the verify/fix loop now." }], details: {} };
 		},
 	});

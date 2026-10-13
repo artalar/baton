@@ -6,8 +6,8 @@
 
 import { DEFAULT_JEV, initialTrack, type JevConfig, type JevTrack, type TurnJev } from "./jev-config.ts";
 
-export type Phase = "read" | "lead" | "followup" | "debug" | "review" | "final" | "done";
-export const HELPER_PHASES: readonly Phase[] = ["read", "followup", "debug", "review"];
+export type Phase = "read" | "lead" | "followup" | "implement" | "debug" | "review" | "final" | "done";
+export const HELPER_PHASES: readonly Phase[] = ["read", "followup", "implement", "debug", "review"];
 export const isHelper = (p: Phase) => HELPER_PHASES.includes(p);
 
 export interface SwitchConfig {
@@ -48,6 +48,13 @@ export interface SwitchConfig {
 	reportChars: number;
 	/** 0.9.3 endgame: when budget left (budget − reserve − estimate) < this, the lead keeps working — no mid-work hand-offs to the helper. */
 	endgameUsd: number;
+	/** 0.10: minimum helper calls before a reading stretch may end (initial read / follow-up); one "read more" nudge. */
+	minReadCalls: number;
+	minFollowupCalls: number;
+	/** 0.10: consecutive read-only lead turns before the helper takes over the reading (was 2). */
+	leadReadTurnsToDelegate: number;
+	/** 0.10: max chars of the full diff in a helper → lead report after implement/debug (for the lead's review). */
+	reviewDiffChars: number;
 	/** 0.9: Jev decision model gate (src/pi/jev-policy.ts). */
 	jev: JevConfig;
 }
@@ -55,7 +62,7 @@ export interface SwitchConfig {
 export const DEFAULT_SWITCH: SwitchConfig = {
 	lead: "openrouter/anthropic/claude-opus-5.5",
 	helper: "openrouter/z-ai/glm-5.3-flash",
-	maxFollowups: 2,
+	maxFollowups: 4,
 	redCycles: 6,
 	maxRedTotal: 12,
 	maxHelperMs: 270_000,
@@ -66,14 +73,18 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	planningTurns: 1,
 	finalCheck: true,
 	emptyRetries: 3,
-	clipChars: 20_000,
+	clipChars: 50_000,
 	leadMaxTokens: 16_000,
 	nonWriteMaxTokens: 6_000,
 	budgetUsd: 0,
 	helperCostFactor: 2.3,
-	reserveUsd: 0.5,
-	reportChars: 160_000,
+	reserveUsd: 0.25,
+	reportChars: 250_000,
 	endgameUsd: 0.3,
+	minReadCalls: 6,
+	minFollowupCalls: 3,
+	leadReadTurnsToDelegate: 1,
+	reviewDiffChars: 0,
 	jev: DEFAULT_JEV,
 };
 
@@ -265,6 +276,10 @@ export interface SwitchState {
 	/** Clipped outputs: toolCallId → max chars. */
 	clips: Record<string, number>;
 	switches: SwitchEvent[];
+	/** 0.10: "read more" nudge sent in this reading stretch. */
+	readNudged: boolean;
+	/** 0.10: implement stretches delegated by the lead. */
+	implements: number;
 	/** 0.9: Jev rolling summary inputs (ring buffer of recent calls, counters, helper-written note). */
 	track: JevTrack;
 	jev: JevStats;
@@ -331,6 +346,8 @@ export function initialSwitchState(now: number): SwitchState {
 		stubs: {},
 		clips: {},
 		switches: [],
+		readNudged: false,
+		implements: 0,
 		track: initialTrack(),
 		jev: initialJevStats(),
 	};
@@ -342,18 +359,21 @@ export const BATON_TOOLS = ["delegate_reads", "baton_delegate", "baton_optimize"
 export const LEAD_SYSTEM_NOTE = `
 
 # Baton harness
-This session runs under Baton: a cheaper helper model may perform some steps (reading, running checks and small fixes, final review); you will then see an honest "[Baton harness]" report of what it did. Available harness tools: baton_delegate({kind:"reads"|"debug", instruction}) hands file reading, or the verify/fix loop, to the helper; baton_optimize({}) drops superseded read outputs from your context (one cache rewrite). delegate_reads({instruction}) = baton_delegate kind "reads".`;
+This session runs under Baton: a cheaper helper model may perform some steps (reading, running checks and small fixes, final review); you will then see an honest "[Baton harness]" report of what it did. Available harness tools: baton_delegate({kind:"reads"|"implement"|"debug", instruction}) hands file reading, the implementation of a precise spec (it may create and edit files), or the verify/fix loop, to the helper; baton_optimize({}) drops superseded read outputs from your context (one cache rewrite). delegate_reads({instruction}) = baton_delegate kind "reads".`;
 
 export const MSG = {
-	read: "[baton switch → helper: reading] Explore the repository and the project skills (read, ls, grep, find, any bash that inspects — e.g. cat/rg/git log, `node -e` to inspect an installed API). Any change to project files is detected, reverted and ends your stretch. Read everything the lead model will need to plan and write the code. Do NOT write code, edit files or explain at length. When you have read enough, reply only: READ DONE.",
+	read: "[baton switch → helper: reading] You are the reader for the lead model, which will plan and write the code for the user's task above. Read, in full, everything it needs: the repository layout and package.json, EVERY SKILL.md and REFERENCE.md of the project skills (.agents/skills, .pi/skills, .claude/skills — read whole files, use offset/limit for long ones until the end), and any docs/examples of the APIs the task uses. Prefer the skills over node_modules sources: they match the installed versions. Your tool outputs are handed to the lead verbatim, so read the actual text — do not summarise. Use read/ls/grep/find/cat; any change to project files is detected and reverted. Do NOT write code, edit files or explain. Make at least 6 tool calls; when everything relevant is read, reply only: READ DONE.",
 	followup: (instr: string) =>
-		`[baton switch → helper: follow-up reads] The lead model asks you to read: ${instr}\nUse read-only tools only, read exactly what is needed, do not explain. Then reply only: READ DONE.`,
+		`[baton switch → helper: follow-up reads] The lead model needs more information: ${instr}\nRead the relevant files in full (skills/REFERENCE.md and project files first; node_modules only if the skills do not cover it). Your outputs reach the lead verbatim. Read-only tools only, no explanations; make at least 3 relevant calls, then reply only: READ DONE.`,
+	readMore: (n: number, min: number) => `[baton switch → helper] You made only ${n} tool call(s); at least ${min} are expected. Read the remaining relevant skill/reference sections and project files the lead will need (whole files), then reply READ DONE.`,
+	implement: (spec: string) =>
+		`[baton switch → helper: implement] The lead model has planned the work and hands you its implementation. Spec from the lead:\n${spec}\n\nImplement it exactly: create and edit the files named in the spec (write/edit tools), follow the interfaces and names the lead defined, use the APIs as documented in the project skills. Before each file write ONE short line saying what it contains. Forbidden: --passWithNoTests, \`as unknown as\`, downgrading packages, skipping/deleting/weakening tests, changing files the spec does not mention. Do not redesign. If the spec is ambiguous or needs a design decision, reply only: ESCALATE <one line why>. When all files are written, reply only: IMPLEMENTED (checks run automatically).`,
 	debug:
 		"[baton switch → helper: verify/debug] Run the project's checks (typecheck, tests, build) and fix failures with small, targeted edits to existing files. Do not create new files, do not redesign, do not write long explanations. Forbidden: --passWithNoTests, `as unknown as` casts, downgrading package versions, skipping/deleting/weakening tests. Before each edit write ONE short line saying what the edit does. When typecheck, tests and build are green, stop immediately (no exploratory or fuzz scripts) and reply only: GREEN. If a fix needs new files, a design change or a forbidden step, reply only: ESCALATE <one line why>.",
 	review:
 		"[baton switch → helper: final review] Review the whole change (git status, git diff, run typecheck/tests/build once) against the user's task. Fix only clear, small bugs (same restrictions as before: no skipped tests, no `as unknown as`, no version downgrades). Then reply with a short list of remaining issues (or NONE).",
 	lead: (why: string, report: string) =>
-		`${report ? `${report}\n\n` : ""}[baton switch → lead] ${why}\nYou lead: plan briefly and write the code (edit/write). Write the tests together with the code and run them yourself once.`,
+		`${report ? `${report}\n\n` : ""}[baton switch → lead] ${why}\nYou lead and own the design, but the budget is tight: the helper must do the bulk of the typing. Split: write the plan, the module boundaries and the key types/interfaces (and tricky core logic) yourself, then hand the routine implementation of the remaining files (UI components, wiring, boilerplate, test files from your test list) to the helper with baton_delegate({kind:"implement", instruction:<precise spec: files, exports, signatures, behaviour, tests to write>}); checks run automatically afterwards and you review the diff in the harness report. Need more API details? baton_delegate({kind:"reads", instruction}) — the helper reads skills/docs and hands you the text verbatim.`,
 	final: (report: string) => `${report}\n\n[baton switch → lead: final check] Do a SHORT final check. Fix only real problems; otherwise reply DONE in one line.`,
 	noTests: "[baton switch → lead] There are no test files yet and you have not run tests. Write the tests for your code now (and run them once) before handing over to verification.",
 	lengthStop: "[baton switch → lead] Your previous response hit the output token cap and was cut off. Continue exactly where it stopped (re-issue the cut tool call if any).",
@@ -376,6 +396,10 @@ export interface TurnInput {
 	jev?: TurnJev;
 	/** 0.9.3: USD left before the budget stop (undefined = no budget). */
 	budgetLeft?: number;
+	/** 0.10: full uncommitted diff incl. new files (lazy; for the lead's review after implement/debug). */
+	diffFull?: () => string;
+	/** 0.10: run the project's checks (typecheck + tests) now (lazy; Baton runs them itself after an implement stretch). */
+	autoCheck?: () => { ok: boolean; text: string } | undefined;
 }
 
 export interface Decision {
@@ -533,6 +557,8 @@ export const gateCall = (...a: Parameters<typeof gateCallRules>) => gateCallRule
  */
 export function applyJevGate(s: SwitchState, c: Call, d: { action: "allow" | "allow_handoff" | "block"; reason: string }): { block: true; reason: string } | undefined {
 	if (!isHelper(s.phase) || d.action === "allow") return undefined;
+	// implement: creating the files of the lead's spec is the job, so P(allow_handoff) alone does not end the stretch
+	if (s.phase === "implement" && d.action === "allow_handoff" && /P\(allow_handoff\)/.test(d.reason)) return undefined;
 	if (d.action === "block") {
 		const f: Flag = { phase: s.phase, tool: c.name, path: editPath(c) || undefined, why: d.reason, blocked: true };
 		s.flags.push(f);
@@ -557,8 +583,8 @@ export function gateCallRules(s: SwitchState, c: Call, fileExists: (p: string) =
 	if ((BATON_TOOLS as readonly string[]).includes(c.name)) return { block: true, reason: `${c.name} is for the lead model only.` };
 	// reading phases: any tool is allowed; the fs guard (src/pi/fsguard.ts) reverts file changes and hands over
 	if (s.phase === "read" || s.phase === "followup") return undefined;
-	// debug / review: no new files
-	if (c.name === "write") {
+	// debug / review: no new files (implement: the lead's spec names new files)
+	if (c.name === "write" && s.phase !== "implement") {
 		const p = c.args.path ?? c.args.file_path;
 		if (typeof p === "string" && !fileExists(p)) {
 			s.wantLead = `helper tried to create ${p}`;
@@ -586,7 +612,7 @@ const oneLine = (t: string, n = 140) => t.replace(/\s+/g, " ").trim().slice(0, n
  * this text is attached to the lead's next instruction (a user-role message), so the lead knows exactly that
  * automation — not it — performed these steps.
  */
-export function harnessReport(s: SwitchState, from: Phase, why: string, cfg: SwitchConfig, diffStat?: string): string {
+export function harnessReport(s: SwitchState, from: Phase, why: string, cfg: SwitchConfig, diffStat?: string, diffFull?: string): string {
 	if (from === "read" || from === "followup") {
 		if (!s.stretchOutputs.length) return `[Baton harness] Reading was intercepted and performed by automation (helper model); it read nothing useful. (${why})${guardNotes(s)}`;
 		let budget = cfg.reportChars;
@@ -618,19 +644,75 @@ export function harnessReport(s: SwitchState, from: Phase, why: string, cfg: Swi
 		}
 		return `[Baton harness] Reading was intercepted and performed by automation (helper model), not by you. Its tool outputs follow (${s.stretchOutputs.length}):\n${parts.join("\n")}${guardNotes(s)}`;
 	}
+	if (from === "implement" || from === "debug" || from === "review") return interruptionSummary(s, from, why, diffStat, diffFull, cfg);
 	const checks = Object.entries(s.stretchChecks)
 		.map(([k, v]) => `$ ${oneLine(v!.cmd, 160)}  → ${k}: ${v!.ok ? "PASS" : "FAIL"}\n${tail(v!.tail, 1200)}`)
 		.join("\n");
 	const edits = s.stretchEdits.map((e) => `- ${e.path}: ${e.intent}`).join("\n");
 	const flags = s.stretchFlags.map((f) => `- ${f.blocked ? "BLOCKED" : "FLAG"} ${f.tool}${f.path ? ` ${f.path}` : ""}: ${f.why}`).join("\n");
 	return [
-		`[Baton harness] Execution of the following steps was intercepted and performed by automation (helper model), not by you: ${from === "debug" ? "running checks and fixing failures" : "final review"}. Handback reason: ${why}.`,
+		`[Baton harness] Execution of the following steps was intercepted and performed by automation (helper model), not by you: ${from}. Handback reason: ${why}.`,
 		`Result: ${s.lastVerifyGreen ? "checks green" : "checks NOT green"}; helper edits: ${s.stretchEdits.length}.`,
 		`Final diff summary (git diff --stat):\n${diffStat?.trim() || "(unavailable)"}`,
+		...(diffFull?.trim() ? [`Full diff for your review (helper changes and everything uncommitted${diffFull.length > cfg.reviewDiffChars ? `, first ${cfg.reviewDiffChars} chars` : ""}):\n${diffFull.slice(0, cfg.reviewDiffChars)}`] : []),
 		`Final check outputs:\n${checks || "(the helper ran no checks)"}`,
 		`Helper edits (one line each):\n${edits || "(none)"}`,
 		`SUSPICIOUS EDITS (guardrail flags):\n${flags || "(none)"}`,
 		`Helper's last note: ${oneLine(s.lastHelperText, 600) || "(none)"}`,
+	].join("\n\n") + guardNotes(s);
+}
+
+/**
+ * Pure: compact digest of a unified diff — per file: new/modified/deleted, +/− lines, and the top-level names
+ * (functions, consts, classes, types, interfaces, components) whose definitions were added or changed.
+ */
+export function diffDigest(diff: string): { file: string; status: string; add: number; del: number; names: string[] }[] {
+	const out: { file: string; status: string; add: number; del: number; names: string[] }[] = [];
+	let cur: (typeof out)[number] | undefined;
+	const DEF = /^[+-]\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?\s+([\w$]+)|(?:const|let|var)\s+([\w$]+)|class\s+([\w$]+)|type\s+([\w$]+)|interface\s+([\w$]+)|enum\s+([\w$]+))/;
+	for (const line of diff.split("\n")) {
+		const f = /^diff --git a\/(\S+) b\/(\S+)/.exec(line);
+		if (f) {
+			cur = { file: f[2]!, status: "modified", add: 0, del: 0, names: [] };
+			out.push(cur);
+			continue;
+		}
+		if (!cur) continue;
+		if (/^new file mode/.test(line)) cur.status = "new";
+		else if (/^deleted file mode/.test(line)) cur.status = "deleted";
+		else if (/^(\+\+\+|---) /.test(line)) continue;
+		else if (line.startsWith("+")) cur.add++;
+		else if (line.startsWith("-")) cur.del++;
+		const hunk = /^@@ .*@@\s*(?:export\s+)?(?:async\s+)?(?:function\s+([\w$]+)|(?:const|let|class|interface|type)\s+([\w$]+))/.exec(line);
+		const m = DEF.exec(line);
+		const name = m ? m.slice(1).find(Boolean) : hunk ? hunk.slice(1).find(Boolean) : undefined;
+		if (name && !cur.names.includes(name) && cur.names.length < 12) cur.names.push(name);
+	}
+	return out;
+}
+
+/**
+ * Pure: the "[Baton harness] interruption summary" for a helper edit stretch (implement / debug / review).
+ * The lead never sees the helper's edit calls or reasoning — only what was done, which files and definitions
+ * changed, and the check status. Details on request: the lead reads the files or runs `git diff` itself.
+ */
+export function interruptionSummary(s: SwitchState, from: Phase, why: string, diffStat?: string, diffFull?: string, cfg: SwitchConfig = DEFAULT_SWITCH): string {
+	const what = from === "implement" ? "implemented your spec" : from === "debug" ? "ran the checks and fixed failures" : "reviewed the change";
+	const helperFiles = new Set(s.stretchEdits.flatMap((e) => e.path.split(", ").filter(Boolean)));
+	const digest = diffFull ? diffDigest(diffFull) : [];
+	const touched = digest.filter((d) => !helperFiles.size || [...helperFiles].some((h) => h === d.file || h.endsWith(`/${d.file}`) || d.file.endsWith(h.replace(/^.*?\/(?=src\/)/, ""))));
+	const files = (touched.length ? touched : digest).map((d) => `- ${d.file} (${d.status}, +${d.add}/−${d.del})${d.names.length ? `: ${d.names.join(", ")}` : ""}`);
+	const fallback = s.stretchEdits.map((e) => `- ${e.path}: ${e.intent}`);
+	const checks = Object.entries(s.stretchChecks).map(([k, v]) => `- ${k === "tsc" && v!.cmd.startsWith("(baton") ? "auto-check (typecheck + tests)" : k}: ${v!.ok ? "PASS" : "FAIL"}${v!.ok ? "" : ` — ${oneLine(v!.tail.split("\n").filter((l) => /error|fail|✗|×/i.test(l)).slice(0, 3).join(" | "), 300)}`}`);
+	const flags = s.stretchFlags.map((f) => `- ${f.blocked ? "BLOCKED" : "FLAG"} ${f.tool}${f.path ? ` ${f.path}` : ""}: ${f.why}`);
+	return [
+		`[Baton harness] interruption summary — automation (helper model), not you, ${what} while you were paused. Handback reason: ${why}.`,
+		`Files and definitions changed by the helper (${s.stretchEdits.length} edit call(s)):\n${(files.length ? files : fallback).join("\n") || "(none)"}`,
+		`Checks: ${s.lastVerifyGreen ? "GREEN" : "NOT green"}\n${checks.join("\n") || "- (no checks ran)"}`,
+		...(flags.length ? [`SUSPICIOUS EDITS (guardrails):\n${flags.join("\n")}`] : []),
+		...(cfg.reviewDiffChars > 0 && diffFull ? [`Diff (first ${cfg.reviewDiffChars} chars):\n${diffFull.slice(0, cfg.reviewDiffChars)}`] : []),
+		`Helper's last note: ${oneLine(s.lastHelperText, 300) || "(none)"}`,
+		`Details on request: read the files or run \`git diff\` yourself.${diffStat?.trim() ? `\ngit diff --stat:\n${diffStat.trim().split("\n").slice(-25).join("\n")}` : ""}`,
 	].join("\n\n") + guardNotes(s);
 }
 
@@ -655,8 +737,9 @@ function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: Sw
 	let report = "";
 	if (isHelper(from) && !isHelper(next)) {
 		compacted = compactAtHandoff(s, from, cfg);
-		report = harnessReport(s, from, reason, cfg, from === "debug" || from === "review" ? inp.diffStat?.() : undefined);
-		if (from === "debug" || from === "review") s.reverifyOpen = true;
+		const exec = from === "debug" || from === "review" || from === "implement";
+		report = harnessReport(s, from, reason, cfg, exec ? inp.diffStat?.() : undefined, exec ? inp.diffFull?.() : undefined);
+		if (exec) s.reverifyOpen = true;
 	}
 	const reportInfo = report ? { chars: report.length, edits: s.stretchEdits.length, flags: s.stretchFlags.length, outputs: s.stretchOutputs.length } : undefined;
 	s.switches.push({ turn: inp.turn, from, to: next, reason, ts: inp.now });
@@ -675,12 +758,14 @@ function to(s: SwitchState, inp: TurnInput, next: Phase, reason: string, cfg: Sw
 	s.leadReadTurns = 0;
 	s.lastHelperText = "";
 	s.wantLead = undefined;
+	s.readNudged = false;
 	s.editedSinceVerify = false;
 	if (next === "debug") s.red = { sig: "", same: 0, total: 0 };
 	if (next === "lead" && (from === "read" || from === "followup")) s.planningLeft = Math.max(s.planningLeft, cfg.planningTurns);
 	let message: Decision["message"];
 	if (next === "lead") message = { audience: "lead", text: MSG.lead(reason, report) };
 	if (next === "debug") message = { audience: "helper", text: MSG.debug };
+	if (next === "implement") message = { audience: "helper", text: MSG.implement(inp.text) };
 	if (next === "review") message = { audience: "helper", text: MSG.review };
 	if (next === "final") message = { audience: "lead", text: MSG.final(report || `[Baton harness] Review notes: ${inp.text.slice(0, 1500)}`) };
 	return { to: next, reason, message, compacted, report: reportInfo, continue: inp.calls.length === 0 && next !== "done" };
@@ -779,12 +864,35 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 		case "read":
 		case "followup": {
 			if (s.wantLead) return to(s, inp, "lead", `reading ended: ${s.wantLead}`, cfg);
-			if (!real.length) return to(s, inp, "lead", `reading done (${s.reads.length} reads so far)`, cfg);
+			const minCalls = s.phase === "read" ? cfg.minReadCalls : cfg.minFollowupCalls;
+			if (!real.length && s.stretchCalls < minCalls && !s.readNudged && elapsed < cfg.maxHelperMs) {
+				s.readNudged = true;
+				return { to: s.phase, reason: `helper read too little (${s.stretchCalls}/${minCalls}) — nudged`, message: { audience: "helper", text: MSG.readMore(s.stretchCalls, minCalls) }, continue: true };
+			}
+			if (!real.length) return to(s, inp, "lead", `reading done (${s.stretchCalls} helper calls, ${s.reads.length} reads so far)`, cfg);
 			if (text.length > cfg.readTextChars) return to(s, inp, "lead", "helper started reasoning — reading done", cfg);
 			const cap = s.phase === "read" ? cfg.maxReadCalls : cfg.maxFollowupCalls;
 			if (s.stretchCalls >= cap) return to(s, inp, "lead", `reading call cap ${cap} reached`, cfg);
 			if (elapsed > cfg.maxHelperMs) return to(s, inp, "lead", `helper stretch > ${Math.round(cfg.maxHelperMs / 1000)} s (cache TTL)`, cfg);
 			return { to: s.phase };
+		}
+		case "implement": {
+			if (s.wantLead) return to(s, inp, "lead", `implementation escalated: ${s.wantLead}`, cfg);
+			if (elapsed > cfg.maxHelperMs) return to(s, inp, "lead", `implement stretch > ${Math.round(cfg.maxHelperMs / 1000)} s (cache TTL) — partial implementation, see diff`, cfg);
+			if (real.length) return { to: s.phase };
+			if (/ESCALATE/.test(text)) return to(s, inp, "lead", `helper escalated the implementation: ${text.slice(0, 300)}`, cfg);
+			// done: Baton runs the checks itself; red → the helper fixes (debug), green → the lead reviews the diff
+			const chk = inp.autoCheck?.();
+			if (chk) {
+				s.stretchChecks.tsc = { cmd: "(baton auto-check) typecheck + tests", ok: chk.ok, tail: chk.text };
+				s.lastVerifyGreen = chk.ok;
+				if (!chk.ok) {
+					const d = to(s, inp, "debug", "implementation done; baton auto-check is red → helper fixes", cfg);
+					d.message = { audience: "helper", text: `${MSG.debug}\nBaton ran the checks after your implementation:\n${chk.text.slice(-3000)}` };
+					return d;
+				}
+			}
+			return to(s, inp, "lead", `implementation done${chk ? " — baton auto-check green" : ""}; review the diff`, cfg);
 		}
 		case "debug":
 		case "review": {
@@ -832,7 +940,15 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 				s.metrics.lengthStops++;
 				return { to: s.phase, reason: "lead hit the output cap", message: { audience: "lead", text: MSG.lengthStop }, continue: true };
 			}
-			const delegate = real.find((c) => c.name === "delegate_reads" || (c.name === "baton_delegate" && c.args.kind !== "debug"));
+			const impl = real.find((c) => c.name === "baton_delegate" && c.args.kind === "implement");
+			if (impl) {
+				s.implements++;
+				const spec = String(impl.args.instruction ?? "") || text;
+				const d = to(s, inp, "implement", `lead delegated implementation (#${s.implements})`, cfg);
+				d.message = { audience: "helper", text: MSG.implement(spec) };
+				return d;
+			}
+			const delegate = real.find((c) => c.name === "delegate_reads" || (c.name === "baton_delegate" && c.args.kind === "reads"));
 			if (delegate && s.followups < cfg.maxFollowups) {
 				s.followups++;
 				const instr = String(delegate.args.instruction ?? "");
@@ -860,10 +976,11 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 				d.message = { audience: "helper", text: MSG.followup(`the lead was exploring with these calls:\n- ${last}\nContinue this exploration: read/search the related files, types and docs the lead will need next (at least 3 calls) before replying READ DONE`) };
 				return d;
 			}
-			if (!endgame && s.leadReadTurns >= 2 && s.followups < cfg.maxFollowups) {
+			if (!endgame && s.leadReadTurns >= cfg.leadReadTurnsToDelegate && s.followups < cfg.maxFollowups) {
 				s.followups++;
 				const d = to(s, inp, "followup", `lead issued only reads (round ${s.followups})`, cfg);
-				d.message = { audience: "helper", text: MSG.followup("continue the lead's reads above and anything they obviously lead to") };
+				const last = real.map((c) => (c.name === "bash" ? `$ ${String(c.args.command ?? "").replace(/\s+/g, " ").slice(0, 200)}` : `${c.name} ${JSON.stringify(c.args).slice(0, 200)}`)).join("\n- ");
+				d.message = { audience: "helper", text: MSG.followup(`the lead was reading with these calls:\n- ${last}\nFind the same information in the project skills/REFERENCE.md first, then read what these calls lead to`) };
 				return d;
 			}
 			const testsReady = s.leadRanTests || !!inp.testsExist;

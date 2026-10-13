@@ -22,7 +22,8 @@ import {
 	verifyKinds,
 } from "../src/pi/switch-core.ts";
 
-const cfg = { ...DEFAULT_SWITCH };
+// pre-0.10 thresholds (0.10 defaults are covered in test/switch-v010.test.ts)
+const cfg = { ...DEFAULT_SWITCH, leadReadTurnsToDelegate: 2, minReadCalls: 0, minFollowupCalls: 0, maxFollowups: 2 };
 const c = (id: string, name: string, args: Record<string, unknown> = {}): Call => ({ id, name, args });
 let t = 0;
 const turn = (p: Partial<TurnInput>): TurnInput => ({ turn: t++, now: 1000 + t, text: "", calls: [], results: [], empty: false, ...p });
@@ -77,8 +78,9 @@ describe("2. tests are written by the lead; debug only after tests exist / ran",
 		expect(decideTurn(s, turn({ text: "done" }), cfg).to).toBe("debug");
 	});
 	it("lead prompt asks for tests with the code and does not instruct baton tool use", () => {
-		expect(MSG.lead("x", "")).toMatch(/tests together with the code/);
-		expect(MSG.lead("x", "")).not.toMatch(/delegate_reads|baton_/);
+		// 0.10 (user decision): the lead prompt prescribes the plan → helper-implements split, tests listed in the spec
+		expect(MSG.lead("x", "")).toMatch(/tests to write/);
+		expect(MSG.lead("x", "")).toMatch(/kind:"implement"/);
 	});
 });
 
@@ -209,11 +211,12 @@ describe("7. honest handoff", () => {
 		const d = decideTurn(s, turn({ text: "GREEN", diffStat: () => " src/rot.ts | 3 ++-" }), cfg);
 		const txt = d.message!.text;
 		expect(d.message!.audience).toBe("lead");
-		expect(txt).toMatch(/^\[Baton harness\] Execution of the following steps was intercepted and performed by automation \(helper model\)/);
+		// 0.10: edit stretches come back as a short interruption summary
+		expect(txt).toMatch(/^\[Baton harness\] interruption summary — automation \(helper model\), not you/);
 		expect(txt).toContain("src/rot.ts | 3 ++-");
-		expect(txt).toContain("→ test: PASS");
+		expect(txt).toContain("- test: PASS");
 		expect(txt).toContain("- src/rot.ts: Fix the off-by-one in rotate [+1 lines]");
-		expect(txt).toMatch(/SUSPICIOUS EDITS \(guardrail flags\):\n\(none\)/);
+		expect(txt).not.toMatch(/SUSPICIOUS EDITS/);
 		expect(d.report).toMatchObject({ edits: 1, flags: 0 });
 		// lead view: Opus turns untouched (with signatures), helper turns + results dropped
 		const lead = "anthropic/claude-opus-5.5";
