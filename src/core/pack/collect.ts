@@ -3,10 +3,9 @@
  * Pure Node: git through an injectable `Exec`, defaulting to child_process.
  */
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type JournalEvent, eventLine } from "../journal.ts";
-import { changedFiles, type Exec, git, packDiff, packExcludes, readAgentsMd, repoMap } from "../repo.ts";
+import { changedFiles, type Exec, git, gitRoot, packDiff, packExcludes, readAgentsMd, readRepoText, repoMap, splitNul } from "../repo.ts";
 import { discoverSkills, SKILL_DIRS, selectSkills } from "../skills.ts";
 import { clip } from "../util.ts";
 import type { AdvisorKind, PackInput, VerbatimCall } from "./sections.ts";
@@ -103,14 +102,9 @@ export async function collectPackInput(o: CollectOptions): Promise<PackInput> {
 		}
 	} else {
 		base.timeline = tools.filter((e) => (e.importance ?? 0) >= 1).slice(-60);
-		const files = ((await git(exec, ["ls-files"])) ?? "").split("\n").filter(Boolean).slice(0, 2000);
-		base.repoMap = repoMap(files, (p) => {
-			try {
-				return readFileSync(join(o.cwd, p), "utf8");
-			} catch {
-				return undefined;
-			}
-		}, 16_000);
+		const root = await gitRoot(exec, o.cwd);
+		const files = splitNul((await git(exec, ["ls-files", "-z", "--full-name"])) ?? "").slice(0, 2000);
+		base.repoMap = repoMap(files, (p) => readRepoText(join(root, p)), 16_000);
 	}
 	const sk = o.skills ?? {};
 	if (sk.enabled !== false) {
