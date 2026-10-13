@@ -3,7 +3,7 @@
  * context (see ./collect.ts) into chat messages for a tool-less advisor model.
  */
 import { estimateTokens } from "../util.ts";
-import { type AdvisorKind, fitSections, type Pack, type PackInput, packSections, type Section } from "./sections.ts";
+import { type AdvisorKind, escapeXmlAttr, fitSections, type Pack, type PackInput, packSections, type Section } from "./sections.ts";
 
 export * from "./sections.ts";
 
@@ -29,6 +29,11 @@ function render(sections: Section[]): string {
 	return sections.map((x) => `## ${x.title}\n${x.body}`).join("\n\n");
 }
 
+function batonPack(kind: string, reason: string | undefined, inner: string): string {
+	const reasonAttr = reason ? ` reason="${escapeXmlAttr(reason)}"` : "";
+	return `<baton_pack v="3" kind="${escapeXmlAttr(kind)}"${reasonAttr}>\n${inner}\n</baton_pack>`;
+}
+
 export const DEFAULT_PACK_BUDGET = 40_000;
 
 /**
@@ -46,7 +51,7 @@ export function buildReviewPack(input: PackInput, opts: { budgetTokens?: number;
 	const stable = frozen !== undefined ? [] : sections.filter((x) => x.stable);
 	const rest = sections.filter((x) => !x.stable);
 	const system = frozen ?? render(stable);
-	const user = `<baton_pack v="3" kind="${input.kind}"${input.reason ? ` reason="${input.reason}"` : ""}>\n${render(rest)}\n</baton_pack>`;
+	const user = batonPack(input.kind, input.reason, render(rest));
 	const stableTokens = estimateTokens(system);
 	const tokens = stableTokens + estimateTokens(user);
 	return {
@@ -65,7 +70,7 @@ export function buildReviewPack(input: PackInput, opts: { budgetTokens?: number;
 /** Single-text form of the pack (debugging, `baton-pack --text`). */
 export function buildPack(input: PackInput, budgetTokens: number = DEFAULT_PACK_BUDGET): Pack {
 	const { sections, clipped } = fitSections(packSections(input), budgetTokens);
-	const text = `<baton_pack v="3" kind="${input.kind}"${input.reason ? ` reason="${input.reason}"` : ""}>\n${render(sections)}\n</baton_pack>`;
+	const text = batonPack(input.kind, input.reason, render(sections));
 	const tokens = estimateTokens(text);
 	return {
 		kind: input.kind,
