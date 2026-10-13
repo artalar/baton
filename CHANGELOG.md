@@ -10,6 +10,7 @@
 - Planning: auto-plan nudge after 8 exploration calls, a one-time soft gate on the first write without a plan, plan reply fields `invariants`, `rules`, `checkpoints`, a pinned plan in every request, `baton_step` progress tracking, drift nudge after 20 calls without a step.
 - Review checks against the pinned plan; a review that returns steps becomes the new pinned plan.
 - Earlier review: a nudge at the first milestone (tests green or build/typecheck exit 0 after edits); default reminder lowered from 25 to 12 calls.
+- Advisor replies cut off by the output limit are salvaged (complete steps kept, tail fields defaulted); the retry after a cut-off asks for a much shorter reply; packs ask for concise English replies; `advisorMaxTokens` default 4096 → 8192 (reasoning shares the limit).
 - Advisor usage, attempts and pack size are recorded in the journal (`advisor` events) and tool details.
 
 ## 0.1.0 — 2026-10-13

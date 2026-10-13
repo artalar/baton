@@ -39,3 +39,23 @@ describe("advisor schema", () => {
 		expect(t).toContain("Test command: npm test");
 	});
 });
+
+import { repairTruncatedJson } from "../src/schema.ts";
+describe("truncated advisor replies", () => {
+	it("salvages a reply cut off by max_tokens: complete steps kept, tail fields defaulted", () => {
+		const full = JSON.stringify({ assessment: "a", verdict: "course_correct", facts_corrected: [], plan: [{ id: "S1", action: "x", done_when: "t" }, { id: "S2", action: "y", done_when: "u" }] });
+		const cut = "```json\n" + full.slice(0, full.indexOf('"S2"') + 12);
+		const r = parseAdvisorReply(cut);
+		expect(r.ok).toBe(true);
+		if (!r.ok) return;
+		expect(r.repaired).toBe(true);
+		expect(r.truncated).toBe(true);
+		expect(r.reply.plan.map((s) => s.id)).toEqual(["S1"]);
+		expect(r.reply.do_not_retry).toEqual([]);
+		expect(r.reply.test_cmd).toBeNull();
+	});
+	it("does not invent a verdict", () => {
+		expect(parseAdvisorReply('{"assessment": "long text that was cu').ok).toBe(false);
+		expect(repairTruncatedJson('{"a": 1}')).toBeUndefined();
+	});
+});

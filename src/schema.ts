@@ -80,11 +80,59 @@ export function extractJson(text: string): unknown {
 	return undefined;
 }
 
-export type ParseResult = { ok: true; reply: AdvisorReply; truncated: boolean } | { ok: false; errors: string[] };
+/**
+ * Pure: salvage a JSON object cut off by max_tokens. Cuts back to the last complete value
+ * (a "," or a closing bracket outside strings) and closes the open brackets. Returns undefined
+ * when nothing usable is left.
+ */
+export function repairTruncatedJson(text: string): unknown {
+	const start = text.indexOf("{");
+	if (start < 0) return undefined;
+	const stack: string[] = [];
+	const cuts: { pos: number; stack: string[] }[] = [];
+	let inStr = false;
+	let esc = false;
+	for (let i = start; i < text.length; i++) {
+		const ch = text[i]!;
+		if (inStr) {
+			if (esc) esc = false;
+			else if (ch === "\\") esc = true;
+			else if (ch === '"') inStr = false;
+			continue;
+		}
+		if (ch === '"') inStr = true;
+		else if (ch === "{" || ch === "[") stack.push(ch === "{" ? "}" : "]");
+		else if (ch === "}" || ch === "]") {
+			stack.pop();
+			if (!stack.length) return undefined; // complete object: not a truncation case
+			cuts.push({ pos: i + 1, stack: [...stack] });
+		} else if (ch === ",") cuts.push({ pos: i, stack: [...stack] });
+	}
+	for (let k = cuts.length - 1; k >= 0; k--) {
+		const c = cuts[k]!;
+		try {
+			return JSON.parse(text.slice(start, c.pos) + [...c.stack].reverse().join(""));
+		} catch {
+			/* try an earlier cut */
+		}
+	}
+	return undefined;
+}
+
+export type ParseResult = { ok: true; reply: AdvisorReply; truncated: boolean; repaired?: boolean } | { ok: false; errors: string[] };
 
 export function parseAdvisorReply(text: string): ParseResult {
-	const json = extractJson(text);
-	if (json === undefined) return { ok: false, errors: ["no JSON object found in reply"] };
+	let json = extractJson(text);
+	let repaired = false;
+	if (json === undefined) {
+		// cut off by max_tokens: salvage what is complete and default the missing tail fields
+		const fixed = repairTruncatedJson(text) as Record<string, unknown> | undefined;
+		if (fixed && typeof fixed === "object" && typeof fixed.verdict === "string" && Array.isArray(fixed.plan)) {
+			json = { facts_corrected: [], do_not_retry: [], test_cmd: null, ...fixed, plan: (fixed.plan as unknown[]).filter((st) => Value.Check(AdvisorStep, st)) };
+			repaired = true;
+		}
+	}
+	if (json === undefined) return { ok: false, errors: ["no JSON object found in reply (cut off at max tokens?)"] };
 	if (!Value.Check(AdvisorReply, json)) {
 		const errors = [...Value.Errors(AdvisorReply, json)].slice(0, 8).map((e) => `${(e as { instancePath?: string }).instancePath ?? ""} ${e.message}`.trim());
 		return { ok: false, errors };
@@ -92,7 +140,7 @@ export function parseAdvisorReply(text: string): ParseResult {
 	const reply = json as AdvisorReply;
 	const truncated = reply.plan.length > MAX_STEPS;
 	if (truncated) reply.plan = reply.plan.slice(0, MAX_STEPS);
-	return { ok: true, reply, truncated };
+	return { ok: true, reply, truncated: truncated || repaired, repaired };
 }
 
 /** Human/LLM readable plan block appended to context or put into the reset summary. */

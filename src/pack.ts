@@ -116,7 +116,7 @@ export function packSections(i: PackInput): Section[] {
 	s.push({
 		title: "INSTRUCTIONS",
 		cut: 0,
-		body: `${INSTRUCTIONS[i.kind]}\n${NO_TOOLS}\nReply with ONE JSON object only, no prose, matching this schema (every plan step needs done_when; at most 7 steps):\n${REPLY_SCHEMA_TEXT}`,
+		body: `${INSTRUCTIONS[i.kind]}\n${NO_TOOLS}\nReply with ONE JSON object only, no prose, in English, matching this schema. Be concise: assessment at most 3 sentences, at most 7 steps, each field at most 60 words, quote at most one line per finding. The reply must fit the output limit; a cut-off reply is wasted:\n${REPLY_SCHEMA_TEXT}`,
 	});
 	return s;
 }

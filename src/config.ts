@@ -66,7 +66,7 @@ export interface BatonConfig {
 export const DEFAULT_CONFIG: BatonConfig = {
 	executor: "openrouter/z-ai/glm-5.3-flash",
 	advisor: "openrouter/anthropic/claude-opus-5.5",
-	advisorMaxTokens: 4096,
+	advisorMaxTokens: 8192,
 	judge: { enabled: false, model: "typesafe/jev-latest", minConfidence: 0.7 },
 	packBudgetTokens: 40_000,
 	pack: {

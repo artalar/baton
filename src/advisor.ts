@@ -41,9 +41,17 @@ export async function callAdvisor(ctx: ExtensionContext, modelRef: string, pack:
 		if (parsed.ok) return { ok: true, reply: parsed.reply, truncated: parsed.truncated, raw, usage, model: modelRef, attempts: attempt };
 		if (attempt === 2) return { ok: false, raw, errors: parsed.errors, usage, model: modelRef, attempts: attempt };
 		messages.push({ role: "assistant", content: res.content, timestamp: Date.now() } as any);
+		const cut = res.stopReason === "length";
 		messages.push({
 			role: "user",
-			content: [{ type: "text", text: `Your reply did not match the schema: ${parsed.errors.join("; ")}. Reply again with ONE valid JSON object only.` }],
+			content: [
+				{
+					type: "text",
+					text: cut
+						? "Your reply was cut off at the output token limit. Reply again with ONE valid JSON object only, much shorter: at most 5 steps, at most 40 words per field, no long quotes, in English."
+						: `Your reply did not match the schema: ${parsed.errors.join("; ")}. Reply again with ONE valid JSON object only.`,
+				},
+			],
 			timestamp: Date.now(),
 		});
 	}
