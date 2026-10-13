@@ -10,9 +10,12 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, write
 import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { decide, type JevQuestions, type JevResult } from "../core/jev.ts";
+import { openRouterComplete, openRouterModelId } from "../core/openrouter.ts";
 import { parseModelRef } from "./config.ts";
+import { buildState, buildSummary, CALL_QUESTIONS, callSummary, gateFromAnswers, recordCall, summaryPrompt, TURN_QUESTIONS, turnJevFromAnswers, type TurnJev } from "./jev-policy.ts";
 import { classifyEffects, diffSnaps, revertTo, type Snap, snapshot } from "./fsguard.ts";
-import { addCost, anchorCache, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
+import { addCost, anchorCache, applyJevGate, budgetExceeded, budgetSpend, type Call, type CostRow, capMaxTokens, capReasoning, countCacheControl, DEFAULT_SWITCH, executedSegments, decideTurn, gateCall, initialSwitchState, isHelper, LEAD_SYSTEM_NOTE, leadRequestPlan, MSG, type Msg, optimizeContext, type Result, shapeContext, type SwitchConfig, type SwitchState, TEST_FILE } from "./switch-core.ts";
 
 /** Test files under cwd (skips node_modules, dot dirs, dist). */
 export function hasTestFiles(dir: string, depth = 5): boolean {
@@ -45,7 +48,11 @@ export function loadSwitchConfig(cwd: string): SwitchConfig & { journalDir: stri
 	}
 	const env = process.env.BATON_BUDGET_USD;
 	if (env && Number(env) > 0) over.budgetUsd = Number(env);
-	return { ...DEFAULT_SWITCH, ...over, journalDir };
+	const jevOver = (over.jev ?? {}) as Partial<SwitchConfig["jev"]>;
+	const jev = { ...DEFAULT_SWITCH.jev, ...jevOver, thr: { ...DEFAULT_SWITCH.jev.thr, ...(jevOver.thr ?? {}) } };
+	if (process.env.BATON_JEV === "0" || process.env.BATON_JEV === "off") jev.enabled = false;
+	if (process.env.BATON_JEV_MODEL) jev.model = process.env.BATON_JEV_MODEL;
+	return { ...DEFAULT_SWITCH, ...over, jev, journalDir };
 }
 
 type Block = { type: string; id?: string; name?: string; arguments?: Record<string, unknown>; text?: string; thinking?: string };
@@ -74,9 +81,58 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			/* journal is best effort */
 		}
 	};
+	const jevSummary = () =>
+		st && { enabled: cfg!.jev.enabled, model: cfg!.jev.model, fallbackModel: cfg!.jev.fallbackModel, jevCalls: st.jev.calls, jevGateCalls: st.jev.gateCalls, jevTurnCalls: st.jev.turnCalls, jevFallbacks: st.jev.fallbacks, jevFallbackModel: st.jev.fallbackModel, jevCached: st.jev.cached, jevBlocks: st.jev.blocks, jevHandoffs: st.jev.handoffs, jevSwitches: st.jev.switches, jevCost: st.jev.cost, jevAvgLatMs: st.jev.calls + st.jev.fallbacks ? Math.round(st.jev.latMs / (st.jev.calls + st.jev.fallbacks)) : 0, jevMaxLatMs: Math.round(st.jev.maxLatMs), summaryCalls: st.jev.summaryCalls, summaryCost: st.jev.summaryCost, summaryText: st.track.text };
+	const extraCost = () => (st ? st.jev.cost + st.jev.summaryCost : 0);
+	/** Ask Jev; updates stats and journals one `jev` event. Undefined = fall back to the 0.8.1 rules. */
+	const askJev = async (point: "call" | "turn", questions: JevQuestions, proposed: { model: string; call: string }, extra: Record<string, unknown> = {}): Promise<JevResult | undefined> => {
+		if (!st || !cfg?.jev.enabled) return undefined;
+		const j = cfg.jev;
+		const sum = buildSummary(st.track, { activeModel: isHelper(st.phase) ? cfg.helper : cfg.lead, phase: st.phase, redSame: st.red.same, redTotal: st.red.total, checksRed: !st.lastVerifyGreen && st.red.total > 0, guardFlags: st.stretchFlags.map((f) => f.why) });
+		const state = buildState(st.track, sum, proposed, j);
+		const r = await decide(state, questions, { model: j.model, fallbackModel: j.fallbackModel, timeoutMs: j.timeoutMs });
+		st.jev.latMs += r.latMs;
+		st.jev.maxLatMs = Math.max(st.jev.maxLatMs, r.latMs);
+		if (!r.ok) {
+			st.jev.fallbacks++;
+			st.jev.cost += r.cost;
+			log("jev", { point, phase: st.phase, fallback: true, error: r.error.slice(0, 300), lat: Math.round(r.latMs), cost: r.cost, ...extra });
+			log("jev_fallback", { point, phase: st.phase, error: r.error.slice(0, 300) });
+			return undefined;
+		}
+		st.jev.calls++;
+		if (point === "call") st.jev.gateCalls++;
+		else st.jev.turnCalls++;
+		if (r.cached) st.jev.cached++;
+		if (r.attempt === "fallback") st.jev.fallbackModel++;
+		st.jev.cost += r.usage.cost ?? 0;
+		return r;
+	};
+	let summaryInflight = false;
+	const refreshSummaryText = () => {
+		if (!st || !cfg?.jev.enabled || !cfg.jev.summaryEveryTurns || summaryInflight) return;
+		if (turn - st.track.textTurn < cfg.jev.summaryEveryTurns || st.track.toolCalls < 3) return;
+		summaryInflight = true;
+		const s0 = st;
+		s0.track.textTurn = turn;
+		const sum = buildSummary(s0.track, { activeModel: isHelper(s0.phase) ? cfg.helper : cfg.lead, phase: s0.phase, redSame: s0.red.same, redTotal: s0.red.total, checksRed: !s0.lastVerifyGreen && s0.red.total > 0, guardFlags: s0.stretchFlags.map((f) => f.why) });
+		const t0 = Date.now();
+		openRouterComplete({ model: openRouterModelId(cfg.helper), maxTokens: 600, cache: false }, { signal: AbortSignal.timeout(30_000) })([{ role: "user", content: summaryPrompt(s0.track, sum, cfg.jev.summaryChars) }])
+			.then((r) => {
+				const cost = (r.usage as { cost?: number } | undefined)?.cost ?? 0;
+				s0.jev.summaryCalls++;
+				s0.jev.summaryCost += cost;
+				const text = r.text.replace(/\s+/g, " ").trim().slice(0, cfg!.jev.summaryChars);
+				if (text) s0.track.text = text;
+				log("jev_summary", { ok: !!text, chars: text.length, cost, lat: Date.now() - t0, error: r.errorMessage });
+			})
+			.finally(() => {
+				summaryInflight = false;
+			});
+	};
 	const summary = () => {
 		if (!st) return;
-		const s = { phase: st.phase, switches: st.switches.length, followups: st.followups, costs, total: num(costs), budget: budgetSpend(costs, leadId(), cfg!.helperCostFactor), budgetStopped, metrics: st.metrics, flags: st.flags, wallS: Math.round((Date.now() - started) / 1000), switchLog: st.switches };
+		const s = { phase: st.phase, jev: jevSummary(), switches: st.switches.length, followups: st.followups, costs, total: num(costs), budget: { ...budgetSpend(costs, leadId(), cfg!.helperCostFactor), jevUsd: extraCost() }, budgetStopped, metrics: st.metrics, flags: st.flags, wallS: Math.round((Date.now() - started) / 1000), switchLog: st.switches };
 		try {
 			writeFileSync(join(dir, "switch-summary.json"), JSON.stringify(s, null, 2));
 		} catch {
@@ -112,6 +168,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		if (e.messageType !== "user") return undefined;
 		started = Date.now();
 		st = initialSwitchState(Date.now());
+		st.track.task = String((e as { prompt?: string }).prompt ?? "").slice(0, 400);
 		log("start", { lead: cfg!.lead, helper: cfg!.helper, config: { ...cfg } });
 		if (process.env.BATON_SWITCH_START === "lead") {
 			// resume (`pi -c`): the context already holds the earlier work — the lead continues directly
@@ -125,7 +182,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		return { message: { customType: "baton-switch-helper", content: MSG.read, display: true }, systemPrompt: e.systemPrompt + LEAD_SYSTEM_NOTE };
 	});
 
-	pi.on("tool_call", (e, ctx) => {
+	pi.on("tool_call", async (e, ctx) => {
 		if (!st) return undefined;
 		const c: Call = { id: e.toolCallId, name: e.toolName, args: (e.input ?? {}) as Record<string, unknown> };
 		const abs = (p: string) => (isAbsolute(p) ? p : join(ctx.cwd, p));
@@ -141,6 +198,22 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			log(g.reason.startsWith("Baton guardrail") ? "guardrail" : "blocked", { phase: st.phase, tool: c.name, reason: g.reason, args: JSON.stringify(c.args).slice(0, 300) });
 			return g;
 		}
+		// 0.9: Jev gates every helper call (after the deterministic rules; errors/timeouts → rules only)
+		if (isHelper(st.phase) && cfg!.jev.gateCalls) {
+			const phase = st.phase;
+			const r = await askJev("call", CALL_QUESTIONS, { model: cfg!.helper, call: callSummary(c) });
+			if (r && st.phase === phase) {
+				const d = gateFromAnswers(r.answers, cfg!.jev.thr);
+				const ph = r.answers.phase?.type === "choice" ? r.answers.phase.choice : undefined;
+				log("jev", { point: "call", phase, tool: c.name, action: d.action, reason: d.reason, probs: d.probs, jevPhase: ph, lat: Math.round(r.latMs), cost: r.usage.cost ?? 0, model: r.model, cached: r.cached, fallback: false, fallbackModel: r.attempt === "fallback" });
+				const jb = applyJevGate(st, c, d);
+				if (jb) {
+					st.blocked.push(c.id);
+					log("blocked", { phase, tool: c.name, reason: jb.reason, by: "jev", args: JSON.stringify(c.args).slice(0, 300) });
+					return jb;
+				}
+			}
+		}
 		// fs guard: snapshot before every helper call that can change files, and before lead bash calls (read-like detection)
 		const helper = isHelper(st.phase);
 		const mayWrite = !["read", "grep", "find", "ls", "glob"].includes(c.name);
@@ -152,6 +225,10 @@ export default function batonSwitch(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_result", (e, ctx) => {
+		if (st && !e.parentToolCallId && !st.blocked.includes(e.toolCallId)) {
+			const text = (e.content as Block[]).flatMap((b) => (b.type === "text" && b.text ? [b.text] : [])).join("\n");
+			recordCall(st.track, { id: e.toolCallId, name: e.toolName, args: (e.input ?? {}) as Record<string, unknown> }, isHelper(st.phase) ? cfg!.helper : cfg!.lead, { isError: !!e.isError, text }, cfg!.jev.recentCalls);
+		}
 		const p = pending.get(e.toolCallId);
 		if (!p || !st) return undefined;
 		pending.delete(e.toolCallId);
@@ -160,6 +237,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 		const ms = p.pre.ms + post.ms;
 		guardMs.push(ms);
 		const changed = d.changed.length > 0 || d.headChanged || d.nodeModulesChanged;
+		if (d.nodeModulesChanged && !(p.command && /\b(?:npm|pnpm|yarn|bun)\s+(?:i|install|add|ci)\b/.test(p.command))) st.track.nodeModulesChanged = true;
 		if (!changed) {
 			if (!p.helper && p.name === "bash") st.noChange.push(e.toolCallId);
 			log("fs_guard", { phase: p.phase, tool: p.name, ms: Math.round(ms * 10) / 10, changed: false });
@@ -197,7 +275,8 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			afterHelper = false;
 		}
 		if (cfg && st && !budgetStopped) {
-			const b = budgetExceeded(costs, leadId(), cfg);
+			const b0 = budgetExceeded(costs, leadId(), cfg);
+			const b = { estimate: b0.estimate + extraCost(), stop: cfg.budgetUsd > 0 && b0.estimate + extraCost() + cfg.reserveUsd >= cfg.budgetUsd };
 			if (b.stop) {
 				budgetStopped = true;
 				log("budget_stop", { estimate: b.estimate, budget: cfg.budgetUsd, reserve: cfg.reserveUsd, factor: cfg.helperCostFactor, phase: st.phase });
@@ -258,12 +337,24 @@ export default function batonSwitch(pi: ExtensionAPI) {
 				return "";
 			}
 		};
-		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
+		// 0.9: Jev at the turn boundary (lead: routine ahead → helper; helper debug/review: stuck → lead)
+		let jev: TurnJev | undefined;
+		const realCalls = calls.filter((c) => !st!.blocked.includes(c.id) && !st!.dropped.includes(c.id));
+		if (cfg!.jev.gateTurns && realCalls.length && !st.wantLead && (from === "lead" || from === "debug" || from === "review")) {
+			const last = realCalls[realCalls.length - 1]!;
+			const r = await askJev("turn", TURN_QUESTIONS, { model: isHelper(from) ? cfg!.helper : cfg!.lead, call: `(turn boundary — last call of the turn) ${callSummary(last)}` });
+			if (r) {
+				jev = turnJevFromAnswers(r.answers);
+				log("jev", { point: "turn", phase: from, probs: jev, consecutiveNonWrite: st.track.consecutiveNonWrite, lat: Math.round(r.latMs), cost: r.usage.cost ?? 0, model: r.model, cached: r.cached, fallback: false, fallbackModel: r.attempt === "fallback" });
+			}
+		}
+		refreshSummaryText();
+		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, jev, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
 		const entries: SessionBoundaryDraft[] = [];
 		if (d.reason && d.to === from && d.continue) log(d.message ? "nudge" : "retry", { phase: from, reason: d.reason });
 		if (d.to !== from) {
 			if (isHelper(from) && !isHelper(d.to)) afterHelper = true;
-			log("switch", { from, to: d.to, reason: d.reason, compacted: d.compacted, report: d.report, metrics: st.metrics, model: d.to === "done" ? undefined : isHelper(d.to) ? cfg!.helper : cfg!.lead, costs });
+			log("switch", { from, to: d.to, reason: d.reason, byJev: /^jev:|\(jev:/.test(d.reason ?? "") || /jev:/.test(d.reason ?? ""), jev: { calls: st.jev.calls, fallbacks: st.jev.fallbacks, cost: st.jev.cost }, compacted: d.compacted, report: d.report, metrics: st.metrics, model: d.to === "done" ? undefined : isHelper(d.to) ? cfg!.helper : cfg!.lead, costs });
 			if (d.to !== "done") await setModelFor(ctx, d.to);
 			summary();
 		}
@@ -275,7 +366,7 @@ export default function batonSwitch(pi: ExtensionAPI) {
 
 	pi.on("agent_end", () => {
 		if (guardMs.length) log("fs_guard_stats", { calls: guardMs.length, avgMs: Math.round((guardMs.reduce((a, b) => a + b, 0) / guardMs.length) * 10) / 10, maxMs: Math.round(Math.max(...guardMs) * 10) / 10 });
-		if (st) log("end", { phase: st.phase, costs, metrics: st.metrics, flags: st.flags, budget: budgetSpend(costs, leadId(), cfg!.helperCostFactor), budgetStopped });
+		if (st) log("end", { phase: st.phase, costs, metrics: st.metrics, flags: st.flags, jev: jevSummary(), budget: { ...budgetSpend(costs, leadId(), cfg!.helperCostFactor), jevUsd: extraCost() }, budgetStopped });
 		summary();
 	});
 

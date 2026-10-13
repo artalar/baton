@@ -4,6 +4,8 @@
  * side-effect free; src/pi/switch.ts wires them to pi events (tool_call gate, turn_end switch, context shaping).
  */
 
+import { DEFAULT_JEV, initialTrack, type JevConfig, type JevTrack, type TurnJev } from "./jev-config.ts";
+
 export type Phase = "read" | "lead" | "followup" | "debug" | "review" | "final" | "done";
 export const HELPER_PHASES: readonly Phase[] = ["read", "followup", "debug", "review"];
 export const isHelper = (p: Phase) => HELPER_PHASES.includes(p);
@@ -44,6 +46,8 @@ export interface SwitchConfig {
 	reserveUsd: number;
 	/** Max chars of helper read outputs carried in one honest harness report. */
 	reportChars: number;
+	/** 0.9: Jev decision model gate (src/pi/jev-policy.ts). */
+	jev: JevConfig;
 }
 
 export const DEFAULT_SWITCH: SwitchConfig = {
@@ -67,6 +71,7 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	helperCostFactor: 2.3,
 	reserveUsd: 0.5,
 	reportChars: 160_000,
+	jev: DEFAULT_JEV,
 };
 
 export interface Call {
@@ -257,7 +262,31 @@ export interface SwitchState {
 	/** Clipped outputs: toolCallId → max chars. */
 	clips: Record<string, number>;
 	switches: SwitchEvent[];
+	/** 0.9: Jev rolling summary inputs (ring buffer of recent calls, counters, helper-written note). */
+	track: JevTrack;
+	jev: JevStats;
 }
+
+export interface JevStats {
+	/** Successful decisions (incl. cache hits). */
+	calls: number;
+	gateCalls: number;
+	turnCalls: number;
+	/** Decisions answered by the fallback decision model. */
+	fallbackModel: number;
+	/** Errors / timeouts / invalid answers → 0.8.1 rules. */
+	fallbacks: number;
+	cached: number;
+	blocks: number;
+	handoffs: number;
+	switches: number;
+	cost: number;
+	latMs: number;
+	maxLatMs: number;
+	summaryCalls: number;
+	summaryCost: number;
+}
+export const initialJevStats = (): JevStats => ({ calls: 0, gateCalls: 0, turnCalls: 0, fallbackModel: 0, fallbacks: 0, cached: 0, blocks: 0, handoffs: 0, switches: 0, cost: 0, latMs: 0, maxLatMs: 0, summaryCalls: 0, summaryCost: 0 });
 
 export function initialSwitchState(now: number): SwitchState {
 	return {
@@ -299,6 +328,8 @@ export function initialSwitchState(now: number): SwitchState {
 		stubs: {},
 		clips: {},
 		switches: [],
+		track: initialTrack(),
+		jev: initialJevStats(),
 	};
 }
 
@@ -338,6 +369,8 @@ export interface TurnInput {
 	testsExist?: boolean;
 	/** `git diff --stat` (lazy; called only at a debug/review → lead handback). */
 	diffStat?: () => string;
+	/** 0.9: Jev answers for this turn boundary (absent → 0.8.1 rules only). */
+	jev?: TurnJev;
 }
 
 export interface Decision {
@@ -486,8 +519,35 @@ export function guardCheck(c: Call, readFile: (p: string) => string | undefined 
 	return undefined;
 }
 
-/** Pure: the tool_call gate. */
-export function gateCall(s: SwitchState, c: Call, fileExists: (p: string) => boolean, readFile?: (p: string) => string | undefined): { block: true; reason: string } | undefined {
+/** Pure: the deterministic tool_call gate (0.8.1 rules; always runs first, independent of Jev). */
+export const gateCall = (...a: Parameters<typeof gateCallRules>) => gateCallRules(...a);
+
+/**
+ * Pure: apply a Jev gate decision to a helper call that passed the deterministic rules. `block` → blocked and the
+ * lead takes over after this turn; `allow_handoff` → the call runs, the lead takes over after this turn.
+ */
+export function applyJevGate(s: SwitchState, c: Call, d: { action: "allow" | "allow_handoff" | "block"; reason: string }): { block: true; reason: string } | undefined {
+	if (!isHelper(s.phase) || d.action === "allow") return undefined;
+	if (d.action === "block") {
+		const f: Flag = { phase: s.phase, tool: c.name, path: editPath(c) || undefined, why: d.reason, blocked: true };
+		s.flags.push(f);
+		s.stretchFlags.push(f);
+		s.jev.blocks++;
+		s.wantLead = `call blocked (${d.reason})`;
+		return { block: true, reason: `Baton supervisor: this call was blocked (${d.reason}): it looks like weakening checks or tampering with the environment. The lead model takes over now; reply ESCALATE <one line why>.` };
+	}
+	s.jev.handoffs++;
+	if (/lead should review/.test(d.reason)) {
+		const f: Flag = { phase: s.phase, tool: c.name, path: editPath(c) || undefined, why: d.reason, blocked: false };
+		s.flags.push(f);
+		s.stretchFlags.push(f);
+	}
+	s.wantLead ??= d.reason;
+	return undefined;
+}
+
+/** Pure: the tool_call gate — deterministic rules only. */
+export function gateCallRules(s: SwitchState, c: Call, fileExists: (p: string) => boolean, readFile?: (p: string) => string | undefined): { block: true; reason: string } | undefined {
 	if (!isHelper(s.phase)) return undefined;
 	if ((BATON_TOOLS as readonly string[]).includes(c.name)) return { block: true, reason: `${c.name} is for the lead model only.` };
 	// reading phases: any tool is allowed; the fs guard (src/pi/fsguard.ts) reverts file changes and hands over
@@ -697,6 +757,11 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 		case "debug":
 		case "review": {
 			if (s.wantLead) return to(s, inp, "lead", `escalated: ${s.wantLead}`, cfg);
+			if (inp.jev && inp.jev.stuck >= cfg.jev.thr.stuck) {
+				s.jev.switches++;
+				s.planningLeft = cfg.planningTurns;
+				return to(s, inp, "lead", `jev: stuck ${inp.jev.stuck.toFixed(2)} (red ×${s.red.same}, total ${s.red.total})`, cfg);
+			}
 			if (s.phase === "debug" && (s.red.same >= cfg.redCycles || s.red.total >= cfg.maxRedTotal)) {
 				const why = `escalated after ${s.red.total} red cycles (same failure ×${s.red.same}): ${s.red.sig.slice(0, 200)}`;
 				s.planningLeft = cfg.planningTurns;
@@ -753,6 +818,14 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 			// (read tools, read-only bash, or bash the fs guard saw change nothing) → the helper reads instead
 			const readLike = (c: Call) => !isEdit(c) && !isVerify(c) && !(BATON_TOOLS as readonly string[]).includes(c.name) && (isReadOnly(c) || s.noChange.includes(c.id));
 			s.leadReadTurns = real.length && real.every(readLike) ? s.leadReadTurns + 1 : 0;
+			// 0.9: Jev predicts routine (non-write) work ahead after ≥2 consecutive non-write calls → helper reads
+			if (inp.jev && real.length && !real.some(isEdit) && !(real.some(isVerify) && s.leadEditsInStretch > 0) && inp.jev.routine >= cfg.jev.thr.routine && s.track.consecutiveNonWrite >= cfg.jev.thr.minNonWrite && s.track.routineHandoffs < cfg.jev.maxRoutineHandoffs) {
+				s.track.routineHandoffs++;
+				s.jev.switches++;
+				const d = to(s, inp, "followup", `jev: routine ahead ${inp.jev.routine.toFixed(2)} after ${s.track.consecutiveNonWrite} non-write calls`, cfg);
+				d.message = { audience: "helper", text: MSG.followup("continue the lead's reads/checks above and anything they obviously lead to") };
+				return d;
+			}
 			if (s.leadReadTurns >= 2 && s.followups < cfg.maxFollowups) {
 				s.followups++;
 				const d = to(s, inp, "followup", `lead issued only reads (round ${s.followups})`, cfg);
