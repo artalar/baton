@@ -15,10 +15,10 @@ import { charsForTokens, estimateTokens, globToRegExp, matchesAny } from "../src
 const cfg = DEFAULT_CONFIG.triggers;
 
 describe("token estimate", () => {
-	it("is conservative: chars/3.2, non-ASCII counted twice", () => {
-		expect(estimateTokens("a".repeat(320))).toBe(100);
-		expect(estimateTokens("я".repeat(160))).toBe(100);
-		expect(charsForTokens(100)).toBe(320);
+	it("is conservative: chars/2.4, non-ASCII counted twice", () => {
+		expect(estimateTokens("a".repeat(240))).toBe(100);
+		expect(estimateTokens("я".repeat(120))).toBe(100);
+		expect(charsForTokens(100)).toBe(240);
 	});
 });
 

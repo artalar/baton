@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 
 /**
- * Conservative chars-per-token ratio. Real tokenizers give ~3.5-4 chars/token for English prose
- * but ~2.8-3.4 for code, JSON and non-Latin text (e.g. Russian), so chars/4 under-counts the packs
- * Baton sends. 3.2 keeps the pack budget safe for mixed code + prose.
+ * Conservative chars-per-token ratio, calibrated on real advisor calls (Claude Opus 5.5 via OpenRouter,
+ * Tetris-on-Reatom run, 2026-10-13): packs of code + skills + diff measured 2.43-2.61 "estimate units"
+ * per real input token with chars/3.2 under-counting by 23-32%. 2.4 keeps the pack budget safe.
  */
-export const CHARS_PER_TOKEN = 3.2;
+export const CHARS_PER_TOKEN = 2.4;
 
-/** Conservative token estimate used everywhere in Baton: chars / 3.2, plus extra weight for non-ASCII. */
+/** Conservative token estimate used everywhere in Baton: chars / 2.4, non-ASCII counted twice. */
 export function estimateTokens(text: string): number {
 	let nonAscii = 0;
 	for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 127) nonAscii++;

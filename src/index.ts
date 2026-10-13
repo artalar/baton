@@ -397,7 +397,7 @@ export default function baton(pi: ExtensionAPI) {
 				[
 					`Baton: ${r.journal.events.length} events in ${r.cfg.journalDir}`,
 					`tool calls ${t.toolCalls}, since advisor ${t.toolCalls - t.lastAdvisorAt}, review passed: ${t.reviewPassed}`,
-					`last request: masked ${s.masked}, duplicate ${s.deduped}, stale ${s.stale}, ~${Math.round(s.charsSaved / 3.2)} tok saved`,
+					`last request: masked ${s.masked}, duplicate ${s.deduped}, stale ${s.stale}, ~${Math.round(s.charsSaved / 2.4)} tok saved`,
 					`plan: ${r.pinned ? `${r.pinned.label}, ${Object.values(r.stepStatus).filter((x) => x === "done").length}/${r.pinned.reply.plan.length} steps done` : "none"}`,
 					`advisor ${r.cfg.advisor}, judge ${r.cfg.judge.enabled ? r.cfg.judge.model : "off"}`,
 				].join("\n"),
