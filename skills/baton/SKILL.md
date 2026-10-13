@@ -10,7 +10,7 @@ tools: Baton prepares a pack for it from the artefacts — task, user prompts, p
 files, last test run, relevant project skills and AGENTS.md. Everything you *say* about your work is shown to it
 as an **unverified claim**; only the diff and the test output count. So: run the tests before a review.
 
-Every tool call is journaled to `.pi/baton/events.jsonl`. By default your context is never rewritten; the
+Every tool call is journaled for this pi session at `.pi/baton/sessions/<session id>/events.jsonl` (raw output in `raw/` next to it). A resumed session keeps that journal; a new session starts clean. By default your context is never rewritten; the
 advisor's reply is simply appended. (Only when the project enables `compact.enabled` is the context reset at
 each advisor call and older outputs become stubs like `[baton: output masked. evt#12 …]` — then call
 `baton_recall({"evt": 12})` for the full text.)
