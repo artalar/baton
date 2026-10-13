@@ -1,0 +1,13 @@
+{
+  "executor": "openrouter/z-ai/glm-5.3-flash",
+  "advisor": "openrouter/anthropic/claude-opus-5.5",
+  "advisorMaxTokens": 4096,
+  "judge": { "enabled": false, "model": "typesafe/jev-latest", "minConfidence": 0.7 },
+  "packBudgetTokens": 40000,
+  "triggers": { "contextRatio": 0.6, "sameErrorCount": 3, "reviewBeforeCommit": true, "remindEvery": 25, "minGapCalls": 5 },
+  "mask": { "enabled": true, "exemptTools": ["baton_review", "baton_help", "baton_plan"], "dedupReads": true, "staleReads": true },
+  "help": { "lastCalls": 8 },
+  "reset": { "keepTurns": 2 },
+  "replaceAutoCompact": true,
+  "journalDir": ".pi/baton"
+}
