@@ -79,22 +79,6 @@ Development: `npm install && npm run check` runs `tsc --noEmit` against the real
 - The Jev judge only covers the help-pack timeline. Its question format follows pi's `ClassifierContext` types, but it has not been run against the TypeSafe API.
 - `executor` in the config is informational. Baton never switches models.
 
-## По-русски
-
-Baton — расширение для pi. Дешёвая модель-исполнитель (GLM-5.3-Flash) пишет код, а сильный советник (Opus 5.5) вызывается разово и без кэша, только для плана (`baton_plan`), помощи (`baton_help`) и ревью (`baton_review`).
-
-- Все вызовы инструментов пишутся в `.pi/baton/events.jsonl`.
-- Уже прочитанные выводы в запросе заменяются заглушками `evt#`; полный вывод возвращает `baton_recall`.
-- После help и plan контекст сбрасывается до «задача + план + 2 последних хода».
-- Страховки:
-  - контекст ≥60%;
-  - одна и та же ошибка 3 раза;
-  - `git commit` заблокирован до успешного ревью;
-  - напоминание после 25 вызовов.
-- Установка: `pi install git:github.com/artalar/baton`, а локально — `pi -e ./src/index.ts`.
-- Конфиг: `~/.pi/agent/baton.json` и `.pi/baton.json`, в них только id моделей. Ключи берутся из pi (`auth.json` или env).
-- Статус: ранняя версия. Типы и юнит-тесты проверены, на реальных ключах end-to-end не проверялось.
-
 ## License
 
 MIT
