@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.3 — 2026-10-13
+- **Only a red verify hands the lead's work to the helper**: lead → debug after writing now requires a failing verify in the turn. Arm G: Opus ran green tests mid-work (logic + model done, no UI yet) → GLM took the verify loop, found nothing to fix, tried to create `Tetris.tsx`, was blocked by the "new files are the lead's job" rule and escalated 11 s before the budget stop (~1 min of wall time lost; the debug stretch itself cost ≈$0.035, so the block rule was not the money sink).
+- **Endgame**: when budget left (`budgetUsd − reserveUsd − estimate − Jev`) < `endgameUsd` (0.3), the lead keeps working: no lead → debug / follow-up / Jev routine hand-offs (each hand-back costs a cache write and wall time the lead needs to finish files).
+
 ## 0.9.2 — 2026-10-13
 - Jev lead → helper switch (`routine_ahead`) now requires ≥ `minNonWrite` consecutive non-write calls **of the lead** (`track.leadNonWrite`); helper read calls no longer count. Arm G: the switch fired right after the lead's first turn ("after 9 non-write calls" = GLM's reads), twice, each time GLM returned READ DONE in seconds.
 

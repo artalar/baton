@@ -46,6 +46,8 @@ export interface SwitchConfig {
 	reserveUsd: number;
 	/** Max chars of helper read outputs carried in one honest harness report. */
 	reportChars: number;
+	/** 0.9.3 endgame: when budget left (budget − reserve − estimate) < this, the lead keeps working — no mid-work hand-offs to the helper. */
+	endgameUsd: number;
 	/** 0.9: Jev decision model gate (src/pi/jev-policy.ts). */
 	jev: JevConfig;
 }
@@ -71,6 +73,7 @@ export const DEFAULT_SWITCH: SwitchConfig = {
 	helperCostFactor: 2.3,
 	reserveUsd: 0.5,
 	reportChars: 160_000,
+	endgameUsd: 0.3,
 	jev: DEFAULT_JEV,
 };
 
@@ -371,6 +374,8 @@ export interface TurnInput {
 	diffStat?: () => string;
 	/** 0.9: Jev answers for this turn boundary (absent → 0.8.1 rules only). */
 	jev?: TurnJev;
+	/** 0.9.3: USD left before the budget stop (undefined = no budget). */
+	budgetLeft?: number;
 }
 
 export interface Decision {
@@ -845,8 +850,9 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 			// (read tools, read-only bash, or bash the fs guard saw change nothing) → the helper reads instead
 			const readLike = (c: Call) => !isEdit(c) && !isVerify(c) && !(BATON_TOOLS as readonly string[]).includes(c.name) && (isReadOnly(c) || s.noChange.includes(c.id));
 			s.leadReadTurns = real.length && real.every(readLike) ? s.leadReadTurns + 1 : 0;
+			const endgame = inp.budgetLeft !== undefined && inp.budgetLeft < cfg.endgameUsd;
 			// 0.9: Jev predicts routine (non-write) work ahead after ≥2 consecutive non-write calls → helper reads
-			if (inp.jev && real.length && !real.some(isEdit) && !(real.some(isVerify) && s.leadEditsInStretch > 0) && inp.jev.routine >= cfg.jev.thr.routine && s.track.leadNonWrite >= cfg.jev.thr.minNonWrite && s.track.routineHandoffs < cfg.jev.maxRoutineHandoffs) {
+			if (!endgame && inp.jev && real.length && !real.some(isEdit) && !(real.some(isVerify) && s.leadEditsInStretch > 0) && inp.jev.routine >= cfg.jev.thr.routine && s.track.leadNonWrite >= cfg.jev.thr.minNonWrite && s.track.routineHandoffs < cfg.jev.maxRoutineHandoffs) {
 				s.track.routineHandoffs++;
 				s.jev.switches++;
 				const d = to(s, inp, "followup", `jev: routine ahead ${inp.jev.routine.toFixed(2)} after ${s.track.leadNonWrite} lead non-write calls`, cfg);
@@ -854,14 +860,17 @@ export function decideTurn(s: SwitchState, inp: TurnInput, cfg: SwitchConfig = D
 				d.message = { audience: "helper", text: MSG.followup(`the lead was exploring with these calls:\n- ${last}\nContinue this exploration: read/search the related files, types and docs the lead will need next (at least 3 calls) before replying READ DONE`) };
 				return d;
 			}
-			if (s.leadReadTurns >= 2 && s.followups < cfg.maxFollowups) {
+			if (!endgame && s.leadReadTurns >= 2 && s.followups < cfg.maxFollowups) {
 				s.followups++;
 				const d = to(s, inp, "followup", `lead issued only reads (round ${s.followups})`, cfg);
 				d.message = { audience: "helper", text: MSG.followup("continue the lead's reads above and anything they obviously lead to") };
 				return d;
 			}
 			const testsReady = s.leadRanTests || !!inp.testsExist;
-			if (real.some((c) => isVerify(c)) && s.leadEditsInStretch > 0 && testsReady) return to(s, inp, "debug", "lead ran a verify after writing code (tests exist)", cfg);
+			// 0.9.3: only a RED verify hands the fix loop to the helper; a green mid-work verify leaves the lead writing
+			// (arm G: green tests → GLM took over before the UI existed, tried to create it, got blocked, 1 min lost)
+			const redVerify = real.some((c) => isVerify(c) && resById.get(c.id)?.isError);
+			if (!endgame && redVerify && s.leadEditsInStretch > 0 && testsReady) return to(s, inp, "debug", "lead's verify after writing code failed (tests exist)", cfg);
 			if (!real.length) {
 				if (!testsReady && !s.testsNudged && !s.reviewDone && hasLeadCode(s)) {
 					s.testsNudged = true;

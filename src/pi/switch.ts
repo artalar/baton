@@ -349,7 +349,9 @@ export default function batonSwitch(pi: ExtensionAPI) {
 			}
 		}
 		refreshSummaryText();
-		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, jev, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
+		const b0 = budgetSpend(costs, leadId(), cfg!.helperCostFactor);
+		const budgetLeft = cfg!.budgetUsd > 0 ? cfg!.budgetUsd - cfg!.reserveUsd - b0.estimate - extraCost() : undefined;
+		const d = decideTurn(st, { turn, now: Date.now(), text, calls, results, jev, budgetLeft, empty: !calls.length && !text.trim() && !hasThinking, lengthStop: m.stopReason === "length", testsExist: !isHelper(from) ? hasTestFiles(ctx.cwd) : undefined, diffStat }, cfg);
 		const entries: SessionBoundaryDraft[] = [];
 		if (d.reason && d.to === from && d.continue) log(d.message ? "nudge" : "retry", { phase: from, reason: d.reason });
 		if (d.to !== from) {

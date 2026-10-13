@@ -324,3 +324,27 @@ describe("0.9.1: skill files reach the lead verbatim, deduplicated", () => {
 		expect(skillKey("node_modules/x/README.md")).toBeUndefined();
 	});
 });
+
+describe("0.9.3: green mid-work verify keeps the lead; endgame keeps the lead", () => {
+	const lead = () => {
+		const s = initialSwitchState(0);
+		s.phase = "lead";
+		s.leadEditsInStretch = 1;
+		s.leadRanTests = true;
+		return s;
+	};
+	const v = bash("v", "npx vitest run");
+	it("green verify after writing → lead continues; red → debug", () => {
+		expect(decideTurn(lead(), turn({ calls: [v], results: [{ id: "v", isError: false, text: "Tests 27 passed" }] }), cfg).to).toBe("lead");
+		const d = decideTurn(lead(), turn({ calls: [v], results: [{ id: "v", isError: true, text: "FAIL x" }] }), cfg);
+		expect(d.to).toBe("debug");
+		expect(d.reason).toMatch(/failed/);
+	});
+	it("endgame (budget left < endgameUsd): no hand-off to the helper, even on red", () => {
+		expect(decideTurn(lead(), turn({ calls: [v], results: [{ id: "v", isError: true, text: "FAIL x" }], budgetLeft: 0.2 }), cfg).to).toBe("lead");
+		const s = lead();
+		s.leadReadTurns = 1;
+		expect(decideTurn(s, turn({ calls: [c("r", "read", { path: "a" })], budgetLeft: 0.1 }), cfg).to).toBe("lead");
+		expect(decideTurn(lead(), turn({ calls: [v], results: [{ id: "v", isError: true, text: "FAIL x" }], budgetLeft: 0.5 }), cfg).to).toBe("debug");
+	});
+});
