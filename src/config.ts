@@ -13,6 +13,8 @@ export interface BatonConfig {
 	maxHelperTurns: number;
 	/** Size cap of one run note. */
 	noteChars: number;
+	/** While a run is active, the lead's last request is re-sent this long after it was sent, and again after each re-send, so its prompt cache does not expire. 0 = off. */
+	cacheKeepaliveMs: number;
 	journalDir: string;
 }
 
@@ -22,8 +24,18 @@ export const DEFAULT_CONFIG: BatonConfig = {
 	speculate: true,
 	maxHelperTurns: 40,
 	noteChars: 80_000,
+	cacheKeepaliveMs: 290_000,
 	journalDir: ".pi/baton",
 };
+
+/** A project file may set cacheKeepaliveMs, and every keepalive is billed as a cache read of the whole lead prompt. One hour is the longest prompt cache tier. */
+const CACHE_KEEPALIVE_MIN_MS = 60_000;
+const CACHE_KEEPALIVE_MAX_MS = 3_600_000;
+
+function isCacheKeepaliveMs(value: unknown): boolean {
+	if (value === 0) return true;
+	return typeof value === "number" && Number.isInteger(value) && value >= CACHE_KEEPALIVE_MIN_MS && value <= CACHE_KEEPALIVE_MAX_MS;
+}
 
 /** Keys a project `.pi/baton.json` may not set: they choose models (and so spend money) or write files. */
 const USER_ONLY_KEYS = ["lead", "helper", "journalDir"] as const;
@@ -84,12 +96,12 @@ function withoutUserOnlyKeys(projectConfig: Record<string, unknown>, userConfigP
 	return allowed;
 }
 
-function positiveInteger(name: string, env: NodeJS.ProcessEnv, warn: (message: string) => void): number | undefined {
+function envInteger(name: string, minimum: number, env: NodeJS.ProcessEnv, warn: (message: string) => void): number | undefined {
 	const raw = env[name]?.trim();
 	if (!raw) return undefined;
 	const value = Number(raw);
-	if (Number.isInteger(value) && value > 0) return value;
-	warn(`baton: ${name}=${raw} is not a positive integer; ignoring it`);
+	if (Number.isInteger(value) && value >= minimum) return value;
+	warn(`baton: ${name}=${raw} is not ${minimum > 0 ? "a positive" : "a non-negative"} integer; ignoring it`);
 	return undefined;
 }
 
@@ -104,10 +116,16 @@ export function loadConfig(cwd: string, warn: (message: string) => void = () => 
 	if (env.BATON_HELPER) config.helper = env.BATON_HELPER;
 	const speculate = envFlag("BATON_SPEC", env);
 	if (speculate !== undefined) config.speculate = speculate;
-	const maxHelperTurns = positiveInteger("BATON_MAX_TURNS", env, warn);
+	const maxHelperTurns = envInteger("BATON_MAX_TURNS", 1, env, warn);
 	if (maxHelperTurns) config.maxHelperTurns = maxHelperTurns;
+	const cacheKeepaliveMs = envInteger("BATON_CACHE_KEEPALIVE_MS", 0, env, warn);
+	if (cacheKeepaliveMs !== undefined) config.cacheKeepaliveMs = cacheKeepaliveMs;
 	if (env.BATON_JOURNAL_DIR) config.journalDir = env.BATON_JOURNAL_DIR;
 
+	if (!isCacheKeepaliveMs(config.cacheKeepaliveMs)) {
+		warn(`baton: cacheKeepaliveMs ${JSON.stringify(config.cacheKeepaliveMs)} is neither 0 (off) nor ${CACHE_KEEPALIVE_MIN_MS}–${CACHE_KEEPALIVE_MAX_MS}; using ${DEFAULT_CONFIG.cacheKeepaliveMs}`);
+		config.cacheKeepaliveMs = DEFAULT_CONFIG.cacheKeepaliveMs;
+	}
 	if (!isInside(cwd, config.journalDir)) {
 		warn(`baton: journalDir ${config.journalDir} is outside the working directory; using ${DEFAULT_CONFIG.journalDir}`);
 		config.journalDir = DEFAULT_CONFIG.journalDir;

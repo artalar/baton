@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HELPER_INSTRUCTION_TYPE, LEAD_NOTE_TYPE } from "../src/context.ts";
 import baton from "../src/index.ts";
 
@@ -27,17 +27,37 @@ function project() {
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[] }> };
 type Call = { name: string; args: Record<string, unknown>; output?: string; isError?: boolean };
+type ModelRef = { id: string; provider: string };
+type StreamOptions = { onPayload: (payload: unknown, model: ModelRef) => unknown; sessionId?: string; signal: AbortSignal };
+type Ping = { model: ModelRef; payload: unknown; sessionId?: string; signal: AbortSignal };
+
+const PING_USAGE = { input: 12, output: 2, cacheRead: 40_000, cacheWrite: 0, totalTokens: 40_014, cost: { total: 0.008 } };
 
 function mount(cwd: string) {
 	const handlers = new Map<string, Handler[]>();
 	const tools = new Map<string, Tool>();
+	const pings: Ping[] = [];
 	const ctx = {
 		cwd,
 		hasUI: true,
 		ui: { notify() {} },
-		model: undefined as { id: string; provider: string } | undefined,
+		model: undefined as ModelRef | undefined,
 		sessionManager: { getSessionId: () => "session-1" },
-		modelRegistry: { find: (provider: string, id: string) => ({ provider, id }) },
+		modelRegistry: {
+			find: (provider: string, id: string) => ({ provider, id }),
+			/** A provider whose model starts its reply at once and reports usage, as Anthropic does in message_start. */
+			streamSimple(model: ModelRef, _context: unknown, options: StreamOptions) {
+				pings.push({ model, payload: options.onPayload({ builtFrom: "an empty context" }, model), sessionId: options.sessionId, signal: options.signal });
+				return {
+					async *[Symbol.asyncIterator]() {
+						yield { type: "start" };
+						yield { type: "thinking_start" };
+						yield { type: "thinking_delta" };
+					},
+					result: async () => ({ stopReason: options.signal.aborted ? "aborted" : "stop", usage: PING_USAGE }),
+				};
+			},
+		},
 	};
 	const pi = {
 		on(event: string, handler: Handler) {
@@ -59,8 +79,17 @@ function mount(cwd: string) {
 		return result;
 	};
 	let callCounter = 0;
-	/** Simulates one assistant turn: tool_call hooks, the side effect, then turn_end. */
-	const turn = async (model: string, calls: (Call & { effect?: () => void })[], options: { text?: string; stopReason?: string; errorMessage?: string } = {}) => {
+	let requestCounter = 0;
+	/**
+	 * Simulates one assistant turn: the provider request, tool_call hooks, the side effect, then turn_end.
+	 * `toolsMs` advances the fake clock between the request and turn_end, as long tool calls do.
+	 */
+	const turn = async (
+		model: string,
+		calls: (Call & { effect?: () => void })[],
+		options: { text?: string; stopReason?: string; errorMessage?: string; usage?: Record<string, number>; toolsMs?: number } = {},
+	) => {
+		await emit("before_provider_request", { payload: { model, request: ++requestCounter } });
 		const withIds = calls.map((call) => ({ ...call, id: `call-${++callCounter}` }));
 		const blocked: string[] = [];
 		for (const call of withIds) {
@@ -68,12 +97,14 @@ function mount(cwd: string) {
 			if (verdict?.block) blocked.push(verdict.reason);
 			else call.effect?.();
 		}
+		if (options.toolsMs) await vi.advanceTimersByTimeAsync(options.toolsMs);
 		const result = await emit("turn_end", {
 			message: {
 				role: "assistant",
 				model,
 				stopReason: options.stopReason ?? (withIds.length ? "toolUse" : "stop"),
 				errorMessage: options.errorMessage,
+				usage: options.usage,
 				content: [...(options.text ? [{ type: "text", text: options.text }] : []), ...withIds.map((call) => ({ type: "toolCall", id: call.id, name: call.name, arguments: call.args }))],
 			},
 			toolResults: withIds.filter((call) => call.output !== undefined).map((call) => ({ toolCallId: call.id, isError: !!call.isError, content: [{ type: "text", text: call.output }] })),
@@ -81,7 +112,7 @@ function mount(cwd: string) {
 		return Object.assign(result ?? {}, { blocked, isEmpty: result === undefined });
 	};
 	const undo = (params: Record<string, unknown>) => tools.get("baton_undo")!.execute("t", params).then((reply) => reply.content[0]!.text);
-	return { ctx, emit, turn, undo };
+	return { ctx, emit, turn, undo, pings };
 }
 
 async function startTask(h: ReturnType<typeof mount>, prompt = "Build tetris") {
@@ -224,5 +255,107 @@ describe("speculative runs in a pi session", () => {
 		} finally {
 			delete process.env.BATON_SPEC;
 		}
+	});
+});
+
+const READ = { name: "read", args: { path: "src/model.ts" }, output: "x" };
+const LEAD_USED_CACHE = { cacheRead: 30_000, cacheWrite: 2_000 };
+const HOUR_MS = 3_600_000;
+
+const journalEvents = (cwd: string, kind: string) =>
+	readFileSync(join(cwd, ".pi/baton/sessions/session-1/events.jsonl"), "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line))
+		.filter((event) => event.kind === kind);
+
+describe("lead cache keepalive", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("re-sends the lead's last request, timed from that request, while the helper works, and stops with the run", async () => {
+		const cwd = project();
+		const h = mount(cwd);
+		await startTask(h);
+		await h.turn(LEAD, [READ], { usage: LEAD_USED_CACHE, toolsMs: 100_000 });
+		await h.turn(HELPER, [READ]);
+		await vi.advanceTimersByTimeAsync(189_999);
+		expect(h.pings).toHaveLength(0);
+
+		await vi.advanceTimersByTimeAsync(1);
+		expect(h.pings).toHaveLength(1);
+		expect(h.pings[0]).toMatchObject({ model: { id: LEAD }, payload: { model: LEAD, request: 1 }, sessionId: "session-1" });
+		expect(h.pings[0]!.signal.aborted).toBe(true);
+		await vi.advanceTimersByTimeAsync(290_000);
+		expect(h.pings.map((ping) => ping.payload)).toEqual([
+			{ model: LEAD, request: 1 },
+			{ model: LEAD, request: 1 },
+		]);
+
+		await h.turn(HELPER, [], { text: "Done." });
+		await vi.advanceTimersByTimeAsync(HOUR_MS);
+		expect(h.pings).toHaveLength(2);
+		const ping = { run: 1, model: LEAD, sincePreviousMs: 290_000, cacheRead: 40_000, cacheWrite: 0, cost: 0.008 };
+		expect(journalEvents(cwd, "cache_keepalive")).toEqual([expect.objectContaining(ping), expect.objectContaining(ping)]);
+		const summary = JSON.parse(readFileSync(join(cwd, ".pi/baton/sessions/session-1/summary.json"), "utf8"));
+		expect(summary.stats.cacheKeepalives).toBe(2);
+		expect(summary.costs[LEAD]).toMatchObject({ requests: 2, cacheRead: 80_000 });
+		expect(summary.costs[LEAD].usd).toBeCloseTo(0.016);
+	});
+
+	it("does not ping without a run, when the lead's request used no prompt cache, or when it is off", async () => {
+		const h = mount(project());
+		await startTask(h);
+		await h.turn(LEAD, [], { text: "Done.", usage: LEAD_USED_CACHE });
+		await vi.advanceTimersByTimeAsync(HOUR_MS);
+		await h.turn(LEAD, [READ]);
+		await vi.advanceTimersByTimeAsync(HOUR_MS);
+		expect(h.pings).toHaveLength(0);
+
+		process.env.BATON_CACHE_KEEPALIVE_MS = "0";
+		try {
+			const off = mount(project());
+			await startTask(off);
+			await off.turn(LEAD, [READ], { usage: LEAD_USED_CACHE });
+			await vi.advanceTimersByTimeAsync(HOUR_MS);
+			expect(off.pings).toHaveLength(0);
+		} finally {
+			delete process.env.BATON_CACHE_KEEPALIVE_MS;
+		}
+	});
+
+	it("stops on a new prompt, a user interrupt, a session restart, the agent's end, and pi's shutdown", async () => {
+		const h = mount(project());
+		const startRun = () => h.turn(LEAD, [READ], { usage: LEAD_USED_CACHE });
+		const pingsWithinAnHour = async () => {
+			await vi.advanceTimersByTimeAsync(HOUR_MS);
+			return h.pings.length;
+		};
+		await startTask(h);
+
+		await startRun();
+		await h.emit("before_agent_start", { messageType: "user", prompt: "Also add a score", systemPrompt: "", systemPromptOptions: {} });
+		expect(await pingsWithinAnHour()).toBe(0);
+
+		await startRun();
+		await h.turn(HELPER, [READ], { stopReason: "aborted" });
+		expect(await pingsWithinAnHour()).toBe(0);
+
+		await startRun();
+		await startTask(h);
+		expect(await pingsWithinAnHour()).toBe(0);
+
+		await startRun();
+		await h.emit("agent_end", {});
+		expect(await pingsWithinAnHour()).toBe(0);
+
+		await startTask(h);
+		await startRun();
+		await h.emit("session_shutdown", { reason: "quit" });
+		expect(await pingsWithinAnHour()).toBe(0);
 	});
 });

@@ -9,7 +9,7 @@ Baton is now one small thing: speculative execution of the lead model's work by 
 ### Removed
 
 - Advisor mode (`baton_plan`, `baton_review`, `baton_help`, `baton_step`, `baton_recall`, `/baton`, review gating, loop detector, compaction), the pack library, and the `baton-pack` / `baton-review` CLIs, skill and prompt.
-- Phased switch mode (helper reading, implement/debug/review phases, `baton_read`, `baton_edit`, `baton_delegate`, `baton_optimize`, edit intents, the file-system guard, lead-cache keepalive).
+- Phased switch mode (helper reading, implement/debug/review phases, `baton_read`, `baton_edit`, `baton_delegate`, `baton_optimize`, edit intents, the file-system guard). Its lead-cache keepalive is replaced; see Added.
 - Jev and every speculation heuristic: step gate, step estimate, adaptive ceiling, phase rule, out-of-plan edit stop, stop on tool error, cooldown, repeat detector (`BATON_JEV*`, `BATON_SPEC_GATE`, `BATON_SPEC_STOPS`, `BATON_SPEC_EST`, `BATON_SPEC_PHASE`, `BATON_SPEC_ADAPT`, `BATON_SPEC_V2`).
 - The process-wide USD budget (`BATON_BUDGET_USD`). Costs per model are still in the journal.
 - The unreleased advisor and switch-mode changes made after 0.13.1 are gone with those modes. The `dist/` build, `bun run smoke`, and CI on Node.js 22 and 24 stay.
@@ -20,12 +20,13 @@ Baton is now one small thing: speculative execution of the lead model's work by 
 - A run note built from facts only: the helper's calls in order with their status, read outputs verbatim and deduplicated, output tails of other calls, and the diff of files changed with edit/write. The helper's text is never included.
 - `baton_undo({run, paths?})`: restores files a run changed with edit/write from originals saved before the helper's first edit, and deletes files it created. Files changed after the run are left alone and listed. No git needed.
 - A run ends when the helper stops calling tools, its request fails, the user sends a message, or at a safety cap of 40 turns (`maxHelperTurns`, `BATON_MAX_TURNS`). An unfinished run is closed and reported when a new prompt arrives.
+- Lead cache keepalive during a run (`cacheKeepaliveMs`, 290 s; `BATON_CACHE_KEEPALIVE_MS`; `0` = off): every 290 s, counted from the lead's last request, Baton re-sends that request's payload byte for byte through pi's provider with the same session id, and aborts it at the first model event, so the lead's 5-minute prompt cache outlives long runs. It runs only while a run is active and the lead's request used the prompt cache. Journal event `cache_keepalive`; the usage the provider reports counts in `summary.json`. It replaces the switch-mode keepalive, which sent its replay through a separate OpenRouter client.
 
 ### Changed
 
 - Speculation is on by default (`BATON_SPEC=0` turns it off) and starts after every lead turn with tool calls, except one that called `baton_undo`.
 - The helper sees the lead's view plus its current run, not earlier runs.
-- One entry point: `pi -e ./dist/index.js`. Six configuration keys: `lead`, `helper`, `speculate`, `maxHelperTurns`, `noteChars`, `journalDir`.
+- One entry point: `pi -e ./dist/index.js`. Seven configuration keys: `lead`, `helper`, `speculate`, `maxHelperTurns`, `noteChars`, `cacheKeepaliveMs`, `journalDir`.
 - The journal is per session: `<journalDir>/sessions/<id>/events.jsonl` and `summary.json`, with per-request usage including cache writes.
 
 ## [0.13.1] - 2026-10-13

@@ -31,10 +31,10 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "vitest run",
+    "test": "vitest run --dir test",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun run test",
-    "coverage": "vitest run --coverage",
+    "coverage": "vitest run --dir test --coverage",
     "smoke": "bash scripts/smoke-pack.sh",
     "prepublishOnly": "bun run check && bun run build"
   },

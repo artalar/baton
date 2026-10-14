@@ -11,7 +11,7 @@ flowchart TD
   prompt["User prompt"] --> lead["Lead turn"]
   lead -- "final answer, error or abort" --> done["Agent ends"]
   lead -- "called baton_undo" --> lead
-  lead -- "tool calls" --> start["Run N: switch to the helper, append the helper instruction"]
+  lead -- "tool calls" --> start["Run N: switch to the helper, append the helper instruction, keep the lead's cache warm"]
   start --> helper["Helper turn: real tool calls; before its first edit/write of a file, the harness saves the original"]
   helper -- "more tool calls" --> helper
   helper -- "no tool calls, request error, user message, or 40-turn safety cap" --> note["Note from facts: calls, read outputs, output tails, diff against the originals"]
@@ -20,7 +20,7 @@ flowchart TD
 
 - **One session, two views.** The lead never sees helper turns or the helper instruction, only the notes appended at the end of its context, so its prompt cache stays valid. The helper sees the lead's view plus its current run.
 - **Real work, kept by default.** The helper edits files and runs commands for real, so it can run tests and fix what they report. Keeping the run costs the lead nothing; reviewing a diff costs input tokens, which are much cheaper than writing the same change itself.
-- **Natural stop.** A run ends when the helper stops calling tools (the step is done or needs a decision), when its request fails, when the user sends a message, or at a generous safety cap (40 turns). There is no time limit; for long runs set `PI_CACHE_RETENTION=long` so the lead's cache outlives them.
+- **Natural stop.** A run ends when the helper stops calling tools (the step is done or needs a decision), when its request fails, when the user sends a message, or at a generous safety cap (40 turns). There is no time limit: while the helper works, Baton keeps the lead's prompt cache warm (see [Lead cache keepalive](#lead-cache-keepalive)).
 - **No predictor.** A run starts after every lead turn with tool calls, except a turn that called `baton_undo`. A useless run costs one cheap request and a two-line note.
 
 ### What the lead reads after a run
@@ -75,6 +75,19 @@ It also says that the helper reads the lead's messages (so "Helper: do not touch
 
 Before the helper's first `edit` or `write` of a file in a run, the harness saves the file's content (or notes that it did not exist). The same originals produce the diff. `baton_undo` writes them back and deletes files the run created, but only for files that are still exactly as the run left them. Files changed after the run are left alone and listed. Changes made through `bash` are not covered; the helper is told to change files only with `edit`/`write`. No git is involved, so it works in any directory.
 
+### Lead cache keepalive
+
+Anthropic keeps a prompt cache entry for 5 minutes after the request that last used it. The lead sends nothing during a run, so after a long run its next turn would write its whole prompt to the cache again instead of reading it (a cache write costs 1.25× the input price, a read 0.1× or less). While a run is active, Baton re-sends the lead's last request every `cacheKeepaliveMs` (290 s), counted from the start of that request and then of each re-send:
+
+- **The same request.** The body is the lead's last provider payload, copied when pi sent it. Messages, tools, thinking settings, `max_tokens` and cache markers stay as they were, because a change to any of them misses the cache. It goes through pi's own provider with the same session id, which OpenRouter uses to route to the same upstream cache.
+- **Aborted at once.** The re-send is aborted at the first event of the model's reply. By then the provider has read the prompt and renewed the entry, so it costs a cache read and a few output tokens.
+- **Only while the lead waits.** It starts with a run, if the lead's last request used the prompt cache, and stops when the run ends, a prompt arrives, the agent ends, or the session changes. A run that ends within 290 s of the lead's request sends nothing.
+- **Outside the transcript.** Neither model sees it. Each re-send is a `cache_keepalive` journal event with the usage the provider reported before the abort, and that usage counts in `summary.json`. Anthropic's API reports usage at the start of a reply; OpenAI-compatible endpoints report it only at the end, so their events carry no usage. Pi's own session cost does not include these requests.
+
+290 s leaves 10 s of the 5-minute lifetime for the request to reach the provider. The clock starts when pi hands the lead's request to the provider, slightly before the provider renews the entry. If an event shows `cacheWrite` instead of `cacheRead`, lower `cacheKeepaliveMs`. With `PI_CACHE_RETENTION=long` the entry lives an hour, so runs shorter than that need no keepalive: set `cacheKeepaliveMs` to `0`.
+
+Pi's own `cacheWarming` cannot do this: it refreshes only the current request, which after the switch to the helper is the helper's. Pi's bundled catalog also gives the default OpenRouter Opus no cache lifetime, so pi does not warm it even between helper runs.
+
 ## Quick start
 
 Requires Node.js 22 or newer, and `OPENROUTER_API_KEY` for the default models.
@@ -100,13 +113,14 @@ User file `~/.pi/agent/baton.json` (or `$PI_CODING_AGENT_DIR/baton.json`), then 
 | `speculate` | `true` | `BATON_SPEC` | Speculative runs on or off; off when lead and helper are the same model |
 | `maxHelperTurns` | `40` | `BATON_MAX_TURNS` | Safety cap of helper turns per run |
 | `noteChars` | `80000` | | Size cap of one note |
+| `cacheKeepaliveMs` | `290000` | `BATON_CACHE_KEEPALIVE_MS` | [Lead cache keepalive](#lead-cache-keepalive) interval during a run; `0` = off, otherwise 60000–3600000 |
 | `journalDir` | `.pi/baton` | `BATON_JOURNAL_DIR` | Must stay inside the working directory |
 
 On/off variables accept `1`/`on`/`true`/`yes` and `0`/`off`/`false`/`no`.
 
 ## Journal
 
-Per pi session: `<journalDir>/sessions/<session id>/events.jsonl` (prompts, run starts and ends, per-request usage including the lead's cache writes, undos) and `summary.json` (costs per model, run stats, stop reasons, every run with its changed and undone files). The journal directory gets a `.gitignore` of `*`.
+Per pi session: `<journalDir>/sessions/<session id>/events.jsonl` (prompts, run starts and ends, per-request usage including the lead's cache writes, lead cache keepalives, undos) and `summary.json` (costs per model including keepalives, run stats, stop reasons, every run with its changed and undone files). The journal directory gets a `.gitignore` of `*`.
 
 ## Architecture
 
@@ -116,6 +130,7 @@ Per pi session: `<journalDir>/sessions/<session id>/events.jsonl` (prompts, run 
 | `src/run.ts` | Run state, saved originals, changes, undo |
 | `src/notes.ts` | Every text the models read: lead system section, helper instruction, run note, undo result |
 | `src/context.ts` | Lead and helper views of the transcript |
+| `src/keepalive.ts` | Lead cache keepalive: re-sends the lead's last request during a run |
 | `src/config.ts` | Configuration |
 | `src/journal.ts` | Journal |
 

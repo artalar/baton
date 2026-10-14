@@ -4,6 +4,7 @@ import { Type } from "typebox";
 import { type BatonConfig, isSameModel, loadConfig, parseModelRef } from "./config.ts";
 import { type ContextMessage, HELPER_INSTRUCTION_TYPE, LEAD_NOTE_TYPE, viewFor } from "./context.ts";
 import { type Journal, openJournal } from "./journal.ts";
+import { keepWarm, type SentRequest } from "./keepalive.ts";
 import { describeCall, helperInstruction, LEAD_SYSTEM_NOTE, renderRunNote, renderUndoResult } from "./notes.ts";
 import { type ActiveRun, collectChanges, type FinishedRun, type RunCall, recordTurn, rememberOriginal, startRun, undoRun } from "./run.ts";
 
@@ -29,6 +30,7 @@ interface SessionStats {
 	helperTurns: number;
 	helperCalls: number;
 	undos: number;
+	cacheKeepalives: number;
 	stopReasons: Record<string, number>;
 }
 
@@ -42,7 +44,7 @@ const textOf = (content: unknown) =>
 		.flatMap((block) => (block.type === "text" && block.text ? [block.text] : []))
 		.join("\n");
 
-const emptyStats = (): SessionStats => ({ runs: 0, helperTurns: 0, helperCalls: 0, undos: 0, stopReasons: {} });
+const emptyStats = (): SessionStats => ({ runs: 0, helperTurns: 0, helperCalls: 0, undos: 0, cacheKeepalives: 0, stopReasons: {} });
 
 const stopReasonKey = (reason: string) => reason.replace(/\s*\(.*$/, "").replace(/\d+/g, "N");
 
@@ -56,6 +58,8 @@ export default function baton(pi: ExtensionAPI) {
 	let costs: Record<string, CostRow> = {};
 	let stats = emptyStats();
 	let startedAt = Date.now();
+	let lastLeadRequest: SentRequest | undefined;
+	let stopKeepalive = () => {};
 
 	const notify = (ctx: ExtensionContext, message: string) => {
 		if (ctx.hasUI) ctx.ui.notify(message, "warning");
@@ -92,9 +96,35 @@ export default function baton(pi: ExtensionAPI) {
 
 	const leadNote = (text: string): SessionBoundaryDraft => ({ type: "custom_message", customType: LEAD_NOTE_TYPE, content: text, display: true });
 
+	const addUsage = (model: string, usage: Usage) => {
+		const row = costs[model] ?? { requests: 0, usd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+		costs[model] = {
+			requests: row.requests + 1,
+			usd: row.usd + (usage.cost?.total ?? 0),
+			input: row.input + (usage.input ?? 0),
+			output: row.output + (usage.output ?? 0),
+			cacheRead: row.cacheRead + (usage.cacheRead ?? 0),
+			cacheWrite: row.cacheWrite + (usage.cacheWrite ?? 0),
+		};
+	};
+
+	const startKeepalive = (ctx: ExtensionContext, leadUsage: Usage | undefined) => {
+		const request = lastLeadRequest;
+		const leadUsedPromptCache = (leadUsage?.cacheRead ?? 0) + (leadUsage?.cacheWrite ?? 0) > 0;
+		if (!request || !leadUsedPromptCache) return;
+		const runNumber = runCounter;
+		stopKeepalive = keepWarm(request, config!.cacheKeepaliveMs, ctx.modelRegistry, ({ sincePreviousMs, error, usage }) => {
+			stats.cacheKeepalives++;
+			if (usage) addUsage(request.model.id, usage);
+			journal?.log("cache_keepalive", { run: runNumber, model: request.model.id, sincePreviousMs, error, cost: usage?.cost?.total, input: usage?.input, output: usage?.output, cacheRead: usage?.cacheRead, cacheWrite: usage?.cacheWrite });
+			writeSummary();
+		});
+	};
+
 	const finishRun = async (ctx: ExtensionContext, stopReason: string): Promise<string> => {
 		const run = activeRun!;
 		activeRun = undefined;
+		stopKeepalive();
 		const changes = collectChanges(run, cwd);
 		const note = renderRunNote({ runNumber: run.number, helperModel: config!.helper, stopReason, turns: run.turns, calls: run.calls, changes, noteChars: config!.noteChars });
 		finishedRuns.push({ number: run.number, stopReason, turns: run.turns, callCount: run.calls.length, changes, undone: new Set() });
@@ -107,6 +137,7 @@ export default function baton(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", (_event, ctx) => {
+		stopKeepalive();
 		config = undefined;
 		activeRun = undefined;
 		finishedRuns = [];
@@ -114,7 +145,12 @@ export default function baton(pi: ExtensionAPI) {
 		costs = {};
 		stats = emptyStats();
 		startedAt = Date.now();
+		lastLeadRequest = undefined;
 		init(ctx);
+	});
+
+	pi.on("session_shutdown", () => {
+		stopKeepalive();
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -141,16 +177,19 @@ export default function baton(pi: ExtensionAPI) {
 		if (message.role !== "assistant") return undefined;
 		const model = message.model ?? "unknown";
 		const usage = message.usage ?? {};
-		const row = costs[model] ?? { requests: 0, usd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-		costs[model] = {
-			requests: row.requests + 1,
-			usd: row.usd + (usage.cost?.total ?? 0),
-			input: row.input + (usage.input ?? 0),
-			output: row.output + (usage.output ?? 0),
-			cacheRead: row.cacheRead + (usage.cacheRead ?? 0),
-			cacheWrite: row.cacheWrite + (usage.cacheWrite ?? 0),
-		};
+		addUsage(model, usage);
 		journal?.log("usage", { model, run: activeRun?.number, cost: usage.cost?.total ?? 0, input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite });
+		return undefined;
+	});
+
+	pi.on("before_provider_request", (event, ctx) => {
+		if (!config?.speculate || !config.cacheKeepaliveMs || activeRun || !ctx.model) return undefined;
+		lastLeadRequest = undefined;
+		try {
+			lastLeadRequest = { model: ctx.model, payload: structuredClone(event.payload), sessionId: ctx.sessionManager?.getSessionId?.(), sentAt: Date.now() };
+		} catch (error) {
+			journal?.log("error", { message: `cache keepalive: cannot copy the lead request: ${(error as Error).message}` });
+		}
 		return undefined;
 	});
 
@@ -161,7 +200,7 @@ export default function baton(pi: ExtensionAPI) {
 
 	pi.on("turn_end", async (event, ctx) => {
 		if (!config) return undefined;
-		const message = event.message as { role?: string; content?: MessageBlock[]; stopReason?: string; errorMessage?: string; model?: string };
+		const message = event.message as { role?: string; content?: MessageBlock[]; stopReason?: string; errorMessage?: string; model?: string; usage?: Usage };
 		if (message.role !== "assistant") return undefined;
 		const blocks = Array.isArray(message.content) ? message.content : [];
 		const results = new Map(event.toolResults.map((result) => [result.toolCallId, result]));
@@ -199,10 +238,12 @@ export default function baton(pi: ExtensionAPI) {
 		stats.runs++;
 		activeRun = startRun(runCounter, Date.now());
 		journal?.log("run_start", { run: runCounter, after: calls.map((call) => describeCall(call, 120)) });
+		startKeepalive(ctx, message.usage);
 		return { entries: [{ type: "custom_message", customType: HELPER_INSTRUCTION_TYPE, content: helperInstruction(runCounter), display: true }] };
 	});
 
 	pi.on("agent_end", () => {
+		stopKeepalive();
 		writeSummary();
 	});
 

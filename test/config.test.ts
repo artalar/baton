@@ -16,10 +16,27 @@ function dirs(user?: object, project?: object) {
 }
 
 describe("config", () => {
-	it("defaults to speculation on with a generous turn cap", () => {
+	it("defaults to speculation on with a generous turn cap and a lead cache keepalive just inside the 5-minute cache", () => {
 		const { cwd, env } = dirs();
 		expect(loadConfig(cwd, () => {}, env)).toEqual(DEFAULT_CONFIG);
-		expect(DEFAULT_CONFIG).toMatchObject({ speculate: true, maxHelperTurns: 40 });
+		expect(DEFAULT_CONFIG).toMatchObject({ speculate: true, maxHelperTurns: 40, cacheKeepaliveMs: 290_000 });
+	});
+
+	it("a project file or BATON_CACHE_KEEPALIVE_MS sets the keepalive, 0 turns it off, and values out of range fall back to the default", () => {
+		const { cwd, env } = dirs({ cacheKeepaliveMs: 240_000 }, { cacheKeepaliveMs: 120_000 });
+		expect(loadConfig(cwd, () => {}, env).cacheKeepaliveMs).toBe(120_000);
+		expect(loadConfig(cwd, () => {}, { ...env, BATON_CACHE_KEEPALIVE_MS: "0" }).cacheKeepaliveMs).toBe(0);
+
+		const warnings: string[] = [];
+		const tooOften = dirs(undefined, { cacheKeepaliveMs: 1_000 });
+		expect(loadConfig(tooOften.cwd, (message) => warnings.push(message), tooOften.env).cacheKeepaliveMs).toBe(290_000);
+		expect(loadConfig(cwd, (message) => warnings.push(message), { ...env, BATON_CACHE_KEEPALIVE_MS: "soon" }).cacheKeepaliveMs).toBe(120_000);
+		expect(loadConfig(cwd, (message) => warnings.push(message), { ...env, BATON_CACHE_KEEPALIVE_MS: "7200000" }).cacheKeepaliveMs).toBe(290_000);
+		expect(warnings).toEqual([
+			"baton: cacheKeepaliveMs 1000 is neither 0 (off) nor 60000–3600000; using 290000",
+			"baton: BATON_CACHE_KEEPALIVE_MS=soon is not a non-negative integer; ignoring it",
+			"baton: cacheKeepaliveMs 7200000 is neither 0 (off) nor 60000–3600000; using 290000",
+		]);
 	});
 
 	it("a project file cannot choose models or the journal; the user file can", () => {
