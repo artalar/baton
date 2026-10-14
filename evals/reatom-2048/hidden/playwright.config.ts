@@ -13,7 +13,7 @@ export default defineConfig({
   retries: 0,
   workers: 1,
   timeout: 20_000,
-  globalTimeout: 90_000,
+  globalTimeout: 180_000,
   reporter: process.env.GRADE_JSON ? [['json', { outputFile: process.env.GRADE_JSON }]] : 'list',
   use: {
     baseURL: process.env.BASE_URL,

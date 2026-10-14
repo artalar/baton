@@ -1,7 +1,7 @@
 import { effect, onEvent } from '@reatom/core'
 import { h, mount } from '@reatom/jsx'
 import { App } from './ui'
-import { newGame, play, type Dir } from './model'
+import { newGame, play, undo, type Dir } from './model'
 
 const arrowDirs: Record<string, Dir> = {
   ArrowLeft: 'left',
@@ -16,6 +16,11 @@ const onKeyDown = (event: Event) => {
   if (keyEvent.code === 'KeyN') {
     keyEvent.preventDefault()
     newGame()
+    return
+  }
+  if (keyEvent.code === 'KeyU') {
+    keyEvent.preventDefault()
+    undo()
     return
   }
   const dir = arrowDirs[keyEvent.key]

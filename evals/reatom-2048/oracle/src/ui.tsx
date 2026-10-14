@@ -1,5 +1,18 @@
 import { h } from '@reatom/jsx'
-import { SIZE, board, newGame, play, score, status, type Dir } from './model'
+import {
+  SIZE,
+  best,
+  board,
+  history,
+  newGame,
+  play,
+  retrySubmit,
+  score,
+  status,
+  submission,
+  undo,
+  type Dir,
+} from './model'
 
 const shellStyle = `
   box-sizing: border-box;
@@ -80,21 +93,37 @@ export const App = () => {
     </button>
   ))
   controls.push(
+    <button type="button" data-undo disabled={() => history().length === 0} on:click={() => undo()}>
+      Undo
+    </button>,
     <button type="button" data-new-game on:click={() => newGame()}>
       New game
     </button>,
   )
+  const retryButton = () =>
+    submission() === 'error' ? (
+      <button type="button" data-retry on:click={() => retrySubmit()}>
+        Retry
+      </button>
+    ) : null
   return (
     <main css={shellStyle}>
       <h1 css="margin: 0; font-size: 40px;">2048</h1>
-      <p css="margin: 0;">Arrow keys move tiles. n or New game restarts.</p>
+      <p css="margin: 0;">Arrow keys move tiles. u or Undo steps back. n or New game restarts.</p>
       <p css="margin: 0; display: flex; gap: 16px; align-items: baseline;">
         <span>
           Score <strong data-score={() => String(score())}>{() => String(score())}</strong>
         </span>
         <span>
+          Best <strong data-best>{() => String(best())}</strong>
+        </span>
+        <span>
           <span data-status={() => status()}>{() => status()}</span>
         </span>
+      </p>
+      <p css="margin: 0; display: flex; gap: 8px; align-items: baseline;">
+        Submission <span data-submit={() => submission()}>{() => submission()}</span>
+        {retryButton}
       </p>
       <Board />
       <div css="display: flex; gap: 8px;">{controls}</div>

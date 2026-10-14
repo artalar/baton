@@ -33,6 +33,11 @@ const pick = (
 
   for (const alias of wanted) {
     for (const [name, target] of entries) {
+      if (name.toLowerCase() === alias) return target
+    }
+  }
+  for (const alias of wanted) {
+    for (const [name, target] of entries) {
       const segment = lastSegment(name)
       if (segmentBlocked(segment)) continue
       if (segment === alias) return target

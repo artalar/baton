@@ -1,10 +1,23 @@
-import { action, atom, reatomEnum } from '@reatom/core'
+import {
+  abortVar,
+  action,
+  atom,
+  isAbort,
+  reatomEnum,
+  withAbort,
+  withLocalStorage,
+  wrap,
+} from '@reatom/core'
 
 export const SIZE = 4
 const WIN_TILE = 2048
 const SPAWN_TWO_PROBABILITY = 0.9
+const UNDO_LIMIT = 3
 
 export type Dir = 'left' | 'right' | 'up' | 'down'
+type Status = 'idle' | 'playing' | 'won' | 'lost'
+type Snapshot = { board: number[][]; score: number; status: Status }
+type ScorePayload = { score: number; maxTile: number }
 
 const emptyGrid = (): number[][] =>
   Array.from({ length: SIZE }, () => Array<number>(SIZE).fill(0))
@@ -12,6 +25,10 @@ const emptyGrid = (): number[][] =>
 export const board = atom(emptyGrid(), 'game.board')
 export const score = atom(0, 'game.score')
 export const status = reatomEnum(['idle', 'playing', 'won', 'lost'], 'game.status')
+export const best = atom(0, 'game.best').extend(withLocalStorage('reatom-2048.best'))
+export const history = atom<Snapshot[]>([], 'game.history')
+export const submission = reatomEnum(['idle', 'pending', 'saved', 'error'], 'game.submission')
+const lastPayload = atom<ScorePayload | null>(null, 'game.lastPayload')
 
 const cloneGrid = (grid: number[][]): number[][] => grid.map((row) => row.slice())
 
@@ -138,13 +155,65 @@ export const move = action((dir: Dir): boolean => {
   return true
 }, 'game.move')
 
+const maxTile = (grid: number[][]): number => Math.max(...grid.flat())
+
+export const submitScore = action(async (payload: ScorePayload) => {
+  lastPayload.set(payload)
+  submission.setPending()
+  try {
+    const response = await wrap(
+      fetch('/api/scores', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: abortVar.find()?.signal,
+      }),
+    )
+    if (!response.ok) throw new Error(`score submit failed: ${response.status}`)
+    submission.setSaved()
+  } catch (error) {
+    if (isAbort(error)) return
+    submission.setError()
+  }
+}, 'game.submitScore').extend(withAbort())
+
+export const retrySubmit = action(() => {
+  const payload = lastPayload()
+  if (payload) submitScore(payload)
+}, 'game.retrySubmit')
+
+const resetSubmission = () => {
+  submitScore.abort('reset')
+  lastPayload.set(null)
+  submission.setIdle()
+}
+
 export const play = action((dir: Dir): boolean => {
+  const before: Snapshot = { board: board(), score: score(), status: status() }
   const changed = move(dir)
-  if (changed) spawnRandom()
-  return changed
+  if (!changed) return false
+  spawnRandom()
+  history.set((stack) => [...stack, before].slice(-UNDO_LIMIT))
+  best.set((current) => Math.max(current, score()))
+  if (status() === 'lost') submitScore({ score: score(), maxTile: maxTile(board()) })
+  return true
 }, 'game.play')
 
+export const undo = action((): boolean => {
+  const stack = history()
+  const previous = stack.at(-1)
+  if (!previous) return false
+  history.set(stack.slice(0, -1))
+  board.set(cloneGrid(previous.board))
+  score.set(previous.score)
+  status.set(previous.status)
+  resetSubmission()
+  return true
+}, 'game.undo')
+
 export const newGame = action(() => {
+  resetSubmission()
+  history.set([])
   board.set(emptyGrid())
   score.set(0)
   status.setPlaying()

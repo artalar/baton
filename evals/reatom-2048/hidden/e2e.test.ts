@@ -188,6 +188,47 @@ async function pressArrow(page: Page, key: 'ArrowLeft' | 'ArrowRight' | 'ArrowUp
   }, key)
 }
 
+async function pressLetter(page: Page, letter: 'n' | 'u') {
+  await page.evaluate((letter) => {
+    document.dispatchEvent(
+      new KeyboardEvent('keydown', {
+        key: letter,
+        code: `Key${letter.toUpperCase()}`,
+        bubbles: true,
+        cancelable: true,
+      }),
+    )
+  }, letter)
+}
+
+type ScoreReply = { delayMs?: number; status?: number; networkError?: boolean }
+
+async function mockScores(page: Page, replies: ScoreReply[]) {
+  const bodies: unknown[] = []
+  await page.route('**/api/scores', async (route) => {
+    const request = route.request()
+    if (request.method() !== 'POST') return route.fallback()
+    const reply = replies[Math.min(bodies.length, replies.length - 1)] ?? {}
+    bodies.push(request.postDataJSON())
+    if (reply.delayMs) await new Promise((done) => setTimeout(done, reply.delayMs))
+    try {
+      if (reply.networkError) await route.abort('failed')
+      else {
+        await route.fulfill({
+          status: reply.status ?? 200,
+          contentType: 'application/json',
+          body: '{}',
+        })
+      }
+    } catch {
+      // The page aborted the request while the reply was delayed.
+    }
+  })
+  return bodies
+}
+
+const submitAttr = (page: Page) => page.locator('[data-submit]')
+
 test('startup deals score 0, status playing, and two tiles', async ({ page }) => {
   await open(page)
   const state = await readState(page)
@@ -497,4 +538,156 @@ test('dom mirrors the board, score, and status', async ({ page }) => {
   await setGrid(page, stuckBoard, 3)
   expect((await readState(page)).status).toBe('lost')
   await expectDom(page)
+})
+
+test('undo restores board, score, and status from before the last player move', async ({ page }) => {
+  await mockScores(page, [{}])
+  await open(page)
+  const undoButton = page.locator('[data-undo]')
+  await expect(undoButton).toHaveCount(1)
+  await expect(undoButton).toBeDisabled()
+
+  await setGrid(page, slideRightStart, 10)
+  await pressArrow(page, 'ArrowRight')
+  expect((await readState(page)).score).toBe(46)
+  await expect(undoButton).toBeEnabled()
+  await undoButton.click()
+  expect(await readState(page)).toEqual({ board: slideRightStart, score: 10, status: 'playing' })
+  await expect(undoButton).toBeDisabled()
+
+  await setGrid(page, nearLostBoard, 7)
+  await pressArrow(page, 'ArrowLeft')
+  expect((await readState(page)).status).toBe('lost')
+  await undoButton.click()
+  expect(await readState(page)).toEqual({ board: nearLostBoard, score: 7, status: 'playing' })
+})
+
+test('undo keeps the last three player moves and the u key undoes', async ({ page }) => {
+  await open(page)
+  await setGrid(page, [
+    [2, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+  ])
+  const states = [await readState(page)]
+  for (const key of ['ArrowRight', 'ArrowLeft', 'ArrowRight', 'ArrowLeft'] as const) {
+    await pressArrow(page, key)
+    const state = await readState(page)
+    expect(state.board).not.toEqual(states.at(-1)!.board)
+    states.push(state)
+  }
+
+  await pressLetter(page, 'u')
+  expect(await readState(page)).toEqual(states[3])
+  await pressLetter(page, 'u')
+  expect(await readState(page)).toEqual(states[2])
+  await pressLetter(page, 'u')
+  expect(await readState(page)).toEqual(states[1])
+  await expect(page.locator('[data-undo]')).toBeDisabled()
+  await pressLetter(page, 'u')
+  expect(await readState(page)).toEqual(states[1])
+})
+
+test('new game clears undo history', async ({ page }) => {
+  await open(page)
+  await setGrid(page, slideRightStart, 10)
+  await pressArrow(page, 'ArrowRight')
+  await expect(page.locator('[data-undo]')).toBeEnabled()
+  await page.locator('[data-new-game]').click()
+  await expect(page.locator('[data-undo]')).toBeDisabled()
+  const fresh = await readState(page)
+  await pressLetter(page, 'u')
+  expect(await readState(page)).toEqual(fresh)
+})
+
+test('best score survives undo, reload, and new game', async ({ page }) => {
+  await open(page)
+  const bestText = page.locator('[data-best]')
+  await setGrid(page, slideRightStart, 10)
+  await pressArrow(page, 'ArrowRight')
+  await expect(bestText).toHaveText('46')
+  await page.locator('[data-undo]').click()
+  expect((await readState(page)).score).toBe(10)
+  await expect(bestText).toHaveText('46')
+
+  await page.reload()
+  await open(page)
+  expect((await readState(page)).score).toBe(0)
+  await expect(bestText).toHaveText('46')
+  await page.locator('[data-new-game]').click()
+  await expect(bestText).toHaveText('46')
+})
+
+test('losing posts the final score once and shows saved', async ({ page }) => {
+  const bodies = await mockScores(page, [{ delayMs: 600 }])
+  await open(page)
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'idle')
+
+  await setGrid(page, nearLostBoard, 7)
+  await pressArrow(page, 'ArrowLeft')
+  expect((await readState(page)).status).toBe('lost')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'pending')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'saved')
+  await expect(page.locator('[data-retry]')).toHaveCount(0)
+
+  await pressArrow(page, 'ArrowRight')
+  await pressArrow(page, 'ArrowUp')
+  await page.waitForTimeout(300)
+  expect(bodies).toEqual([{ score: 7, maxTile: 1024 }])
+
+  await pressLetter(page, 'n')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'idle')
+})
+
+test('failed submissions show retry and retry resends the same score', async ({ page }) => {
+  const bodies = await mockScores(page, [{ networkError: true }, { status: 500 }, { status: 200 }])
+  await open(page)
+  await expect(page.locator('[data-retry]')).toHaveCount(0)
+
+  await setGrid(page, nearLostBoard, 7)
+  await pressArrow(page, 'ArrowLeft')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'error')
+  await expect(page.locator('[data-retry]')).toHaveCount(1)
+
+  await page.locator('[data-retry]').click()
+  await expect.poll(() => bodies.length).toBe(2)
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'error')
+
+  await page.locator('[data-retry]').click()
+  await expect.poll(() => bodies.length).toBe(3)
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'saved')
+  await expect(page.locator('[data-retry]')).toHaveCount(0)
+  expect(bodies).toEqual([
+    { score: 7, maxTile: 1024 },
+    { score: 7, maxTile: 1024 },
+    { score: 7, maxTile: 1024 },
+  ])
+})
+
+test('new game and undo abort a pending submission', async ({ page }) => {
+  const bodies = await mockScores(page, [{ delayMs: 800 }])
+  await open(page)
+
+  await setGrid(page, nearLostBoard, 7)
+  await pressArrow(page, 'ArrowLeft')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'pending')
+  await pressLetter(page, 'n')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'idle')
+  await page.waitForTimeout(1200)
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'idle')
+  expect((await readState(page)).status).toBe('playing')
+
+  await setGrid(page, nearLostBoard, 7)
+  await pressArrow(page, 'ArrowLeft')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'pending')
+  await page.locator('[data-undo]').click()
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'idle')
+  expect(await readState(page)).toEqual({ board: nearLostBoard, score: 7, status: 'playing' })
+  await page.waitForTimeout(1200)
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'idle')
+
+  await pressArrow(page, 'ArrowLeft')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'saved')
+  expect(bodies).toHaveLength(3)
 })

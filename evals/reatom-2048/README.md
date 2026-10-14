@@ -83,6 +83,14 @@ The command prints JSON and exits 0 when there are no violations. No session log
 
 ## Contract
 
-`prompt.txt` is what the agent sees. `board` is a 4x4 `number[][]` (`0` is empty), `score` is a number, and `status` is `idle`, `playing`, `won`, or `lost`. `move(dir)` takes `'left' | 'right' | 'up' | 'down'` and returns a boolean. `newGame` starts a fresh game. On-screen controls are `[data-move="left"]`, `[data-move="right"]`, `[data-move="up"]`, `[data-move="down"]` (each like the matching arrow key) and `[data-new-game]`. The prompt does not mention tests, grading, or `window.__eval`.
+`prompt.txt` is what the agent sees. It describes the game loosely and leaves implementation choices (persistence mechanism, async helpers, whether to read the skills) to the agent. Only the interface section is strict, because the hidden suite depends on it. `board` is a 4x4 `number[][]` (`0` is empty), `score` is a number, and `status` is `idle`, `playing`, `won`, or `lost`. `move(dir)` takes `'left' | 'right' | 'up' | 'down'` and returns a boolean. `newGame` starts a fresh game. On-screen controls are `[data-move="left"]`, `[data-move="right"]`, `[data-move="up"]`, `[data-move="down"]` (each like the matching arrow key) and `[data-new-game]`. The prompt does not mention tests, grading, or `window.__eval`.
+
+On top of the base game, the prompt asks for three features that exercise more of Reatom:
+
+- **Undo**: `[data-undo]` and the `u` key restore board, score, and status from before the last player move. History is capped at 3 moves, `[data-undo]` is `disabled` when empty, and `newGame` clears it.
+- **Best score**: `[data-best]` persists in localStorage and survives undo, reload, and `newGame`.
+- **Score submission**: a losing player move sends one `POST /api/scores` with `{ score, maxTile }`. `[data-submit]` is `idle`, `pending`, `saved`, or `error`. `[data-retry]` resends after an error. `newGame` and undo abort an in-flight request. The workspace has no backend: the hidden suite mocks the endpoint with `page.route`, which controls delays, network failures, and 500s.
+
+The reference game passes all 21 hidden tests. The first two agent runs on the old prompt pass the 14 base tests and fail the 7 new ones.
 
 Grading injects the hook into the temporary copy only. `__grade_setup.ts` calls `addGlobalExtension` and binds matching names onto `window.__eval` for the hidden Playwright suite.

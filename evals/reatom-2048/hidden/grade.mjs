@@ -70,7 +70,7 @@ try {
       const playwright = resolve(evalRoot, 'node_modules/.bin/playwright')
       const tested = await run(playwright, ['test', '--config', resolve(hiddenDir, 'playwright.config.ts')], {
         cwd: hiddenDir,
-        timeoutMs: 120_000,
+        timeoutMs: 240_000,
         env: {
           ...process.env,
           BASE_URL: baseUrl,

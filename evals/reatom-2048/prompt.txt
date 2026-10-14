@@ -1,27 +1,28 @@
-Create a playable 2048 game in this directory with Reatom.
+Build a playable 2048 game in this directory with Reatom: the classic rules plus undo, a persisted best score, and score submission.
 
-Use the installed `@reatom/core` and `@reatom/jsx` (native DOM JSX, not React). Do not install packages and do not add `@reatom/vite`. Vite is already configured with the classic `h` / `hf` JSX pragma — keep `vite.config.ts`. Import `h` from `@reatom/jsx` in every file that uses JSX. `bun run dev` must start the game and `bun run build` must succeed.
-
-Before coding, read `.agents/skills/reatom` and `.agents/skills/reatom-jsx`, including each REFERENCE.md. Follow those APIs. Name atoms and actions with the Reatom `name` argument: `board`, `score`, `status`, `move`, `newGame`.
-
-`board` is a 4x4 `number[][]` (array of 4 rows of 4 numbers), `0` means empty. `score` is a number. `status` holds one of `idle`, `playing`, `won`, `lost`. `move(dir)` takes `'left' | 'right' | 'up' | 'down'` and returns a boolean.
+Use the installed `@reatom/core` and `@reatom/jsx` (native DOM JSX, not React). Do not install packages and do not add `@reatom/vite`. Keep `vite.config.ts`; it uses the classic `h` / `hf` JSX pragma, so import `h` from `@reatom/jsx` wherever you use JSX. `bun run dev` must start the game and `bun run build` must succeed. Reatom skills are in `.agents/skills`. Work only in this directory.
 
 Game:
-- 4x4 grid. Arrow keys and on-screen controls slide every tile into that edge and merge equal values. A tile merges at most once per move. Score increases by each new merged value (2+2 adds 4).
-- Left-row examples: [2,2,2,0] → [4,2,0,0]; [2,2,2,2] → [4,4,0,0]; [4,4,2,2] → [8,4,0,0].
-- `move` slides and merges and returns whether the board changed. It does not spawn.
-- After a successful player move (keyboard or a control), spawn 2 (90%) or 4 (10%) in a random empty cell. A move that does not change the board scores nothing and spawns nothing.
-- Win when a tile of 2048 or more appears: status is `won`, and play continues (status stays `won`).
-- Lose when the board is full and no equal tiles share an edge: status is `lost`, and further moves do nothing. An empty cell means the board is not lost.
-- If a tile is 2048 or more and no moves remain, status is `won`.
-- Show the score, the status, and the controls. `[data-new-game]` and the `n` key start a fresh game: score 0, exactly two tiles (each 2 or 4), status `playing`.
-- Call newGame on startup.
+- Classic 4x4 2048, played with the arrow keys and on-screen direction controls. After each player move that changes the board, a 2 or 4 appears in a random empty cell. A fresh game has score 0, two tiles, and status `playing`, and one starts on page load.
+- Reaching 2048 wins, and play continues. The status stays `won` from then on, even if no moves remain.
+- The game is lost when no move can change the board. After that, moves do nothing.
+- Undo steps back through the last 3 player moves, restoring board, score, and status. Undoing a loss counts. A new game clears the undo history.
+- The best score is the highest score ever reached in this browser. Undo, a new game, and a page reload all keep it.
+- When a player move loses the game, submit the result to the server once. Show the submission state, offer a retry when it fails, and cancel an in-flight submission on new game or undo. There is no backend here: the host serves the endpoint, so it fails locally.
 
-Always render:
-- `[data-board]` with 16 cells `[data-cell="r-c"]` (`r` and `c` are 0..3). Cell text is the tile value, or empty (not "0") when the cell is empty.
-- `[data-score]` text is the integer score and nothing else.
-- `[data-status]` attribute is `idle`, `playing`, `won`, or `lost`.
-- `[data-new-game]` is a clickable control that starts a fresh game.
-- On-screen direction controls are `[data-move="left"]`, `[data-move="right"]`, `[data-move="up"]`, `[data-move="down"]`, each behaving like the matching arrow key.
-
-Listen for `keydown` on `document` or `window`. Work only in this directory.
+Interface (keep exactly):
+- Reatom names, set with the `name` argument:
+  - `board`: atom holding a 4x4 `number[][]`, with `0` for empty.
+  - `score`: number atom.
+  - `status`: atom holding `idle`, `playing`, `won`, or `lost`.
+  - `move(dir)`: action. `dir` is `'left' | 'right' | 'up' | 'down'`. It slides and merges only (no spawn) and returns whether the board changed.
+  - `newGame()`: action.
+- Keys: listen for `keydown` on `document` or `window`. Arrow keys move, `n` starts a new game, `u` undoes.
+- DOM:
+  - `[data-board]` contains 16 cells `[data-cell="r-c"]` (r and c are 0..3). Cell text is the tile value, or empty for 0.
+  - `[data-score]` and `[data-best]` text is the integer and nothing else.
+  - `[data-status]` attribute is the status.
+  - `[data-move="left"|"right"|"up"|"down"]` controls act like the arrow keys.
+  - `[data-new-game]` acts like `n`. `[data-undo]` acts like `u` and has the `disabled` attribute when there is nothing to undo.
+  - `[data-submit]` attribute is `idle` (nothing sent for this game, or cancelled), `pending`, `saved` (2xx), or `error` (network failure or non-2xx). `[data-retry]` exists only while it is `error`, and it resends the same request.
+- Submission: `POST /api/scores` on the same origin with `content-type: application/json` and body `{"score": <score>, "maxTile": <largest tile>}`.
