@@ -30,6 +30,7 @@
     ]
   },
   "scripts": {
+    "analyze": "bun scripts/analyze-session.ts",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run --dir test",
     "typecheck": "tsc --noEmit",

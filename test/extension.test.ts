@@ -148,6 +148,23 @@ describe("speculative runs in a pi session", () => {
 			{ text: "Updating the model." },
 		);
 		expect(first.isEmpty).toBe(true);
+		const leadMessageWithThinking = {
+			role: "assistant",
+			model: LEAD,
+			content: [
+				{ type: "thinking", thinking: "Lead plan in thinking", thinkingSignature: "sig-lead" },
+				{ type: "toolCall", id: "l" },
+			],
+			timestamp: 1,
+		};
+		const helperView = await h.emit("context", {
+			messages: [leadMessageWithThinking],
+		});
+		expect(helperView.messages[0].content).toEqual([
+			{ type: "text", text: "Lead plan in thinking" },
+			{ type: "toolCall", id: "l" },
+		]);
+
 		const back = await h.turn(HELPER, [], { text: "All checks are green, the model is done." });
 		expect(back.continue).toBe(true);
 		expect(h.ctx.model?.id).toBe(LEAD);
@@ -164,7 +181,7 @@ describe("speculative runs in a pi session", () => {
 
 		const leadView = await h.emit("context", {
 			messages: [
-				{ role: "assistant", model: LEAD, content: [{ type: "toolCall", id: "l" }], timestamp: 1 },
+				helperView.messages[0],
 				{ role: "custom", customType: HELPER_INSTRUCTION_TYPE, content: "instruction", timestamp: 2 },
 				{ role: "assistant", model: HELPER, content: [{ type: "toolCall", id: "h" }], timestamp: 3 },
 				{ role: "toolResult", toolCallId: "h", content: [], timestamp: 4 },
@@ -172,6 +189,10 @@ describe("speculative runs in a pi session", () => {
 			],
 		});
 		expect(leadView.messages.map((message: { role: string }) => message.role)).toEqual(["assistant", "custom"]);
+		expect(leadView.messages[0].content).toEqual([
+			{ type: "thinking", thinking: "Lead plan in thinking", thinkingSignature: "sig-lead" },
+			{ type: "toolCall", id: "l" },
+		]);
 
 		expect(await h.undo({ run: 1, paths: ["src/model.test.ts"] })).toBe("baton_undo run #1: deleted src/model.test.ts (created by the run).");
 		expect(existsSync(join(cwd, "src/model.test.ts"))).toBe(false);
@@ -227,6 +248,26 @@ describe("speculative runs in a pi session", () => {
 		} finally {
 			writeFileSync(join(agentDir, "baton.json"), "{}");
 		}
+	});
+
+	it("limits the first speculative run to 5 helper turns and later runs to 10 by default", async () => {
+		const h = mount(project());
+		await startTask(h);
+		const read = { name: "read", args: { path: "src/model.ts" }, output: "x" };
+
+		await h.turn(LEAD, [read]);
+		for (let i = 1; i < 5; i++) {
+			expect((await h.turn(HELPER, [read])).isEmpty).toBe(true);
+		}
+		const firstCap = await h.turn(HELPER, [read]);
+		expect(firstCap.entries[0].content).toMatch(/stopped because it reached the safety cap of 5 helper turns/);
+
+		await h.turn(LEAD, [read]);
+		for (let i = 1; i < 10; i++) {
+			expect((await h.turn(HELPER, [read])).isEmpty).toBe(true);
+		}
+		const secondCap = await h.turn(HELPER, [read]);
+		expect(secondCap.entries[0].content).toMatch(/stopped because it reached the safety cap of 10 helper turns/);
 	});
 
 	it("closes an unfinished run when a new prompt arrives", async () => {

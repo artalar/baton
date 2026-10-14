@@ -14,13 +14,13 @@ flowchart TD
   lead -- "tool calls" --> start["Run N: switch to the helper, append the helper instruction, keep the lead's cache warm"]
   start --> helper["Helper turn: real tool calls; before its first edit/write of a file, the harness saves the original"]
   helper -- "more tool calls" --> helper
-  helper -- "no tool calls, request error, user message, or 40-turn safety cap" --> note["Note from facts: calls, read outputs, output tails, diff against the originals"]
+  helper -- "no tool calls, request error, user message, or 5/10-turn safety cap" --> note["Note from facts: calls, read outputs, output tails, diff against the originals"]
   note --> lead
 ```
 
-- **One session, two views.** The lead never sees helper turns or the helper instruction, only the notes appended at the end of its context, so its prompt cache stays valid. The helper sees the lead's view plus its current run.
+- **One session, two views.** The lead never sees helper turns or the helper instruction, only the notes appended at the end of its context, so its prompt cache stays valid. The helper sees the lead's view (with the lead's thinking extracted to text, and restored when switching back to the lead) plus its current run.
 - **Real work, kept by default.** The helper edits files and runs commands for real, so it can run tests and fix what they report. Keeping the run costs the lead nothing; reviewing a diff costs input tokens, which are much cheaper than writing the same change itself.
-- **Natural stop.** A run ends when the helper stops calling tools (the step is done or needs a decision), when its request fails, when the user sends a message, or at a generous safety cap (40 turns). There is no time limit: while the helper works, Baton keeps the lead's prompt cache warm (see [Lead cache keepalive](#lead-cache-keepalive)).
+- **Natural stop.** A run ends when the helper stops calling tools (the step is done or needs a decision), when its request fails, when the user sends a message, or at a safety cap (10 turns, 5 on the first run). There is no time limit: while the helper works, Baton keeps the lead's prompt cache warm (see [Lead cache keepalive](#lead-cache-keepalive)).
 - **No predictor.** A run starts after every lead turn with tool calls, except a turn that called `baton_undo`. A useless run costs one cheap request and a two-line note.
 
 ### What the lead reads after a run
@@ -111,7 +111,7 @@ User file `~/.pi/agent/baton.json` (or `$PI_CODING_AGENT_DIR/baton.json`), then 
 | `lead` | `openrouter/anthropic/claude-opus-5.5` | `BATON_LEAD` | Lead model, `provider/id` in pi's registry |
 | `helper` | `openrouter/z-ai/glm-5.3-flash` | `BATON_HELPER` | Helper model |
 | `speculate` | `true` | `BATON_SPEC` | Speculative runs on or off; off when lead and helper are the same model |
-| `maxHelperTurns` | `40` | `BATON_MAX_TURNS` | Safety cap of helper turns per run |
+| `maxHelperTurns` | `10` | `BATON_MAX_TURNS` | Safety cap of helper turns per run (`5` on the first run) |
 | `noteChars` | `80000` | | Size cap of one note |
 | `cacheKeepaliveMs` | `290000` | `BATON_CACHE_KEEPALIVE_MS` | [Lead cache keepalive](#lead-cache-keepalive) interval during a run; `0` = off, otherwise 60000–3600000 |
 | `journalDir` | `.pi/baton` | `BATON_JOURNAL_DIR` | Must stay inside the working directory |

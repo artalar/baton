@@ -4,7 +4,15 @@ import { HELPER_INSTRUCTION_TYPE, LEAD_NOTE_TYPE, viewFor } from "../src/context
 const HELPER = "openrouter/z-ai/glm-5.3-flash";
 const transcript = [
 	{ role: "user", content: "build tetris", timestamp: 1 },
-	{ role: "assistant", model: "anthropic/claude-opus-5.5", content: [{ type: "toolCall", id: "lead-1" }], timestamp: 2 },
+	{
+		role: "assistant",
+		model: "anthropic/claude-opus-5.5",
+		content: [
+			{ type: "thinking", thinking: "LEAD THINKING", thinkingSignature: "sig-1" },
+			{ type: "toolCall", id: "lead-1" },
+		],
+		timestamp: 2,
+	},
 	{ role: "toolResult", toolCallId: "lead-1", content: [{ type: "text", text: "LEAD RESULT" }], timestamp: 3 },
 	{ role: "custom", customType: HELPER_INSTRUCTION_TYPE, content: "OLD INSTRUCTION", timestamp: 4 },
 	{ role: "assistant", model: "z-ai/glm-5.3-flash", content: [{ type: "toolCall", id: "helper-1" }], timestamp: 5 },
@@ -32,6 +40,26 @@ describe("context views", () => {
 		expect(view).toContain("CURRENT HELPER RESULT");
 		expect(view).not.toContain("OLD INSTRUCTION");
 		expect(view).not.toContain("OLD HELPER RESULT");
+	});
+
+	it("extracts lead thinking to text for the helper and restores it when switching back to the lead", () => {
+		const helperView = viewFor(transcript, HELPER, 10);
+		expect(helperView[1]?.content).toEqual([
+			{ type: "text", text: "LEAD THINKING" },
+			{ type: "toolCall", id: "lead-1" },
+		]);
+
+		const restoredFromTranscript = viewFor(transcript, HELPER);
+		expect(restoredFromTranscript[1]?.content).toEqual([
+			{ type: "thinking", thinking: "LEAD THINKING", thinkingSignature: "sig-1" },
+			{ type: "toolCall", id: "lead-1" },
+		]);
+
+		const restoredFromHelperView = viewFor(helperView, HELPER);
+		expect(restoredFromHelperView[1]?.content).toEqual([
+			{ type: "thinking", thinking: "LEAD THINKING", thinkingSignature: "sig-1" },
+			{ type: "toolCall", id: "lead-1" },
+		]);
 	});
 
 	it("keeps messages from other models, e.g. before Baton was enabled", () => {

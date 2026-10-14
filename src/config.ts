@@ -9,7 +9,7 @@ export interface BatonConfig {
 	helper: string;
 	/** Speculation on or off. Off = the lead works alone. */
 	speculate: boolean;
-	/** Safety cap of helper turns per run; a run normally ends when the helper stops calling tools. */
+	/** Safety cap of helper turns per later run; the first run uses FIRST_RUN_MAX_TURNS. */
 	maxHelperTurns: number;
 	/** Size cap of one run note. */
 	noteChars: number;
@@ -18,11 +18,13 @@ export interface BatonConfig {
 	journalDir: string;
 }
 
+export const FIRST_RUN_MAX_TURNS = 5;
+
 export const DEFAULT_CONFIG: BatonConfig = {
 	lead: "openrouter/anthropic/claude-opus-5.5",
 	helper: "openrouter/z-ai/glm-5.3-flash",
 	speculate: true,
-	maxHelperTurns: 40,
+	maxHelperTurns: 10,
 	noteChars: 80_000,
 	cacheKeepaliveMs: 290_000,
 	journalDir: ".pi/baton",

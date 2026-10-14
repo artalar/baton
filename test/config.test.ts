@@ -16,10 +16,10 @@ function dirs(user?: object, project?: object) {
 }
 
 describe("config", () => {
-	it("defaults to speculation on with a generous turn cap and a lead cache keepalive just inside the 5-minute cache", () => {
+	it("defaults to speculation on with a 10-turn cap and a lead cache keepalive just inside the 5-minute cache", () => {
 		const { cwd, env } = dirs();
 		expect(loadConfig(cwd, () => {}, env)).toEqual(DEFAULT_CONFIG);
-		expect(DEFAULT_CONFIG).toMatchObject({ speculate: true, maxHelperTurns: 40, cacheKeepaliveMs: 290_000 });
+		expect(DEFAULT_CONFIG).toMatchObject({ speculate: true, maxHelperTurns: 10, cacheKeepaliveMs: 290_000 });
 	});
 
 	it("a project file or BATON_CACHE_KEEPALIVE_MS sets the keepalive, 0 turns it off, and values out of range fall back to the default", () => {

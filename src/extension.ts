@@ -1,7 +1,7 @@
 import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { type BatonConfig, isSameModel, loadConfig, parseModelRef } from "./config.ts";
+import { type BatonConfig, FIRST_RUN_MAX_TURNS, isSameModel, loadConfig, parseModelRef } from "./config.ts";
 import { type ContextMessage, HELPER_INSTRUCTION_TYPE, LEAD_NOTE_TYPE, viewFor } from "./context.ts";
 import { type Journal, openJournal } from "./journal.ts";
 import { keepWarm, type SentRequest } from "./keepalive.ts";
@@ -216,6 +216,7 @@ export default function baton(pi: ExtensionAPI) {
 			stats.helperTurns++;
 			stats.helperCalls += calls.length;
 			if (message.stopReason === "aborted") return { entries: [leadNote(await finishRun(ctx, "the user interrupted it"))] };
+			const maxTurns = activeRun.number === 1 ? Math.min(config.maxHelperTurns, FIRST_RUN_MAX_TURNS) : config.maxHelperTurns;
 			const stopReason =
 				message.stopReason === "error"
 					? `the helper's request failed (${oneLineError(message.errorMessage)})`
@@ -223,8 +224,8 @@ export default function baton(pi: ExtensionAPI) {
 						? activeRun.stopRequested
 						: !calls.length
 							? "the helper ended its turn without tool calls"
-							: activeRun.turns >= config.maxHelperTurns
-								? `it reached the safety cap of ${config.maxHelperTurns} helper turns`
+							: activeRun.turns >= maxTurns
+								? `it reached the safety cap of ${maxTurns} helper turns`
 								: undefined;
 			if (!stopReason) return undefined;
 			return { entries: [leadNote(await finishRun(ctx, stopReason))], continue: true };
