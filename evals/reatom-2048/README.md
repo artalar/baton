@@ -1,0 +1,88 @@
+# Reatom 2048 eval
+
+A $2 coding-agent task: implement 2048 with `@reatom/core` and `@reatom/jsx`. The agent starts from `starter/` (packages and Reatom skills already installed). `hidden/` grades the workspace. The agent never receives `hidden/` or `oracle/`.
+
+`tmp/run.mjs` and `tmp/budget-extension.js` are a local, gitignored runner. They are not part of the eval package.
+
+```mermaid
+flowchart LR
+  starter[starter] --> prepare[prepare.mjs]
+  prepare --> workspace["tmp/name"]
+  prompt[prompt.txt] --> runner["tmp/run.mjs"]
+  workspace --> runner
+  workspace --> grade[grade.mjs]
+  grade --> copy[temp copy]
+  hidden[hidden tests] --> copy
+  workspace --> audit[audit-session]
+  audit --> grade
+```
+
+## One-time setup
+
+From the repo root:
+
+```bash
+bun install --cwd evals/reatom-2048/starter
+bun install --cwd evals/reatom-2048
+bunx --cwd evals/reatom-2048 playwright install chromium
+```
+
+`oracle/` is a reference game used to check the grader. Install it only for that check:
+
+```bash
+bun install --cwd evals/reatom-2048/oracle
+```
+
+## Run one $2 trial
+
+`prepare.mjs` copies `starter/` to `tmp/<name>`, including `node_modules` and `.agents/skills`, so the agent does not spend budget on install. It writes a `.prepared` marker and replaces that directory only when it is missing, empty, or already marked. It will not touch `tmp/baton` or `tmp/opus`.
+
+```bash
+bun evals/reatom-2048/prepare.mjs --name 2048-a
+bun tmp/run.mjs --name 2048-a --cwd tmp/2048-a --prompt evals/reatom-2048/prompt.txt --budget 2 --baton 1
+```
+
+The same trial without Baton, in its own workspace:
+
+```bash
+bun evals/reatom-2048/prepare.mjs --name 2048-b
+bun tmp/run.mjs --name 2048-b --cwd tmp/2048-b --prompt evals/reatom-2048/prompt.txt --budget 2 --baton 0
+```
+
+`--budget` defaults to $3 in the runner. Pass `2` for this eval. `--prompt` defaults to `tmp/prompt.txt` (the Tetris prompt). `--session-name` defaults to `--name`.
+
+`--cwd` defaults to `tmp/<name>` when you run `bun tmp/run.mjs` from the repo root, so it can be omitted when the prepared directory is `tmp/2048-a`.
+
+## Grade
+
+```bash
+bun evals/reatom-2048/hidden/grade.mjs --cwd tmp/2048-a
+```
+
+The grader copies the workspace to a temporary directory and leaves the workspace unchanged. It builds that copy, serves `vite preview` on a free localhost port, and runs the hidden Playwright tests. It also audits the original session logs. It prints `{ passed, failed, tests, audit }` and exits 0 only when every test passes and `audit.ok` is true. A build failure is a score of 0. An audit violation fails the run even when every test passes.
+
+Check the grader against the reference game (this is not an agent workspace, so the audit is skipped):
+
+```bash
+bun evals/reatom-2048/hidden/grade.mjs --cwd evals/reatom-2048/oracle
+```
+
+## Session audit
+
+`hidden/audit-session.mjs` reads `<workspace>/.pi/sessions/*.jsonl` (complete across resumes) and `<workspace>/.run/events.jsonl` plus `events-continue.jsonl` when those files exist. Tool calls are deduped by id. The Baton helper model stays in the same pi session, so its calls are in these logs.
+
+A **violation** fails the audit, and therefore `grade.mjs`: a tool argument or tool result contains `reatom-2048/hidden`, `reatom-2048/oracle`, `e2e.test.ts`, `grade.mjs`, `audit-session`, `playwright.config.ts`, `window.__eval`, `__grade_`, or a Playwright test title from `hidden/e2e.test.ts`. A `read`, `edit`, `write`, `ls`, `find`, or `grep` path that resolves outside the workspace and inside `evals/reatom-2048` is also a violation.
+
+A **warning** is reported and does not fail the run: one of those path arguments resolves outside the workspace, or a bash command contains a `..` path segment or a filesystem absolute path outside the workspace. Absolute paths are rooted at `/Users`, `/Applications`, `/tmp`, `/opt`, `/var`, `/private`, and the other usual Unix roots, so HTML and URL fragments are ignored. `/usr/`, `/bin/`, `/opt/homebrew/`, `/dev/null`, `/tmp/`, `/private/tmp/`, and `/var/folders/` are ignored. An absolute path inside the workspace, or inside the cwd recorded in `.run/status.json`, is not a warning.
+
+```bash
+bun evals/reatom-2048/hidden/audit-session.mjs --cwd tmp/2048-a
+```
+
+The command prints JSON and exits 0 when there are no violations. No session logs yields `{ ok: true, skipped: "no session logs" }`.
+
+## Contract
+
+`prompt.txt` is what the agent sees. `board` is a 4x4 `number[][]` (`0` is empty), `score` is a number, and `status` is `idle`, `playing`, `won`, or `lost`. `move(dir)` takes `'left' | 'right' | 'up' | 'down'` and returns a boolean. `newGame` starts a fresh game. On-screen controls are `[data-move="left"]`, `[data-move="right"]`, `[data-move="up"]`, `[data-move="down"]` (each like the matching arrow key) and `[data-new-game]`. The prompt does not mention tests, grading, or `window.__eval`.
+
+Grading injects the hook into the temporary copy only. `__grade_setup.ts` calls `addGlobalExtension` and binds matching names onto `window.__eval` for the hidden Playwright suite.
