@@ -16,9 +16,10 @@ const args = parseArgs(process.argv.slice(2))
 if (args.help === true) {
   console.log(`usage: bun evals/reatom-2048/prepare.mjs --name <name> [--dest dir]
 
-Copies starter/ to tmp/<name>, including node_modules and .agents/skills.
-Does not copy hidden/ or oracle/. Writes .prepared and replaces the destination
-only when it is missing, empty, or already has that marker.`)
+Copies starter/ to tmp/<name>, including node_modules and .agents/skills, and
+commits it to a new git repository there. Does not copy hidden/ or oracle/.
+Writes .prepared and replaces the destination only when it is missing, empty,
+or already has that marker.`)
   process.exit(0)
 }
 
@@ -46,7 +47,17 @@ mkdirSync(dirname(dest), { recursive: true })
 const copied = spawnSync('cp', ['-R', starter, dest], { stdio: 'inherit' })
 if (copied.status !== 0) process.exit(copied.status ?? 1)
 writeFileSync(resolve(dest, '.prepared'), '')
+commitStarter(dest)
 console.log(dest)
+
+/** Without its own repository, git commands in the workspace reach this repository and print paths of hidden/ and oracle/. */
+function commitStarter(dir) {
+  const gitConfig = ['-c', 'init.defaultBranch=main', '-c', 'user.name=eval', '-c', 'user.email=eval@localhost', '-c', 'commit.gpgsign=false']
+  for (const gitArgs of [['init', '-q'], ['add', '-A'], ['commit', '-q', '-m', 'starter']]) {
+    const result = spawnSync('git', [...gitConfig, ...gitArgs], { cwd: dir, stdio: 'inherit' })
+    if (result.status !== 0) process.exit(result.status ?? 1)
+  }
+}
 
 function assertReplaceable(dest) {
   if (!existsSync(dest)) return
