@@ -16,7 +16,9 @@ Baton is now one small thing: speculative execution of the lead model's work by 
 
 ### Added
 
-- The lead's system prompt explains speculative runs, the note, keep / fix / undo, steering the helper with "Helper: …" in a reply, and that verification is the lead's job.
+- The lead's system prompt says that the lead is the author of the work, what the helper may change, how to hand off a decided step ("Helper: run the typecheck and the build, fix type errors"), to review each run's diff as its own code before keep / fix / undo, and that verification is the lead's job. It no longer says that speculation is there to save cost or that doing nothing means keeping.
+- The helper's write boundary: with edit/write the helper may change only files the lead changed with edit/write in this session (listed in each helper instruction) and files under `<journalDir>/scratch/` for scratch tests, scripts and logs. Any other edit/write is blocked before it runs, shows as `blocked, not run` in the note, and ends the run at once. `summary.json` counts blocked writes and records the file per run.
+- `helperThinking` (`low` by default; `BATON_HELPER_THINKING`; `inherit` keeps the lead's level): the helper's thinking level during a run. The lead's level comes back when it takes over.
 - A run note built from facts only: the helper's calls in order with their status, read outputs verbatim and deduplicated, output tails of other calls, and the diff of files changed with edit/write. The helper's text is never included.
 - `baton_undo({run, paths?})`: restores files a run changed with edit/write from originals saved before the helper's first edit, and deletes files it created. Files changed after the run are left alone and listed. No git needed.
 - A run ends when the helper stops calling tools, its request fails, the user sends a message, or at a safety cap of 10 turns (5 on the first run; `maxHelperTurns`, `BATON_MAX_TURNS`). An unfinished run is closed and reported when a new prompt arrives.
@@ -26,8 +28,13 @@ Baton is now one small thing: speculative execution of the lead model's work by 
 
 - Speculation is on by default (`BATON_SPEC=0` turns it off) and starts after every lead turn with tool calls, except one that called `baton_undo`.
 - The helper sees the lead's view (with the lead's thinking extracted to text, and restored when switching back to the lead) plus its current run, not earlier runs.
-- One entry point: `pi -e ./dist/index.js`. Seven configuration keys: `lead`, `helper`, `speculate`, `maxHelperTurns`, `noteChars`, `cacheKeepaliveMs`, `journalDir`.
+- The helper instruction asks for steps the lead has already decided ("Helper:" requests, what its messages and reasoning commit to, the obvious follow-up of its last calls) instead of continuing the lead's plan, and names the files it may change.
+- One entry point: `pi -e ./dist/index.js`. Eight configuration keys: `lead`, `helper`, `helperThinking`, `speculate`, `maxHelperTurns`, `noteChars`, `cacheKeepaliveMs`, `journalDir`.
 - The journal is per session: `<journalDir>/sessions/<id>/events.jsonl` and `summary.json`, with per-request usage including cache writes.
+
+### Fixed
+
+- Switching between the lead and the helper no longer changes the lead's thinking level. pi's `setModel` resets the level to the settings default, so after the first handoff earlier versions ran the lead (and the helper) at that default, `high` in the eval runs, instead of the level the session started with.
 
 ## [0.13.1] - 2026-10-13
 
