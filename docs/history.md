@@ -1,3 +1,5 @@
+The evidence-based run chronology is in [experiment.md](experiment.md).
+
 This file is the development log: the previous changelog, kept verbatim, including experiment notes and cost models.
 
 # Changelog
