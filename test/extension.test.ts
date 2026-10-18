@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import baton from "../src/index.ts";
 
 const LEAD = "anthropic/claude-opus-5.5";
 const HELPER = "z-ai/glm-5.3-flash";
+const ASK = "Helper: continue the step already decided.";
 const agentDir = mkdtempSync(join(tmpdir(), "baton-agent-"));
 const savedEnv = { ...process.env };
 
@@ -136,12 +138,25 @@ describe("speculative runs in a pi session", () => {
 		const h = mount(cwd);
 		const start = await startTask(h);
 		expect(start.systemPrompt).toMatch(/^BASE PROMPT\n\n# Baton: speculative runs[\s\S]*only files you have changed with edit\/write in this session, plus scratch files under \.pi\/baton\/scratch\/[\s\S]*baton_undo[\s\S]*The harness runs no checks for you/);
+		expect(start.systemPrompt).toContain('begins with "Helper:"');
+		expect(start.systemPrompt).toContain("Without that line the next turn is yours");
+		expect(start.systemPrompt).toContain("does not create product files");
+		expect(start.systemPrompt).toContain("you create it and decide its design and API");
+		expect(start.systemPrompt).toContain("successful typecheck or build of the current tree");
+		expect(start.systemPrompt).toContain("If the note says omitted or the diff was clipped, read that file");
+		expect(start.systemPrompt).not.toContain("ends with tool calls");
 		expect(h.ctx.model?.id).toBe(LEAD);
 
-		const handoff = await h.turn(LEAD, [{ name: "edit", args: { path: "src/model.ts", edits: [] }, output: "Edited" }]);
+		const handoff = await h.turn(LEAD, [{ name: "edit", args: { path: "src/model.ts", edits: [] }, output: "Edited" }], { text: ASK });
 		expect(handoff.entries).toHaveLength(1);
 		expect(handoff.entries[0]).toMatchObject({ customType: HELPER_INSTRUCTION_TYPE });
 		expect(handoff.entries[0].content).toMatch(/Speculative run #1\. You are now the helper model/);
+		expect(handoff.entries[0].content).toContain('Do only the latest "Helper:" request');
+		expect(handoff.entries[0].content).toContain("stop with no tool calls");
+		expect(handoff.entries[0].content).toContain("do not create product files");
+		expect(handoff.entries[0].content).toContain("do not change APIs");
+		expect(handoff.entries[0].content).toContain("Stopping early is cheap");
+		expect(handoff.entries[0].content).not.toContain("obvious follow-up");
 		expect(handoff.entries[0].content).toContain("You may change only the files the lead has written (src/model.ts) and files under .pi/baton/scratch/;");
 		expect(handoff.continue).toBeUndefined();
 		expect(h.ctx.model?.id).toBe(HELPER);
@@ -189,6 +204,7 @@ describe("speculative runs in a pi session", () => {
 		expect(note).toContain(`- created ${scratchTest} (+1 −0)`);
 		expect(note).toContain("+export const model = 2;");
 		expect(note).toMatch(/bash `npm test` → error\n {3}FAIL model\.test\.ts/);
+		expect(note).toContain("Continue from here: keep the run, fix it, or undo it.");
 		expect(note).toMatch(/--- read src\/model\.ts ---\nMODEL SOURCE/);
 		expect(note).not.toMatch(/All checks are green|Updating the model/);
 
@@ -215,7 +231,7 @@ describe("speculative runs in a pi session", () => {
 
 		expect((await h.turn(LEAD, [{ name: "baton_undo", args: { run: 1 }, output: "ok" }])).isEmpty).toBe(true);
 		expect(h.ctx.model?.id).toBe(LEAD);
-		const second = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }]);
+		const second = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }], { text: ASK });
 		expect(second.entries[0].content).toMatch(/Speculative run #2/);
 		expect(await h.undo({ run: 1 })).toMatch(/only the lead/);
 		await h.turn(HELPER, []);
@@ -235,7 +251,7 @@ describe("speculative runs in a pi session", () => {
 		const h = mount(cwd);
 		await startTask(h);
 
-		const handoff = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }]);
+		const handoff = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }], { text: ASK });
 		expect(handoff.entries[0].content).toContain("You may change no project file yet (the lead has written none), only files under .pi/baton/scratch/;");
 
 		const refused = await h.turn(HELPER, [
@@ -255,8 +271,10 @@ describe("speculative runs in a pi session", () => {
 		expect(note).toContain("It stopped because it tried to write src/store.ts, a file you have not changed with edit/write in this session (blocked, not run): 1 turn(s), 3 tool call(s).");
 		expect(note).toContain("2. write src/store.ts → blocked, not run\n3. edit src/model.ts → blocked, not run");
 		expect(note).toContain("Files changed with edit/write: none.");
+		expect(note).toContain("This run changed no files. Continue the task.");
+		expect(note).not.toContain("keep the run, fix it, or undo it");
 
-		await h.turn(LEAD, [{ name: "write", args: { path: "src/store.ts", content: "x" }, output: "Wrote", effect: write(cwd, "src/store.ts", "export const store = 1;\n") }]);
+		await h.turn(LEAD, [{ name: "write", args: { path: "src/store.ts", content: "x" }, output: "Wrote", effect: write(cwd, "src/store.ts", "export const store = 1;\n") }], { text: ASK });
 		const allowed = await h.turn(HELPER, [{ name: "edit", args: { path: "./src/../src/store.ts", edits: [] }, output: "Edited", effect: write(cwd, "src/store.ts", "export const store = 2;\n") }]);
 		expect(allowed.blocked).toEqual([]);
 		const escaped = await h.turn(HELPER, [{ name: "write", args: { path: ".pi/baton/scratch/../../../src/other.ts", content: "x" }, output: "blocked", isError: true }]);
@@ -274,7 +292,7 @@ describe("speculative runs in a pi session", () => {
 		try {
 			const h = mount(project());
 			await startTask(h);
-			await h.turn(LEAD, [READ]);
+			await h.turn(LEAD, [READ], { text: ASK });
 			expect(h.ctx.model?.id).toBe(HELPER);
 			expect(h.thinking.level).toBe("medium");
 			await h.turn(HELPER, []);
@@ -292,24 +310,24 @@ describe("speculative runs in a pi session", () => {
 			await startTask(h);
 			const read = { name: "read", args: { path: "src/model.ts" }, output: "x" };
 
-			await h.turn(LEAD, [read]);
+			await h.turn(LEAD, [read], { text: ASK });
 			const failed = await h.turn(HELPER, [], { stopReason: "error", errorMessage: "429 rate\nlimited" });
 			expect(failed.continue).toBe(true);
 			expect(failed.entries[0].content).toMatch(/stopped because the helper's request failed \(429 rate limited\)/);
 
-			await h.turn(LEAD, [read]);
+			await h.turn(LEAD, [read], { text: ASK });
 			const aborted = await h.turn(HELPER, [read], { stopReason: "aborted" });
 			expect(aborted.continue).toBeUndefined();
 			expect(aborted.entries[0].content).toMatch(/stopped because the user interrupted it/);
 			expect(h.ctx.model?.id).toBe(LEAD);
 
-			await h.turn(LEAD, [read]);
+			await h.turn(LEAD, [read], { text: ASK });
 			await h.emit("message_end", { message: { role: "user", content: "use canvas instead" } });
 			const steered = await h.turn(HELPER, [read]);
 			expect(steered.blocked[0]).toMatch(/lead model takes over/);
 			expect(steered.entries[0].content).toMatch(/stopped because the user sent a message/);
 
-			await h.turn(LEAD, [read]);
+			await h.turn(LEAD, [read], { text: ASK });
 			expect((await h.turn(HELPER, [read])).isEmpty).toBe(true);
 			const capped = await h.turn(HELPER, [read]);
 			expect(capped.entries[0].content).toMatch(/stopped because it reached the safety cap of 2 helper turns/);
@@ -323,14 +341,14 @@ describe("speculative runs in a pi session", () => {
 		await startTask(h);
 		const read = { name: "read", args: { path: "src/model.ts" }, output: "x" };
 
-		await h.turn(LEAD, [read]);
+		await h.turn(LEAD, [read], { text: ASK });
 		for (let i = 1; i < 5; i++) {
 			expect((await h.turn(HELPER, [read])).isEmpty).toBe(true);
 		}
 		const firstCap = await h.turn(HELPER, [read]);
 		expect(firstCap.entries[0].content).toMatch(/stopped because it reached the safety cap of 5 helper turns/);
 
-		await h.turn(LEAD, [read]);
+		await h.turn(LEAD, [read], { text: ASK });
 		for (let i = 1; i < 10; i++) {
 			expect((await h.turn(HELPER, [read])).isEmpty).toBe(true);
 		}
@@ -341,7 +359,7 @@ describe("speculative runs in a pi session", () => {
 	it("closes an unfinished run when a new prompt arrives", async () => {
 		const h = mount(project());
 		await startTask(h);
-		await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }]);
+		await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }], { text: ASK });
 		expect(h.ctx.model?.id).toBe(HELPER);
 		const next = await h.emit("before_agent_start", { messageType: "user", prompt: "Also add a score", systemPrompt: "", systemPromptOptions: {} });
 		expect(h.ctx.model?.id).toBe(LEAD);
@@ -349,21 +367,56 @@ describe("speculative runs in a pi session", () => {
 		expect(next.message.content).toMatch(/Speculative run #1[\s\S]*stopped because a new prompt arrived/);
 	});
 
-	it("never hands over when speculation is off, on a final answer, or after a failed lead turn", async () => {
+	it("starts a helper only from a Helper: line, including a text-only reply", async () => {
 		const h = mount(project());
 		await startTask(h);
 		expect((await h.turn(LEAD, [], { text: "Done." })).isEmpty).toBe(true);
-		expect((await h.turn(LEAD, [{ name: "read", args: { path: "a" } }], { stopReason: "error" })).isEmpty).toBe(true);
+		expect(h.ctx.model?.id).toBe(LEAD);
+		expect((await h.turn(LEAD, [{ name: "read", args: { path: "a" }, output: "x" }], { text: "Next I will read the tests." })).isEmpty).toBe(true);
+		expect(h.ctx.model?.id).toBe(LEAD);
+		expect((await h.turn(LEAD, [{ name: "read", args: { path: "a" } }], { stopReason: "error", text: ASK })).isEmpty).toBe(true);
+		expect(h.ctx.model?.id).toBe(LEAD);
 
+		const asked = await h.turn(LEAD, [], { text: "The board is ready.\n  Helper: run the typecheck" });
+		expect(asked.continue).toBe(true);
+		expect(asked.entries[0].content).toMatch(/Speculative run #1/);
+		expect(h.ctx.model?.id).toBe(HELPER);
+		const note: string = (await h.turn(HELPER, [])).entries[0].content;
+		expect(note).toContain("This run changed no files. Continue the task.");
+		expect(note).not.toContain("keep the run, fix it, or undo it");
+	});
+
+	it("leaves the prompt and the model alone when speculation is off", async () => {
 		process.env.BATON_SPEC = "0";
 		try {
 			const off = mount(project());
-			await startTask(off);
-			expect((await off.turn(LEAD, [{ name: "read", args: { path: "a" }, output: "x" }])).isEmpty).toBe(true);
-			expect(off.ctx.model?.id).toBe(LEAD);
+			const started = await startTask(off);
+			expect(started).toBeUndefined();
+			expect(off.ctx.model).toBeUndefined();
+			expect((await off.turn(LEAD, [{ name: "read", args: { path: "a" }, output: "x" }], { text: ASK })).isEmpty).toBe(true);
+			expect(off.ctx.model).toBeUndefined();
 		} finally {
 			delete process.env.BATON_SPEC;
 		}
+	});
+
+	it("lists paths changed outside edit/write and does not offer to undo them", async () => {
+		const cwd = project();
+		execFileSync("git", ["init"], { cwd, stdio: "ignore" });
+		execFileSync("git", ["add", "src/model.ts"], { cwd, stdio: "ignore" });
+		execFileSync("git", ["-c", "user.email=baton@example.com", "-c", "user.name=Baton", "commit", "-m", "init"], { cwd, stdio: "ignore" });
+		const h = mount(cwd);
+		await startTask(h);
+		await h.turn(LEAD, [], { text: "Helper: append a marker with bash." });
+		await h.turn(HELPER, [{ name: "bash", args: { command: "printf x >> src/model.ts" }, output: "ok", effect: () => writeFileSync(join(cwd, "src/model.ts"), "export const model = 1;\nx\n") }]);
+		const note: string = (await h.turn(HELPER, [])).entries[0].content;
+		expect(note).toContain("Files changed with edit/write: none.");
+		expect(note).toContain("Paths changed outside edit/write (not undone):\n- src/model.ts");
+		expect(note).not.toContain("baton_undo");
+		expect(note).not.toContain("keep the run, fix it, or undo it");
+		expect(note).toContain("Continue the task.");
+		expect(await h.undo({ run: 1 })).toBe("baton_undo run #1: nothing to undo.");
+		expect(readFileSync(join(cwd, "src/model.ts"), "utf8")).toBe("export const model = 1;\nx\n");
 	});
 });
 
@@ -390,7 +443,7 @@ describe("lead cache keepalive", () => {
 		const cwd = project();
 		const h = mount(cwd);
 		await startTask(h);
-		await h.turn(LEAD, [READ], { usage: LEAD_USED_CACHE, toolsMs: 100_000 });
+		await h.turn(LEAD, [READ], { text: ASK, usage: LEAD_USED_CACHE, toolsMs: 100_000 });
 		await h.turn(HELPER, [READ]);
 		await vi.advanceTimersByTimeAsync(189_999);
 		expect(h.pings).toHaveLength(0);
@@ -421,7 +474,7 @@ describe("lead cache keepalive", () => {
 		await startTask(h);
 		await h.turn(LEAD, [], { text: "Done.", usage: LEAD_USED_CACHE });
 		await vi.advanceTimersByTimeAsync(HOUR_MS);
-		await h.turn(LEAD, [READ]);
+		await h.turn(LEAD, [READ], { text: ASK });
 		await vi.advanceTimersByTimeAsync(HOUR_MS);
 		expect(h.pings).toHaveLength(0);
 
@@ -429,7 +482,7 @@ describe("lead cache keepalive", () => {
 		try {
 			const off = mount(project());
 			await startTask(off);
-			await off.turn(LEAD, [READ], { usage: LEAD_USED_CACHE });
+			await off.turn(LEAD, [READ], { text: ASK, usage: LEAD_USED_CACHE });
 			await vi.advanceTimersByTimeAsync(HOUR_MS);
 			expect(off.pings).toHaveLength(0);
 		} finally {
@@ -439,7 +492,7 @@ describe("lead cache keepalive", () => {
 
 	it("stops on a new prompt, a user interrupt, a session restart, the agent's end, and pi's shutdown", async () => {
 		const h = mount(project());
-		const startRun = () => h.turn(LEAD, [READ], { usage: LEAD_USED_CACHE });
+		const startRun = () => h.turn(LEAD, [READ], { text: ASK, usage: LEAD_USED_CACHE });
 		const pingsWithinAnHour = async () => {
 			await vi.advanceTimersByTimeAsync(HOUR_MS);
 			return h.pings.length;

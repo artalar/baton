@@ -6,13 +6,15 @@ import { type BatonConfig, FIRST_RUN_MAX_TURNS, isSameModel, loadConfig, parseMo
 import { type ContextMessage, HELPER_INSTRUCTION_TYPE, LEAD_NOTE_TYPE, viewFor } from "./context.ts";
 import { type Journal, openJournal } from "./journal.ts";
 import { keepWarm, type SentRequest } from "./keepalive.ts";
-import { blockedWriteReason, blockedWriteStop, describeCall, HANDBACK_REASON, helperInstruction, leadSystemNote, renderRunNote, renderUndoResult } from "./notes.ts";
+import { blockedWriteReason, blockedWriteStop, describeCall, HANDBACK_REASON, helperInstruction, leadRequestsHelper, leadSystemNote, renderRunNote, renderUndoResult } from "./notes.ts";
 import {
 	type ActiveRun,
+	captureWorktree,
 	collectChanges,
 	type FinishedRun,
 	fileToolTarget,
 	helperMayWrite,
+	pathsChangedSince,
 	type RunCall,
 	recordTurn,
 	rememberOriginal,
@@ -171,7 +173,8 @@ export default function baton(pi: ExtensionAPI) {
 		activeRun = undefined;
 		stopKeepalive();
 		const changes = collectChanges(run, cwd);
-		const note = renderRunNote({ runNumber: run.number, helperModel: config!.helper, stopReason, turns: run.turns, calls: run.calls, changes, noteChars: config!.noteChars });
+		const outsidePaths = pathsChangedSince(run.worktree, captureWorktree(cwd), changes.map((change) => change.path));
+		const note = renderRunNote({ runNumber: run.number, helperModel: config!.helper, stopReason, turns: run.turns, calls: run.calls, changes, outsidePaths, noteChars: config!.noteChars });
 		finishedRuns.push({ number: run.number, stopReason, turns: run.turns, callCount: run.calls.length, changes, blockedWrite: run.blockedWrite, undone: new Set() });
 		const reasonKey = run.blockedWrite && stopReason === run.stopRequested ? BLOCKED_WRITE_KEY : stopReasonKey(stopReason);
 		stats.stopReasons[reasonKey] = (stats.stopReasons[reasonKey] ?? 0) + 1;
@@ -212,6 +215,10 @@ export default function baton(pi: ExtensionAPI) {
 		init(ctx);
 		const interruptedRunNote = activeRun ? await finishRun(ctx, "a new prompt arrived") : undefined;
 		if (event.messageType === "user") journal?.log("prompt", { prompt: event.prompt.slice(0, 400) });
+		if (!config!.speculate) {
+			if (!interruptedRunNote) return undefined;
+			return { message: { customType: LEAD_NOTE_TYPE, content: interruptedRunNote, display: true } };
+		}
 		await switchModel(ctx, "lead");
 		const systemPrompt = event.systemPrompt + leadSystemNote(shownPath(scratchDir));
 		if (!interruptedRunNote) return { systemPrompt };
@@ -312,16 +319,18 @@ export default function baton(pi: ExtensionAPI) {
 		}
 		if (!config.speculate) return undefined;
 		if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
-		if (!calls.length || calls.some((call) => call.name === UNDO_TOOL)) return undefined;
+		if (!leadRequestsHelper(textOf(blocks))) return undefined;
 		if (!(await switchModel(ctx, "helper"))) return undefined;
 		runCounter++;
 		stats.runs++;
 		activeRun = startRun(runCounter, Date.now());
 		mkdirSync(scratchDir, { recursive: true });
 		journal?.log("run_start", { run: runCounter, after: calls.map((call) => describeCall(call, 120)) });
+		activeRun.worktree = captureWorktree(cwd);
 		startKeepalive(ctx, message.usage);
 		const scope = { leadFiles: [...leadFiles].map(shownPath), scratchDir: shownPath(scratchDir) };
-		return { entries: [{ type: "custom_message", customType: HELPER_INSTRUCTION_TYPE, content: helperInstruction(runCounter, scope), display: true }] };
+		const instruction = { type: "custom_message" as const, customType: HELPER_INSTRUCTION_TYPE, content: helperInstruction(runCounter, scope), display: true };
+		return calls.length ? { entries: [instruction] } : { entries: [instruction], continue: true };
 	});
 
 	pi.on("agent_end", () => {

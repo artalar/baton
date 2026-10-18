@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderRunNote, renderUndoResult } from "../src/notes.ts";
+import { helperInstruction, leadRequestsHelper, leadSystemNote, renderRunNote, renderUndoResult } from "../src/notes.ts";
 import type { RunCall } from "../src/run.ts";
 
 const base = { runNumber: 3, helperModel: "openrouter/z-ai/glm-5.3-flash", stopReason: "the helper ended its turn without tool calls", turns: 2, noteChars: 80_000 };
@@ -21,7 +21,7 @@ describe("run note", () => {
 		expect(note).toContain("- created src/new.ts (+1 −0)");
 		expect(note).toMatch(/-one\n\+two/);
 		expect(note).toContain("baton_undo({run: 3})");
-		expect(note).toContain("Bash commands above may also have changed files");
+		expect(note).toContain("Continue from here: keep the run, fix it, or undo it.");
 		expect(note.match(/READ BODY/g)).toHaveLength(1);
 	});
 
@@ -31,6 +31,44 @@ describe("run note", () => {
 		expect(note).toMatch(/--- read big\.ts ---\n\[omitted — read it yourself\]/);
 		expect(note).toMatch(/\+2/);
 		expect(note).toMatch(/1\. read big\.ts → ok$/m);
+	});
+
+	it("tells the lead to continue when the run changed no files", () => {
+		const note = renderRunNote({ ...base, calls: [{ id: "1", name: "read", args: { path: "a.ts" }, output: "x" }], changes: [] });
+		expect(note).toContain("Files changed with edit/write: none.");
+		expect(note).toContain("This run changed no files. Continue the task.");
+		expect(note).not.toContain("keep the run, fix it, or undo it");
+		expect(note).not.toContain("baton_undo");
+	});
+
+	it("lists paths changed outside edit/write without offering to undo them", () => {
+		const note = renderRunNote({
+			...base,
+			calls: [{ id: "1", name: "bash", args: { command: "printf x > side.txt" }, output: "ok" }],
+			changes: [],
+			outsidePaths: ["side.txt"],
+		});
+		expect(note).toContain("Paths changed outside edit/write (not undone):\n- side.txt");
+		expect(note).toContain("Continue the task.");
+		expect(note).not.toContain("baton_undo");
+		expect(note).not.toContain("keep the run, fix it, or undo it");
+		expect(note).not.toContain("This run changed no files");
+	});
+
+	it("starts a run from a Helper: line and describes that narrower job", () => {
+		expect(leadRequestsHelper("Helper: run the typecheck")).toBe(true);
+		expect(leadRequestsHelper("  Helper: run it")).toBe(true);
+		expect(leadRequestsHelper("Done.\nHelper: read src/a.ts")).toBe(true);
+		expect(leadRequestsHelper("I will ask the Helper: later")).toBe(false);
+		expect(leadRequestsHelper("helper: run it")).toBe(false);
+		const system = leadSystemNote(".pi/baton/scratch");
+		expect(system).toContain('begins with "Helper:"');
+		expect(system).toContain("Without that line the next turn is yours");
+		expect(system).not.toContain("Do not redo or re-read");
+		const instruction = helperInstruction(1, { leadFiles: [], scratchDir: ".pi/baton/scratch" });
+		expect(instruction).toContain('latest "Helper:" request');
+		expect(instruction).toContain("If there is no such request, stop with no tool calls");
+		expect(instruction).not.toContain("obvious follow-up");
 	});
 
 	it("renders undo results", () => {

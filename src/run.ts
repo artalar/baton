@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
@@ -29,6 +30,7 @@ export interface ActiveRun {
 	originals: Map<string, Buffer | undefined>;
 	/** Tool call ids the harness refused to run. */
 	blocked: Set<string>;
+	worktree?: WorktreeSnapshot;
 	/** The file the helper tried to change without being allowed to, relative to cwd. */
 	blockedWrite?: string;
 	stopRequested?: string;
@@ -99,6 +101,76 @@ export function collectChanges(run: ActiveRun, cwd: string): FileChange[] {
 		if (!sameContent(before, after)) changes.push({ path: relative(cwd, absolutePath) || absolutePath, before, after });
 	}
 	return changes;
+}
+
+export interface WorktreeSnapshot {
+	status: string;
+	diffStat: string;
+}
+
+export function captureWorktree(cwd: string): WorktreeSnapshot | undefined {
+	const status = gitText(cwd, ["status", "--porcelain=v1", "--untracked-files=all"]);
+	const diffStat = gitText(cwd, ["diff", "--stat", "--relative"]);
+	if (status === undefined || diffStat === undefined) return undefined;
+	return { status, diffStat };
+}
+
+function gitText(cwd: string, args: string[]): string | undefined {
+	try {
+		return execFileSync("git", ["-C", cwd, "--no-pager", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15_000 });
+	} catch {
+		return undefined;
+	}
+}
+
+function unquoteGitPath(value: string): string {
+	const trimmed = value.trim();
+	if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return trimmed;
+	try {
+		const parsed: unknown = JSON.parse(trimmed);
+		return typeof parsed === "string" ? parsed : trimmed.slice(1, -1);
+	} catch {
+		return trimmed.slice(1, -1);
+	}
+}
+
+function porcelainPaths(status: string): Map<string, string> {
+	const paths = new Map<string, string>();
+	for (const line of status.split("\n")) {
+		if (line.length < 4) continue;
+		for (const part of line.slice(3).split(" -> ")) {
+			const path = unquoteGitPath(part);
+			if (path) paths.set(path, line);
+		}
+	}
+	return paths;
+}
+
+function diffStatPaths(stat: string): Map<string, string> {
+	const paths = new Map<string, string>();
+	for (const line of stat.split("\n")) {
+		const bar = line.indexOf(" | ");
+		if (bar <= 0) continue;
+		const path = unquoteGitPath(line.slice(0, bar));
+		if (path) paths.set(path, line.trim());
+	}
+	return paths;
+}
+
+export function pathsChangedSince(before: WorktreeSnapshot | undefined, after: WorktreeSnapshot | undefined, editWritePaths: readonly string[]): string[] {
+	if (!before || !after) return [];
+	const beforeStatus = porcelainPaths(before.status);
+	const afterStatus = porcelainPaths(after.status);
+	const beforeDiff = diffStatPaths(before.diffStat);
+	const afterDiff = diffStatPaths(after.diffStat);
+	const edited = new Set(editWritePaths);
+	const changed: string[] = [];
+	for (const path of new Set([...beforeStatus.keys(), ...afterStatus.keys(), ...beforeDiff.keys(), ...afterDiff.keys()])) {
+		if (edited.has(path)) continue;
+		if (beforeStatus.get(path) !== afterStatus.get(path) || beforeDiff.get(path) !== afterDiff.get(path)) changed.push(path);
+	}
+	changed.sort();
+	return changed;
 }
 
 /** Restores files a run changed with edit/write, but only those still exactly as the run left them. */

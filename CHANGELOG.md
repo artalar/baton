@@ -26,9 +26,10 @@ Baton is now one small thing: speculative execution of the lead model's work by 
 
 ### Changed
 
-- Speculation is on by default (`BATON_SPEC=0` turns it off) and starts after every lead turn with tool calls, except one that called `baton_undo`.
+- Speculation is on by default (`BATON_SPEC=0` turns it off). A run starts only when the lead's reply has a line that begins with `Helper:`, including a reply with no tool calls. Without that line the lead continues alone. With speculation off, Baton leaves the system prompt and the model as they are.
 - The helper sees the lead's view (with the lead's thinking extracted to text, and restored when switching back to the lead) plus its current run, not earlier runs.
-- The helper instruction asks for steps the lead has already decided ("Helper:" requests, what its messages and reasoning commit to, the obvious follow-up of its last calls) instead of continuing the lead's plan, and names the files it may change.
+- The helper does only the latest `Helper:` request. If there is none, it stops with no tool calls. It does not create product files or change APIs, and the instruction names the files it may change.
+- A run that changed no files tells the lead to continue the task, without a keep / fix / undo verdict. The note lists paths changed outside edit/write and does not offer to undo them. A successful typecheck or build already shown for the current tree is not run again; a read marked omitted, or a clipped diff, is read.
 - One entry point: `pi -e ./dist/index.js`. Eight configuration keys: `lead`, `helper`, `helperThinking`, `speculate`, `maxHelperTurns`, `noteChars`, `cacheKeepaliveMs`, `journalDir`.
 - The journal is per session: `<journalDir>/sessions/<id>/events.jsonl` and `summary.json`, with per-request usage including cache writes.
 

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { collectChanges, type FinishedRun, rememberOriginal, startRun, undoRun } from "../src/run.ts";
+import { collectChanges, type FinishedRun, pathsChangedSince, rememberOriginal, startRun, undoRun } from "../src/run.ts";
 
 function project() {
 	const cwd = mkdtempSync(join(tmpdir(), "baton-run-"));
@@ -48,5 +48,13 @@ describe("run changes and undo", () => {
 		expect(undoRun(finished, cwd)).toMatchObject({ restored: [], deleted: ["src/new.ts"], changedLater: ["src/b.ts"], alreadyUndone: ["src/a.ts"] });
 		expect(existsSync(join(cwd, "src/new.ts"))).toBe(false);
 		expect(readFileSync(join(cwd, "src/b.ts"), "utf8")).toBe("b3 by the lead\n");
+	});
+
+	it("reports git paths that changed outside edit/write", () => {
+		const before = { status: " M src/a.ts\n?? old.txt\n", diffStat: " src/a.ts | 1 +\n" };
+		const after = { status: " M src/a.ts\n?? old.txt\n?? side.txt\n", diffStat: " src/a.ts | 3 +++\n" };
+		expect(pathsChangedSince(before, after, [])).toEqual(["side.txt", "src/a.ts"]);
+		expect(pathsChangedSince(before, after, ["src/a.ts"])).toEqual(["side.txt"]);
+		expect(pathsChangedSince(undefined, after, [])).toEqual([]);
 	});
 });
