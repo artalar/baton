@@ -1,14 +1,13 @@
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { HELPER_INSTRUCTION_TYPE, LEAD_NOTE_TYPE } from "../src/context.ts";
+import { ALERT_TYPE } from "../src/context.ts";
 import baton from "../src/index.ts";
+import { ALERT_INTRO, followerSystemNote, leadSystemNote } from "../src/notes.ts";
 
 const LEAD = "anthropic/claude-opus-5.5";
 const HELPER = "z-ai/glm-5.3-flash";
-const ASK = "Helper: continue the step already decided.";
 const agentDir = mkdtempSync(join(tmpdir(), "baton-agent-"));
 const savedEnv = { ...process.env };
 
@@ -27,7 +26,6 @@ function project() {
 }
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
-type Tool = { execute: (...args: unknown[]) => Promise<{ content: { text: string }[] }> };
 type Call = { name: string; args: Record<string, unknown>; output?: string; isError?: boolean };
 type ModelRef = { id: string; provider: string };
 type StreamOptions = { onPayload: (payload: unknown, model: ModelRef) => unknown; sessionId?: string; signal: AbortSignal };
@@ -37,7 +35,6 @@ const PING_USAGE = { input: 12, output: 2, cacheRead: 40_000, cacheWrite: 0, tot
 
 function mount(cwd: string) {
 	const handlers = new Map<string, Handler[]>();
-	const tools = new Map<string, Tool>();
 	const pings: Ping[] = [];
 	const thinking = { level: "medium", history: [] as string[] };
 	const ctx = {
@@ -67,9 +64,7 @@ function mount(cwd: string) {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 			return () => {};
 		},
-		registerTool(tool: Tool & { name: string }) {
-			tools.set(tool.name, tool);
-		},
+		registerTool() {},
 		/** Like pi, a model switch resets the thinking level to the settings default. */
 		async setModel(model: { id: string; provider: string }) {
 			ctx.model = model;
@@ -91,23 +86,22 @@ function mount(cwd: string) {
 	let callCounter = 0;
 	let requestCounter = 0;
 	/**
-	 * Simulates one assistant turn: the provider request, tool_call hooks, the side effect, then turn_end.
+	 * Simulates one assistant turn: the provider request, then turn_end.
 	 * `toolsMs` advances the fake clock between the request and turn_end, as long tool calls do.
 	 */
 	const turn = async (
 		model: string,
-		calls: (Call & { effect?: () => void })[],
-		options: { text?: string; stopReason?: string; errorMessage?: string; usage?: Record<string, number>; toolsMs?: number } = {},
+		calls: Call[],
+		options: { text?: string; thinking?: string; stopReason?: string; errorMessage?: string; usage?: Record<string, number>; toolsMs?: number } = {},
 	) => {
 		await emit("before_provider_request", { payload: { model, request: ++requestCounter } });
 		const withIds = calls.map((call) => ({ ...call, id: `call-${++callCounter}` }));
-		const blocked: string[] = [];
-		for (const call of withIds) {
-			const verdict = await emit("tool_call", { toolCallId: call.id, toolName: call.name, input: call.args });
-			if (verdict?.block) blocked.push(verdict.reason);
-			else call.effect?.();
-		}
 		if (options.toolsMs) await vi.advanceTimersByTimeAsync(options.toolsMs);
+		const content = [
+			...(options.thinking ? [{ type: "thinking", thinking: options.thinking }] : []),
+			...(options.text ? [{ type: "text", text: options.text }] : []),
+			...withIds.map((call) => ({ type: "toolCall", id: call.id, name: call.name, arguments: call.args })),
+		];
 		const result = await emit("turn_end", {
 			message: {
 				role: "assistant",
@@ -115,14 +109,13 @@ function mount(cwd: string) {
 				stopReason: options.stopReason ?? (withIds.length ? "toolUse" : "stop"),
 				errorMessage: options.errorMessage,
 				usage: options.usage,
-				content: [...(options.text ? [{ type: "text", text: options.text }] : []), ...withIds.map((call) => ({ type: "toolCall", id: call.id, name: call.name, arguments: call.args }))],
+				content,
 			},
 			toolResults: withIds.filter((call) => call.output !== undefined).map((call) => ({ toolCallId: call.id, isError: !!call.isError, content: [{ type: "text", text: call.output }] })),
 		});
-		return Object.assign(result ?? {}, { blocked, isEmpty: result === undefined });
+		return Object.assign(result ?? {}, { isEmpty: result === undefined });
 	};
-	const undo = (params: Record<string, unknown>) => tools.get("baton_undo")!.execute("t", params).then((reply) => reply.content[0]!.text);
-	return { ctx, emit, turn, undo, pings, thinking };
+	return { ctx, emit, turn, pings, thinking };
 }
 
 async function startTask(h: ReturnType<typeof mount>, prompt = "Build tetris") {
@@ -130,169 +123,142 @@ async function startTask(h: ReturnType<typeof mount>, prompt = "Build tetris") {
 	return h.emit("before_agent_start", { messageType: "user", prompt, systemPrompt: "BASE PROMPT", systemPromptOptions: {} });
 }
 
-const write = (cwd: string, path: string, content: string) => () => writeFileSync(join(cwd, path), content);
+const systemSection = async (h: ReturnType<typeof mount>) => {
+	const projected = await h.emit("context_with_system", { messages: [{ role: "system", content: "BASE PROMPT", sections: { identity: "You are pi." } }] });
+	return projected?.messages?.[0]?.sections?.baton as string | undefined;
+};
+
+const READ = { name: "read", args: { path: "src/model.ts" }, output: "file body" };
 
 describe("speculative runs in a pi session", () => {
-	it("hands over after a lead turn, reports facts only, and lets the lead undo", async () => {
-		const cwd = project();
-		const h = mount(cwd);
-		const start = await startTask(h);
-		expect(start.systemPrompt).toMatch(/^BASE PROMPT\n\n# Baton: speculative runs[\s\S]*only files you have changed with edit\/write in this session, plus scratch files under \.pi\/baton\/scratch\/[\s\S]*baton_undo[\s\S]*The harness runs no checks for you/);
-		expect(start.systemPrompt).toContain('begins with "Helper:"');
-		expect(start.systemPrompt).toContain("Without that line the next turn is yours");
-		expect(start.systemPrompt).toContain("does not create product files");
-		expect(start.systemPrompt).toContain("you create it and decide its design and API");
-		expect(start.systemPrompt).toContain("successful typecheck or build of the current tree");
-		expect(start.systemPrompt).toContain("If the note says omitted or the diff was clipped, read that file");
-		expect(start.systemPrompt).not.toContain("ends with tool calls");
+	it("switches to the follower after a lead turn with tool calls, and not after one without", async () => {
+		const h = mount(project());
+		expect(await startTask(h)).toBeUndefined();
+		expect(h.ctx.model?.id).toBe(LEAD);
+		expect(await systemSection(h)).toBe(leadSystemNote());
+
+		expect((await h.turn(LEAD, [], { text: "The board is ready." })).isEmpty).toBe(true);
 		expect(h.ctx.model?.id).toBe(LEAD);
 
-		const handoff = await h.turn(LEAD, [{ name: "edit", args: { path: "src/model.ts", edits: [] }, output: "Edited" }], { text: ASK });
-		expect(handoff.entries).toHaveLength(1);
-		expect(handoff.entries[0]).toMatchObject({ customType: HELPER_INSTRUCTION_TYPE });
-		expect(handoff.entries[0].content).toMatch(/Speculative run #1\. You are now the helper model/);
-		expect(handoff.entries[0].content).toContain('Do only the latest "Helper:" request');
-		expect(handoff.entries[0].content).toContain("stop with no tool calls");
-		expect(handoff.entries[0].content).toContain("do not create product files");
-		expect(handoff.entries[0].content).toContain("do not change APIs");
-		expect(handoff.entries[0].content).toContain("Stopping early is cheap");
-		expect(handoff.entries[0].content).not.toContain("obvious follow-up");
-		expect(handoff.entries[0].content).toContain("You may change only the files the lead has written (src/model.ts) and files under .pi/baton/scratch/;");
-		expect(handoff.continue).toBeUndefined();
+		expect((await h.turn(LEAD, [READ], { stopReason: "error" })).isEmpty).toBe(true);
+		expect(h.ctx.model?.id).toBe(LEAD);
+		expect((await h.turn(LEAD, [READ], { stopReason: "aborted" })).isEmpty).toBe(true);
+		expect(h.ctx.model?.id).toBe(LEAD);
+
+		const handoff = await h.turn(LEAD, [READ], { text: "Reading the model." });
+		expect(handoff.isEmpty).toBe(true);
 		expect(h.ctx.model?.id).toBe(HELPER);
 		expect(h.thinking.level).toBe("low");
+		expect(await systemSection(h)).toBe(followerSystemNote());
+	});
 
-		const scratchTest = ".pi/baton/scratch/model.test.ts";
-		const first = await h.turn(
+	it("hands back when the follower stops calling tools, with an alert of inputs and outputs and no follower thinking", async () => {
+		const h = mount(project());
+		await startTask(h);
+		await h.turn(LEAD, [READ]);
+		const working = await h.turn(
 			HELPER,
 			[
 				{ name: "read", args: { path: "src/model.ts" }, output: "MODEL SOURCE" },
-				{ name: "edit", args: { path: "src/model.ts", edits: [] }, output: "Edited", effect: write(cwd, "src/model.ts", "export const model = 2;\n") },
-				{ name: "write", args: { path: scratchTest, content: "test" }, output: "Wrote", effect: write(cwd, scratchTest, "test('x')\n") },
-				{ name: "bash", args: { command: "npm test" }, isError: true, output: "FAIL model.test.ts\nTests: 1 failed" },
+				{ name: "bash", args: { command: "npm test" }, isError: true, output: "FAIL model.test.ts" },
 			],
-			{ text: "Updating the model." },
+			{ thinking: "FOLLOWER PRIVATE PLAN", text: "Updating the model." },
 		);
-		expect(first.isEmpty).toBe(true);
-		expect(first.blocked).toEqual([]);
-		const leadMessageWithThinking = {
-			role: "assistant",
-			model: LEAD,
-			content: [
-				{ type: "thinking", thinking: "Lead plan in thinking", thinkingSignature: "sig-lead" },
-				{ type: "toolCall", id: "l" },
-			],
-			timestamp: 1,
-		};
-		const helperView = await h.emit("context", {
-			messages: [leadMessageWithThinking],
-		});
-		expect(helperView.messages[0].content).toEqual([
-			{ type: "text", text: "Lead plan in thinking" },
-			{ type: "toolCall", id: "l" },
-		]);
+		expect(working.isEmpty).toBe(true);
+		expect(h.ctx.model?.id).toBe(HELPER);
 
-		const back = await h.turn(HELPER, [], { text: "All checks are green, the model is done." });
+		const back = await h.turn(HELPER, [], { thinking: "DONE THINKING", text: "All checks are green." });
 		expect(back.continue).toBe(true);
 		expect(h.ctx.model?.id).toBe(LEAD);
 		expect(h.thinking).toEqual({ level: "medium", history: ["medium", "low", "medium"] });
-		const note: string = back.entries[0].content;
-		expect(back.entries[0].customType).toBe(LEAD_NOTE_TYPE);
-		expect(note).toMatch(/Speculative run #1 by the helper model \(glm-5\.3-flash\), not by you/);
-		expect(note).toMatch(/It stopped because the helper ended its turn without tool calls: 2 turn\(s\), 4 tool call\(s\)/);
-		expect(note).toContain("- modified src/model.ts (+1 −1)");
-		expect(note).toContain(`- created ${scratchTest} (+1 −0)`);
-		expect(note).toContain("+export const model = 2;");
-		expect(note).toMatch(/bash `npm test` → error\n {3}FAIL model\.test\.ts/);
-		expect(note).toContain("Continue from here: keep the run, fix it, or undo it.");
-		expect(note).toMatch(/--- read src\/model\.ts ---\nMODEL SOURCE/);
-		expect(note).not.toMatch(/All checks are green|Updating the model/);
+		expect(back.entries).toHaveLength(1);
+		expect(back.entries[0].customType).toBe(ALERT_TYPE);
+		expect(back.entries[0].content).toBe(
+			`${ALERT_INTRO}\n1. read\ninput: {"path":"src/model.ts"}\noutput: MODEL SOURCE\n2. bash\ninput: {"command":"npm test"}\noutput: FAIL model.test.ts`,
+		);
+		expect(back.entries[0].content).not.toMatch(/FOLLOWER PRIVATE PLAN|DONE THINKING|All checks are green|Updating the model/);
+		expect(await systemSection(h)).toBe(leadSystemNote());
+	});
 
+	it("keeps a user message from the follower run in the lead view, beside the alert", async () => {
+		const h = mount(project());
+		await startTask(h);
+		await h.turn(LEAD, [READ]);
+		await h.emit("message_end", { message: { role: "user", content: "use canvas instead" } });
+		expect((await h.turn(HELPER, [READ], { thinking: "SECRET" })).isEmpty).toBe(true);
+		expect(h.ctx.model?.id).toBe(HELPER);
+
+		const messages = [
+			{
+				role: "assistant",
+				model: LEAD,
+				content: [
+					{ type: "thinking", thinking: "LEAD PLAN", thinkingSignature: "sig-lead" },
+					{ type: "toolCall", id: "lead-1", name: "read", arguments: { path: "src/model.ts" } },
+				],
+			},
+			{ role: "toolResult", toolCallId: "lead-1", content: [{ type: "text", text: "file body" }] },
+			{ role: "user", content: "use canvas instead" },
+			{
+				role: "assistant",
+				model: HELPER,
+				content: [
+					{ type: "thinking", thinking: "SECRET" },
+					{ type: "toolCall", id: "h1", name: "read", arguments: { path: "src/model.ts" } },
+				],
+			},
+			{ role: "toolResult", toolCallId: "h1", content: [{ type: "text", text: "file body" }] },
+		];
+		const followerView = await h.emit("context", { messages });
+		expect(JSON.stringify(followerView.messages)).toContain("LEAD PLAN");
+		expect(JSON.stringify(followerView.messages)).toContain("use canvas instead");
+		expect(JSON.stringify(followerView.messages)).toContain("file body");
+		expect(JSON.stringify(followerView.messages)).not.toContain("SECRET");
+
+		const back = await h.turn(HELPER, []);
+		const alert = back.entries[0].content as string;
 		const leadView = await h.emit("context", {
+			messages: [...followerView.messages, { role: "custom", customType: ALERT_TYPE, content: alert }],
+		});
+		expect(leadView.messages.map((message: { role: string }) => message.role)).toEqual(["assistant", "toolResult", "user", "custom"]);
+		expect(leadView.messages[2].content).toBe("use canvas instead");
+		expect(leadView.messages[3].content).toBe(alert);
+		expect(leadView.messages[0].content[0]).toEqual({ type: "thinking", thinking: "LEAD PLAN", thinkingSignature: "sig-lead" });
+		expect(JSON.stringify(leadView.messages)).not.toContain("SECRET");
+		expect(JSON.stringify(leadView.messages)).not.toContain('"id":"h1"');
+	});
+
+	it("omits alerts again when the follower runs a second time", async () => {
+		const h = mount(project());
+		await startTask(h);
+		await h.turn(LEAD, [READ]);
+		const firstAlert = (await h.turn(HELPER, [])).entries[0].content as string;
+		await h.turn(LEAD, [READ]);
+		expect(h.ctx.model?.id).toBe(HELPER);
+		const duringSecond = await h.emit("context", {
 			messages: [
-				helperView.messages[0],
-				{ role: "custom", customType: HELPER_INSTRUCTION_TYPE, content: "instruction", timestamp: 2 },
-				{ role: "assistant", model: HELPER, content: [{ type: "toolCall", id: "h" }], timestamp: 3 },
-				{ role: "toolResult", toolCallId: "h", content: [], timestamp: 4 },
-				{ role: "custom", customType: LEAD_NOTE_TYPE, content: note, timestamp: 5 },
+				{ role: "assistant", model: LEAD, content: [{ type: "thinking", thinking: "LEAD PLAN" }, { type: "toolCall", id: "l2" }] },
+				{ role: "custom", customType: ALERT_TYPE, content: firstAlert },
+				{ role: "custom", customType: ALERT_TYPE, content: "ALERT TWO" },
+				{ role: "assistant", model: HELPER, content: [{ type: "thinking", thinking: "AGAIN" }, { type: "toolCall", id: "h2" }] },
+				{ role: "user", content: "still here" },
 			],
 		});
-		expect(leadView.messages.map((message: { role: string }) => message.role)).toEqual(["assistant", "custom"]);
-		expect(leadView.messages[0].content).toEqual([
-			{ type: "thinking", thinking: "Lead plan in thinking", thinkingSignature: "sig-lead" },
-			{ type: "toolCall", id: "l" },
-		]);
-
-		expect(await h.undo({ run: 1, paths: [scratchTest] })).toBe(`baton_undo run #1: deleted ${scratchTest} (created by the run).`);
-		expect(existsSync(join(cwd, scratchTest))).toBe(false);
-		expect(await h.undo({ run: 1 })).toBe(`baton_undo run #1: restored src/model.ts; ${scratchTest} already undone.`);
-		expect(readFileSync(join(cwd, "src/model.ts"), "utf8")).toBe("export const model = 1;\n");
-		expect(await h.undo({ run: 9 })).toMatch(/no run #9/);
-
-		expect((await h.turn(LEAD, [{ name: "baton_undo", args: { run: 1 }, output: "ok" }])).isEmpty).toBe(true);
-		expect(h.ctx.model?.id).toBe(LEAD);
-		const second = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }], { text: ASK });
-		expect(second.entries[0].content).toMatch(/Speculative run #2/);
-		expect(await h.undo({ run: 1 })).toMatch(/only the lead/);
-		await h.turn(HELPER, []);
-		expect((await h.turn(LEAD, [], { text: "Done." })).isEmpty).toBe(true);
-
-		await h.emit("message_end", { message: { role: "assistant", model: LEAD, usage: { cost: { total: 0.5 }, cacheWrite: 100 } } });
-		await h.emit("agent_end", {});
-		const summary = JSON.parse(readFileSync(join(cwd, ".pi/baton/sessions/session-1/summary.json"), "utf8"));
-		expect(summary.stats).toMatchObject({ runs: 2, helperTurns: 3, helperCalls: 4, blockedWrites: 0, undos: 2 });
-		expect(summary.costs[LEAD]).toMatchObject({ requests: 1, usd: 0.5, cacheWrite: 100 });
-		expect(summary.runs[0]).toMatchObject({ number: 1, changedFiles: ["src/model.ts", scratchTest], undone: [scratchTest, "src/model.ts"] });
-		expect(readFileSync(join(cwd, ".pi/baton/.gitignore"), "utf8")).toBe("*\n");
+		const encoded = JSON.stringify(duringSecond.messages);
+		expect(encoded).not.toContain(ALERT_INTRO);
+		expect(encoded).not.toContain("ALERT TWO");
+		expect(encoded).not.toContain("AGAIN");
+		expect(encoded).toContain("LEAD PLAN");
+		expect(encoded).toContain("still here");
+		expect(encoded).toContain("h2");
 	});
 
-	it("blocks helper writes outside the lead's files and the scratch directory, and hands back at once", async () => {
-		const cwd = project();
-		const h = mount(cwd);
-		await startTask(h);
-
-		const handoff = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }], { text: ASK });
-		expect(handoff.entries[0].content).toContain("You may change no project file yet (the lead has written none), only files under .pi/baton/scratch/;");
-
-		const refused = await h.turn(HELPER, [
-			{ name: "read", args: { path: "src/model.ts" }, output: "x" },
-			{ name: "write", args: { path: "src/store.ts", content: "x" }, output: "blocked", isError: true, effect: write(cwd, "src/store.ts", "x") },
-			{ name: "edit", args: { path: "src/model.ts", edits: [] }, output: "blocked", isError: true, effect: write(cwd, "src/model.ts", "y") },
-		]);
-		expect(refused.blocked).toEqual([
-			"Baton: blocked. Only the lead may create or change src/store.ts. Reply with one short line and no tool call.",
-			expect.stringMatching(/lead model takes over/),
-		]);
-		expect(existsSync(join(cwd, "src/store.ts"))).toBe(false);
-		expect(readFileSync(join(cwd, "src/model.ts"), "utf8")).toBe("export const model = 1;\n");
-		expect(refused.continue).toBe(true);
-		expect(h.ctx.model?.id).toBe(LEAD);
-		const note: string = refused.entries[0].content;
-		expect(note).toContain("It stopped because it tried to write src/store.ts, a file you have not changed with edit/write in this session (blocked, not run): 1 turn(s), 3 tool call(s).");
-		expect(note).toContain("2. write src/store.ts → blocked, not run\n3. edit src/model.ts → blocked, not run");
-		expect(note).toContain("Files changed with edit/write: none.");
-		expect(note).toContain("This run changed no files. Continue the task.");
-		expect(note).not.toContain("keep the run, fix it, or undo it");
-
-		await h.turn(LEAD, [{ name: "write", args: { path: "src/store.ts", content: "x" }, output: "Wrote", effect: write(cwd, "src/store.ts", "export const store = 1;\n") }], { text: ASK });
-		const allowed = await h.turn(HELPER, [{ name: "edit", args: { path: "./src/../src/store.ts", edits: [] }, output: "Edited", effect: write(cwd, "src/store.ts", "export const store = 2;\n") }]);
-		expect(allowed.blocked).toEqual([]);
-		const escaped = await h.turn(HELPER, [{ name: "write", args: { path: ".pi/baton/scratch/../../../src/other.ts", content: "x" }, output: "blocked", isError: true }]);
-		expect(escaped.blocked[0]).toBe("Baton: blocked. Only the lead may create or change src/other.ts. Reply with one short line and no tool call.");
-		expect(escaped.entries[0].content).toContain("- modified src/store.ts (+1 −1)");
-
-		await h.emit("agent_end", {});
-		const summary = JSON.parse(readFileSync(join(cwd, ".pi/baton/sessions/session-1/summary.json"), "utf8"));
-		expect(summary.stats).toMatchObject({ runs: 2, blockedWrites: 2, stopReasons: { "it tried to change a file the lead has not written": 2 } });
-		expect(summary.runs.map((run: { blockedWrite?: string }) => run.blockedWrite)).toEqual(["src/store.ts", "src/other.ts"]);
-	});
-
-	it("keeps the lead's thinking level for the helper when helperThinking is inherit", async () => {
+	it("keeps the lead's thinking level for the follower when helperThinking is inherit", async () => {
 		process.env.BATON_HELPER_THINKING = "inherit";
 		try {
 			const h = mount(project());
 			await startTask(h);
-			await h.turn(LEAD, [READ], { text: ASK });
+			await h.turn(LEAD, [READ]);
 			expect(h.ctx.model?.id).toBe(HELPER);
 			expect(h.thinking.level).toBe("medium");
 			await h.turn(HELPER, []);
@@ -303,124 +269,115 @@ describe("speculative runs in a pi session", () => {
 		}
 	});
 
-	it("ends the run on a helper error, an abort, a user message, or the turn cap", async () => {
+	it("hands back on a follower error, an abort, or the turn cap, and not because the user spoke", async () => {
 		writeFileSync(join(agentDir, "baton.json"), JSON.stringify({ maxHelperTurns: 2 }));
 		try {
 			const h = mount(project());
 			await startTask(h);
-			const read = { name: "read", args: { path: "src/model.ts" }, output: "x" };
 
-			await h.turn(LEAD, [read], { text: ASK });
+			await h.turn(LEAD, [READ]);
 			const failed = await h.turn(HELPER, [], { stopReason: "error", errorMessage: "429 rate\nlimited" });
 			expect(failed.continue).toBe(true);
-			expect(failed.entries[0].content).toMatch(/stopped because the helper's request failed \(429 rate limited\)/);
-
-			await h.turn(LEAD, [read], { text: ASK });
-			const aborted = await h.turn(HELPER, [read], { stopReason: "aborted" });
-			expect(aborted.continue).toBeUndefined();
-			expect(aborted.entries[0].content).toMatch(/stopped because the user interrupted it/);
+			expect(failed.entries[0].content).toBe(ALERT_INTRO);
 			expect(h.ctx.model?.id).toBe(LEAD);
+			expect(journalEvents(h.ctx.cwd, "run_end")[0].stopReason).toBe("the follower's request failed (429 rate limited)");
 
-			await h.turn(LEAD, [read], { text: ASK });
+			await h.turn(LEAD, [READ]);
+			const aborted = await h.turn(HELPER, [READ], { stopReason: "aborted" });
+			expect(aborted.continue).toBeUndefined();
+			expect(h.ctx.model?.id).toBe(LEAD);
+			expect(aborted.entries[0].content).toContain('1. read\ninput: {"path":"src/model.ts"}\noutput: file body');
+
+			await h.turn(LEAD, [READ]);
 			await h.emit("message_end", { message: { role: "user", content: "use canvas instead" } });
-			const steered = await h.turn(HELPER, [read]);
-			expect(steered.blocked[0]).toMatch(/lead model takes over/);
-			expect(steered.entries[0].content).toMatch(/stopped because the user sent a message/);
-
-			await h.turn(LEAD, [read], { text: ASK });
-			expect((await h.turn(HELPER, [read])).isEmpty).toBe(true);
-			const capped = await h.turn(HELPER, [read]);
-			expect(capped.entries[0].content).toMatch(/stopped because it reached the safety cap of 2 helper turns/);
+			expect((await h.turn(HELPER, [READ])).isEmpty).toBe(true);
+			expect(h.ctx.model?.id).toBe(HELPER);
+			const capped = await h.turn(HELPER, [READ]);
+			expect(capped.continue).toBe(true);
+			expect(h.ctx.model?.id).toBe(LEAD);
+			expect(capped.entries[0].content).toContain("1. read");
+			expect(capped.entries[0].content).toContain("2. read");
+			expect(journalEvents(h.ctx.cwd, "run_end").at(-1).stopReason).toBe("it reached the safety cap of 2 follower turns");
 		} finally {
 			writeFileSync(join(agentDir, "baton.json"), "{}");
 		}
 	});
 
-	it("limits the first speculative run to 5 helper turns and later runs to 10 by default", async () => {
-		const h = mount(project());
+	it("limits the first follower run to 5 turns and later runs to 10 by default", async () => {
+		const cwd = project();
+		const h = mount(cwd);
 		await startTask(h);
-		const read = { name: "read", args: { path: "src/model.ts" }, output: "x" };
 
-		await h.turn(LEAD, [read], { text: ASK });
+		await h.turn(LEAD, [READ]);
 		for (let i = 1; i < 5; i++) {
-			expect((await h.turn(HELPER, [read])).isEmpty).toBe(true);
+			expect((await h.turn(HELPER, [READ])).isEmpty).toBe(true);
 		}
-		const firstCap = await h.turn(HELPER, [read]);
-		expect(firstCap.entries[0].content).toMatch(/stopped because it reached the safety cap of 5 helper turns/);
+		const firstCap = await h.turn(HELPER, [READ]);
+		expect(firstCap.continue).toBe(true);
+		expect(h.ctx.model?.id).toBe(LEAD);
+		expect(journalEvents(cwd, "run_end")[0].stopReason).toBe("it reached the safety cap of 5 follower turns");
 
-		await h.turn(LEAD, [read], { text: ASK });
+		await h.turn(LEAD, [READ]);
 		for (let i = 1; i < 10; i++) {
-			expect((await h.turn(HELPER, [read])).isEmpty).toBe(true);
+			expect((await h.turn(HELPER, [READ])).isEmpty).toBe(true);
 		}
-		const secondCap = await h.turn(HELPER, [read]);
-		expect(secondCap.entries[0].content).toMatch(/stopped because it reached the safety cap of 10 helper turns/);
+		const secondCap = await h.turn(HELPER, [READ]);
+		expect(h.ctx.model?.id).toBe(LEAD);
+		expect(journalEvents(cwd, "run_end")[1].stopReason).toBe("it reached the safety cap of 10 follower turns");
 	});
 
 	it("closes an unfinished run when a new prompt arrives", async () => {
 		const h = mount(project());
 		await startTask(h);
-		await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }], { text: ASK });
+		await h.turn(LEAD, [READ]);
+		await h.turn(HELPER, [READ]);
 		expect(h.ctx.model?.id).toBe(HELPER);
 		const next = await h.emit("before_agent_start", { messageType: "user", prompt: "Also add a score", systemPrompt: "", systemPromptOptions: {} });
 		expect(h.ctx.model?.id).toBe(LEAD);
-		expect(next.message).toMatchObject({ customType: LEAD_NOTE_TYPE });
-		expect(next.message.content).toMatch(/Speculative run #1[\s\S]*stopped because a new prompt arrived/);
+		expect(next.message).toMatchObject({ customType: ALERT_TYPE });
+		expect(next.message.content).toContain('1. read\ninput: {"path":"src/model.ts"}\noutput: file body');
+		expect(next.systemPrompt).toBeUndefined();
 	});
 
-	it("starts a helper only from a Helper: line, including a text-only reply", async () => {
-		const h = mount(project());
-		await startTask(h);
-		expect((await h.turn(LEAD, [], { text: "Done." })).isEmpty).toBe(true);
-		expect(h.ctx.model?.id).toBe(LEAD);
-		expect((await h.turn(LEAD, [{ name: "read", args: { path: "a" }, output: "x" }], { text: "Next I will read the tests." })).isEmpty).toBe(true);
-		expect(h.ctx.model?.id).toBe(LEAD);
-		expect((await h.turn(LEAD, [{ name: "read", args: { path: "a" } }], { stopReason: "error", text: ASK })).isEmpty).toBe(true);
-		expect(h.ctx.model?.id).toBe(LEAD);
-
-		const asked = await h.turn(LEAD, [], { text: "The board is ready.\n  Helper: run the typecheck" });
-		expect(asked.continue).toBe(true);
-		expect(asked.entries[0].content).toMatch(/Speculative run #1/);
-		expect(h.ctx.model?.id).toBe(HELPER);
-		const note: string = (await h.turn(HELPER, [])).entries[0].content;
-		expect(note).toContain("This run changed no files. Continue the task.");
-		expect(note).not.toContain("keep the run, fix it, or undo it");
-	});
-
-	it("leaves the prompt and the model alone when speculation is off", async () => {
+	it("does not inject a section or switch the model when speculation is off", async () => {
 		process.env.BATON_SPEC = "0";
 		try {
 			const off = mount(project());
 			const started = await startTask(off);
 			expect(started).toBeUndefined();
 			expect(off.ctx.model).toBeUndefined();
-			expect((await off.turn(LEAD, [{ name: "read", args: { path: "a" }, output: "x" }], { text: ASK })).isEmpty).toBe(true);
+			expect(await systemSection(off)).toBeUndefined();
+			expect((await off.turn(LEAD, [READ])).isEmpty).toBe(true);
 			expect(off.ctx.model).toBeUndefined();
+			const view = await off.emit("context", {
+				messages: [{ role: "custom", customType: ALERT_TYPE, content: "ALERT" }, { role: "assistant", model: HELPER, content: [{ type: "thinking", thinking: "SECRET" }] }],
+			});
+			expect(view).toBeUndefined();
 		} finally {
 			delete process.env.BATON_SPEC;
 		}
 	});
 
-	it("lists paths changed outside edit/write and does not offer to undo them", async () => {
+	it("records run stats without a file journal of the follower's edits", async () => {
 		const cwd = project();
-		execFileSync("git", ["init"], { cwd, stdio: "ignore" });
-		execFileSync("git", ["add", "src/model.ts"], { cwd, stdio: "ignore" });
-		execFileSync("git", ["-c", "user.email=baton@example.com", "-c", "user.name=Baton", "commit", "-m", "init"], { cwd, stdio: "ignore" });
 		const h = mount(cwd);
 		await startTask(h);
-		await h.turn(LEAD, [], { text: "Helper: append a marker with bash." });
-		await h.turn(HELPER, [{ name: "bash", args: { command: "printf x >> src/model.ts" }, output: "ok", effect: () => writeFileSync(join(cwd, "src/model.ts"), "export const model = 1;\nx\n") }]);
-		const note: string = (await h.turn(HELPER, [])).entries[0].content;
-		expect(note).toContain("Files changed with edit/write: none.");
-		expect(note).toContain("Paths changed outside edit/write (not undone):\n- src/model.ts");
-		expect(note).not.toContain("baton_undo");
-		expect(note).not.toContain("keep the run, fix it, or undo it");
-		expect(note).toContain("Continue the task.");
-		expect(await h.undo({ run: 1 })).toBe("baton_undo run #1: nothing to undo.");
-		expect(readFileSync(join(cwd, "src/model.ts"), "utf8")).toBe("export const model = 1;\nx\n");
+		await h.turn(LEAD, [READ]);
+		await h.turn(HELPER, [{ name: "write", args: { path: "src/store.ts", content: "x" }, output: "Wrote" }]);
+		await h.turn(HELPER, []);
+		await h.emit("message_end", { message: { role: "assistant", model: LEAD, usage: { cost: { total: 0.5 }, cacheWrite: 100 } } });
+		await h.emit("agent_end", {});
+		const summary = JSON.parse(readFileSync(join(cwd, ".pi/baton/sessions/session-1/summary.json"), "utf8"));
+		expect(summary.stats).toMatchObject({ runs: 1, helperTurns: 2, helperCalls: 1, cacheKeepalives: 0 });
+		expect(summary.stats.blockedWrites).toBeUndefined();
+		expect(summary.stats.undos).toBeUndefined();
+		expect(summary.runs[0]).toEqual({ number: 1, stopReason: "the follower ended its turn without tool calls", turns: 2, calls: 1 });
+		expect(summary.costs[LEAD]).toMatchObject({ requests: 1, usd: 0.5, cacheWrite: 100 });
+		expect(existsSync(join(cwd, ".pi/baton/scratch"))).toBe(false);
+		expect(readFileSync(join(cwd, ".pi/baton/.gitignore"), "utf8")).toBe("*\n");
 	});
 });
 
-const READ = { name: "read", args: { path: "src/model.ts" }, output: "x" };
 const LEAD_USED_CACHE = { cacheRead: 30_000, cacheWrite: 2_000 };
 const HOUR_MS = 3_600_000;
 
@@ -439,11 +396,11 @@ describe("lead cache keepalive", () => {
 		vi.useRealTimers();
 	});
 
-	it("re-sends the lead's last request, timed from that request, while the helper works, and stops with the run", async () => {
+	it("re-sends the lead's last request, timed from that request, while the follower works, and stops with the run", async () => {
 		const cwd = project();
 		const h = mount(cwd);
 		await startTask(h);
-		await h.turn(LEAD, [READ], { text: ASK, usage: LEAD_USED_CACHE, toolsMs: 100_000 });
+		await h.turn(LEAD, [READ], { usage: LEAD_USED_CACHE, toolsMs: 100_000 });
 		await h.turn(HELPER, [READ]);
 		await vi.advanceTimersByTimeAsync(189_999);
 		expect(h.pings).toHaveLength(0);
@@ -474,7 +431,7 @@ describe("lead cache keepalive", () => {
 		await startTask(h);
 		await h.turn(LEAD, [], { text: "Done.", usage: LEAD_USED_CACHE });
 		await vi.advanceTimersByTimeAsync(HOUR_MS);
-		await h.turn(LEAD, [READ], { text: ASK });
+		await h.turn(LEAD, [READ]);
 		await vi.advanceTimersByTimeAsync(HOUR_MS);
 		expect(h.pings).toHaveLength(0);
 
@@ -482,7 +439,7 @@ describe("lead cache keepalive", () => {
 		try {
 			const off = mount(project());
 			await startTask(off);
-			await off.turn(LEAD, [READ], { text: ASK, usage: LEAD_USED_CACHE });
+			await off.turn(LEAD, [READ], { usage: LEAD_USED_CACHE });
 			await vi.advanceTimersByTimeAsync(HOUR_MS);
 			expect(off.pings).toHaveLength(0);
 		} finally {
@@ -492,7 +449,7 @@ describe("lead cache keepalive", () => {
 
 	it("stops on a new prompt, a user interrupt, a session restart, the agent's end, and pi's shutdown", async () => {
 		const h = mount(project());
-		const startRun = () => h.turn(LEAD, [READ], { text: ASK, usage: LEAD_USED_CACHE });
+		const startRun = () => h.turn(LEAD, [READ], { usage: LEAD_USED_CACHE });
 		const pingsWithinAnHour = async () => {
 			await vi.advanceTimersByTimeAsync(HOUR_MS);
 			return h.pings.length;

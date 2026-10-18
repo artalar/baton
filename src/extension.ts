@@ -1,26 +1,11 @@
-import { mkdirSync } from "node:fs";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import { type BatonConfig, FIRST_RUN_MAX_TURNS, isSameModel, loadConfig, parseModelRef, type ThinkingLevel } from "./config.ts";
-import { type ContextMessage, HELPER_INSTRUCTION_TYPE, LEAD_NOTE_TYPE, viewFor } from "./context.ts";
+import { ALERT_TYPE, type ContextMessage, projectSystemPrompt, viewFor } from "./context.ts";
 import { type Journal, openJournal } from "./journal.ts";
 import { keepWarm, type SentRequest } from "./keepalive.ts";
-import { blockedWriteReason, blockedWriteStop, describeCall, HANDBACK_REASON, helperInstruction, leadRequestsHelper, leadSystemNote, renderRunNote, renderUndoResult } from "./notes.ts";
-import {
-	type ActiveRun,
-	captureWorktree,
-	collectChanges,
-	type FinishedRun,
-	fileToolTarget,
-	helperMayWrite,
-	pathsChangedSince,
-	type RunCall,
-	recordTurn,
-	rememberOriginal,
-	startRun,
-	undoRun,
-} from "./run.ts";
+import { followerSystemNote, leadSystemNote, renderAlert } from "./notes.ts";
+import { type ActiveRun, type FinishedRun, recordTurn, type RunCall, startRun } from "./run.ts";
 
 interface Usage {
 	input?: number;
@@ -43,8 +28,6 @@ interface SessionStats {
 	runs: number;
 	helperTurns: number;
 	helperCalls: number;
-	blockedWrites: number;
-	undos: number;
 	cacheKeepalives: number;
 	stopReasons: Record<string, number>;
 }
@@ -52,18 +35,15 @@ interface SessionStats {
 type MessageBlock = { type: string; id?: string; name?: string; arguments?: Record<string, unknown>; text?: string };
 
 const MAX_OUTPUT_CHARS = 200_000;
-const UNDO_TOOL = "baton_undo";
 
 const textOf = (content: unknown) =>
 	((Array.isArray(content) ? content : []) as MessageBlock[])
 		.flatMap((block) => (block.type === "text" && block.text ? [block.text] : []))
 		.join("\n");
 
-const emptyStats = (): SessionStats => ({ runs: 0, helperTurns: 0, helperCalls: 0, blockedWrites: 0, undos: 0, cacheKeepalives: 0, stopReasons: {} });
+const emptyStats = (): SessionStats => ({ runs: 0, helperTurns: 0, helperCalls: 0, cacheKeepalives: 0, stopReasons: {} });
 
 const stopReasonKey = (reason: string) => reason.replace(/\s*\(.*$/, "").replace(/\d+/g, "N");
-
-const BLOCKED_WRITE_KEY = "it tried to change a file the lead has not written";
 
 export default function baton(pi: ExtensionAPI) {
 	let config: BatonConfig | undefined;
@@ -77,10 +57,7 @@ export default function baton(pi: ExtensionAPI) {
 	let startedAt = Date.now();
 	let lastLeadRequest: SentRequest | undefined;
 	let stopKeepalive = () => {};
-	/** Absolute paths of the files the lead changed with edit/write in this session. */
-	let leadFiles = new Set<string>();
-	let scratchDir = "";
-	/** The lead's thinking level while the helper runs with its own. */
+	/** The lead's thinking level while the follower runs with its own. */
 	let leadThinking: ThinkingLevel | undefined;
 
 	const notify = (ctx: ExtensionContext, message: string) => {
@@ -88,14 +65,11 @@ export default function baton(pi: ExtensionAPI) {
 		else console.warn(message);
 	};
 
-	const shownPath = (absolutePath: string) => relative(cwd, absolutePath) || absolutePath;
-
 	const init = (ctx: ExtensionContext) => {
 		if (config) return;
 		cwd = ctx.cwd;
 		config = loadConfig(cwd, (message) => notify(ctx, message));
 		const journalRoot = isAbsolute(config.journalDir) ? config.journalDir : join(cwd, config.journalDir);
-		scratchDir = join(journalRoot, "scratch");
 		journal = openJournal(journalRoot, ctx.sessionManager?.getSessionId?.());
 		journal.log("session", { config });
 	};
@@ -134,14 +108,11 @@ export default function baton(pi: ExtensionAPI) {
 			stopReason: run.stopReason,
 			turns: run.turns,
 			calls: run.callCount,
-			changedFiles: run.changes.map((change) => change.path),
-			blockedWrite: run.blockedWrite,
-			undone: [...run.undone],
 		}));
 		journal.writeSummary({ lead: config.lead, helper: config.helper, wallSeconds: Math.round((Date.now() - startedAt) / 1000), costs, stats, runs });
 	};
 
-	const leadNote = (text: string): SessionBoundaryDraft => ({ type: "custom_message", customType: LEAD_NOTE_TYPE, content: text, display: true });
+	const alertEntry = (text: string): SessionBoundaryDraft => ({ type: "custom_message", customType: ALERT_TYPE, content: text, display: true });
 
 	const addUsage = (model: string, usage: Usage) => {
 		const row = costs[model] ?? { requests: 0, usd: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -172,25 +143,17 @@ export default function baton(pi: ExtensionAPI) {
 		const run = activeRun!;
 		activeRun = undefined;
 		stopKeepalive();
-		const changes = collectChanges(run, cwd);
-		const outsidePaths = pathsChangedSince(run.worktree, captureWorktree(cwd), changes.map((change) => change.path));
-		const note = renderRunNote({ runNumber: run.number, helperModel: config!.helper, stopReason, turns: run.turns, calls: run.calls, changes, outsidePaths, noteChars: config!.noteChars });
-		finishedRuns.push({ number: run.number, stopReason, turns: run.turns, callCount: run.calls.length, changes, blockedWrite: run.blockedWrite, undone: new Set() });
-		const reasonKey = run.blockedWrite && stopReason === run.stopRequested ? BLOCKED_WRITE_KEY : stopReasonKey(stopReason);
+		const alert = renderAlert(run.calls);
+		finishedRuns.push({ number: run.number, stopReason, turns: run.turns, callCount: run.calls.length });
+		const reasonKey = stopReasonKey(stopReason);
 		stats.stopReasons[reasonKey] = (stats.stopReasons[reasonKey] ?? 0) + 1;
-		journal?.log("run_end", {
-			run: run.number,
-			stopReason,
-			turns: run.turns,
-			calls: run.calls.length,
-			changedFiles: changes.map((change) => change.path),
-			blockedWrite: run.blockedWrite,
-			noteChars: note.length,
-		});
+		journal?.log("run_end", { run: run.number, stopReason, turns: run.turns, calls: run.calls.length });
 		await switchModel(ctx, "lead");
 		writeSummary();
-		return note;
+		return alert;
 	};
+
+	const role = (): "lead" | "follower" => (activeRun ? "follower" : "lead");
 
 	pi.on("session_start", (_event, ctx) => {
 		stopKeepalive();
@@ -202,7 +165,6 @@ export default function baton(pi: ExtensionAPI) {
 		stats = emptyStats();
 		startedAt = Date.now();
 		lastLeadRequest = undefined;
-		leadFiles = new Set();
 		leadThinking = undefined;
 		init(ctx);
 	});
@@ -213,41 +175,20 @@ export default function baton(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		init(ctx);
-		const interruptedRunNote = activeRun ? await finishRun(ctx, "a new prompt arrived") : undefined;
+		const interruptedAlert = activeRun ? await finishRun(ctx, "a new prompt arrived") : undefined;
 		if (event.messageType === "user") journal?.log("prompt", { prompt: event.prompt.slice(0, 400) });
 		if (!config!.speculate) {
-			if (!interruptedRunNote) return undefined;
-			return { message: { customType: LEAD_NOTE_TYPE, content: interruptedRunNote, display: true } };
+			if (!interruptedAlert) return undefined;
+			return { message: { customType: ALERT_TYPE, content: interruptedAlert, display: true } };
 		}
 		await switchModel(ctx, "lead");
-		const systemPrompt = event.systemPrompt + leadSystemNote(shownPath(scratchDir));
-		if (!interruptedRunNote) return { systemPrompt };
-		return { systemPrompt, message: { customType: LEAD_NOTE_TYPE, content: interruptedRunNote, display: true } };
-	});
-
-	pi.on("tool_call", (event) => {
-		if (!activeRun) return undefined;
-		if (activeRun.stopRequested) {
-			activeRun.blocked.add(event.toolCallId);
-			return { block: true, terminate: true, reason: HANDBACK_REASON };
-		}
-		const call = { name: event.toolName, args: (event.input ?? {}) as Record<string, unknown> };
-		const target = fileToolTarget(cwd, call);
-		if (target && !helperMayWrite(target, leadFiles, scratchDir)) {
-			activeRun.blocked.add(event.toolCallId);
-			activeRun.blockedWrite = shownPath(target);
-			activeRun.stopRequested = blockedWriteStop(call.name, activeRun.blockedWrite);
-			stats.blockedWrites++;
-			return { block: true, terminate: true, reason: blockedWriteReason(activeRun.blockedWrite) };
-		}
-		rememberOriginal(activeRun, cwd, call);
-		return undefined;
+		if (!interruptedAlert) return undefined;
+		return { message: { customType: ALERT_TYPE, content: interruptedAlert, display: true } };
 	});
 
 	pi.on("message_end", (event) => {
 		const message = event.message as { role?: string; model?: string; usage?: Usage };
 		if (!config) return undefined;
-		if (message.role === "user" && activeRun) activeRun.stopRequested = "the user sent a message";
 		if (message.role !== "assistant") return undefined;
 		const model = message.model ?? "unknown";
 		const usage = message.usage ?? {};
@@ -268,8 +209,14 @@ export default function baton(pi: ExtensionAPI) {
 	});
 
 	pi.on("context", (event) => {
-		if (!config) return undefined;
-		return { messages: viewFor(event.messages as unknown as ContextMessage[], config.helper, activeRun?.startedAt) as unknown as typeof event.messages };
+		if (!config?.speculate) return undefined;
+		return { messages: viewFor(event.messages as unknown as ContextMessage[], config.helper, role()) as unknown as typeof event.messages };
+	});
+
+	pi.on("context_with_system", (event) => {
+		if (!config?.speculate) return undefined;
+		const note = role() === "follower" ? followerSystemNote() : leadSystemNote();
+		return { messages: projectSystemPrompt(event.messages as unknown as ContextMessage[], note) as unknown as typeof event.messages };
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
@@ -287,7 +234,6 @@ export default function baton(pi: ExtensionAPI) {
 					name: block.name ?? "",
 					args: block.arguments ?? {},
 					isError: result?.isError,
-					blocked: activeRun?.blocked.has(block.id!),
 					output: result ? textOf(result.content).slice(0, MAX_OUTPUT_CHARS) : undefined,
 				};
 			});
@@ -296,68 +242,34 @@ export default function baton(pi: ExtensionAPI) {
 			recordTurn(activeRun, calls);
 			stats.helperTurns++;
 			stats.helperCalls += calls.length;
-			if (message.stopReason === "aborted") return { entries: [leadNote(await finishRun(ctx, "the user interrupted it"))] };
+			if (message.stopReason === "aborted") return { entries: [alertEntry(await finishRun(ctx, "the user interrupted it"))] };
 			const maxTurns = activeRun.number === 1 ? Math.min(config.maxHelperTurns, FIRST_RUN_MAX_TURNS) : config.maxHelperTurns;
 			const stopReason =
 				message.stopReason === "error"
-					? `the helper's request failed (${oneLineError(message.errorMessage)})`
-					: activeRun.stopRequested
-						? activeRun.stopRequested
-						: !calls.length
-							? "the helper ended its turn without tool calls"
-							: activeRun.turns >= maxTurns
-								? `it reached the safety cap of ${maxTurns} helper turns`
-								: undefined;
+					? `the follower's request failed (${oneLineError(message.errorMessage)})`
+					: !calls.length
+						? "the follower ended its turn without tool calls"
+						: activeRun.turns >= maxTurns
+							? `it reached the safety cap of ${maxTurns} follower turns`
+							: undefined;
 			if (!stopReason) return undefined;
-			return { entries: [leadNote(await finishRun(ctx, stopReason))], continue: true };
+			return { entries: [alertEntry(await finishRun(ctx, stopReason))], continue: true };
 		}
 
-		if (isSameModel(message.model, config.helper)) return undefined;
-		for (const call of calls) {
-			const target = fileToolTarget(cwd, call);
-			if (target && !call.isError) leadFiles.add(target);
-		}
-		if (!config.speculate) return undefined;
-		if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
-		if (!leadRequestsHelper(textOf(blocks))) return undefined;
+		if (!config.speculate || isSameModel(message.model, config.helper)) return undefined;
+		if (message.stopReason === "error" || message.stopReason === "aborted" || !calls.length) return undefined;
 		if (!(await switchModel(ctx, "helper"))) return undefined;
 		runCounter++;
 		stats.runs++;
-		activeRun = startRun(runCounter, Date.now());
-		mkdirSync(scratchDir, { recursive: true });
-		journal?.log("run_start", { run: runCounter, after: calls.map((call) => describeCall(call, 120)) });
-		activeRun.worktree = captureWorktree(cwd);
+		activeRun = startRun(runCounter);
+		journal?.log("run_start", { run: runCounter, after: calls.map((call) => call.name) });
 		startKeepalive(ctx, message.usage);
-		const scope = { leadFiles: [...leadFiles].map(shownPath), scratchDir: shownPath(scratchDir) };
-		const instruction = { type: "custom_message" as const, customType: HELPER_INSTRUCTION_TYPE, content: helperInstruction(runCounter, scope), display: true };
-		return calls.length ? { entries: [instruction] } : { entries: [instruction], continue: true };
+		return undefined;
 	});
 
 	pi.on("agent_end", () => {
 		stopKeepalive();
 		writeSummary();
-	});
-
-	pi.registerTool({
-		name: UNDO_TOOL,
-		label: "Baton undo",
-		description:
-			"Undo a speculative run of the helper model: files it changed with edit/write go back to their content before the run, and files it created are deleted. Files changed again after the run are left as they are and listed. Changes the helper made through bash are not covered.",
-		parameters: Type.Object({
-			run: Type.Number({ description: "Run number from the [Baton] note." }),
-			paths: Type.Optional(Type.Array(Type.String(), { description: "Only these files, as listed in the note. Default: every file of the run." })),
-		}),
-		async execute(_toolCallId, params) {
-			const reply = (text: string, details: Record<string, unknown> = {}) => ({ content: [{ type: "text" as const, text }], details });
-			if (activeRun) return reply("baton_undo: only the lead can undo a run.");
-			const target = finishedRuns.find((run) => run.number === params.run);
-			if (!target) return reply(`baton_undo: there is no run #${params.run} in this session.`);
-			const result = undoRun(target, cwd, params.paths);
-			stats.undos++;
-			journal?.log("undo", { run: target.number, ...result });
-			writeSummary();
-			return reply(renderUndoResult(target.number, result), { run: target.number, ...result });
-		},
 	});
 }
 

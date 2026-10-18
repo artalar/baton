@@ -11,10 +11,8 @@ export interface BatonConfig {
 	helperThinking: HelperThinking;
 	/** Speculation on or off. Off = the lead works alone. */
 	speculate: boolean;
-	/** Safety cap of helper turns per later run; the first run uses FIRST_RUN_MAX_TURNS. */
+	/** Safety cap of follower turns per later run; the first run uses FIRST_RUN_MAX_TURNS. */
 	maxHelperTurns: number;
-	/** Size cap of one run note. */
-	noteChars: number;
 	/** While a run is active, the lead's last request is re-sent this long after it was sent, and again after each re-send, so its prompt cache does not expire. 0 = off. */
 	cacheKeepaliveMs: number;
 	journalDir: string;
@@ -34,7 +32,6 @@ export const DEFAULT_CONFIG: BatonConfig = {
 	helperThinking: "low",
 	speculate: true,
 	maxHelperTurns: 10,
-	noteChars: 80_000,
 	cacheKeepaliveMs: 290_000,
 	journalDir: ".pi/baton",
 };

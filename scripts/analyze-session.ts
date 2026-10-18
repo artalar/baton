@@ -380,6 +380,40 @@ const computeDistribution = (values: number[]): DistributionStats => {
 	};
 };
 
+function blankRun(runNumber: number, helperModelName: string, startedAtIso: string, triggerLeadTurn?: AssistantTurnRecord): SpeculativeRunRecord {
+	return {
+		runNumber,
+		helperModel: helperModelName,
+		startedAtIso,
+		wallDurationMs: 0,
+		finished: false,
+		stopReason: "in progress (session ended before run finished)",
+		triggerLeadTurnIndex: triggerLeadTurn?.turnIndex,
+		triggerLeadCalls: triggerLeadTurn?.toolCalls.map((call) => call.summary) ?? [],
+		turns: 0,
+		toolCalls: 0,
+		toolErrors: 0,
+		callsPerTurn: 0,
+		costUsd: 0,
+		inputTokens: 0,
+		outputTokens: 0,
+		cacheReadTokens: 0,
+		contextStartTokens: 0,
+		contextEndTokens: 0,
+		thinkingChars: 0,
+		textChars: 0,
+		turnLatencyMs: computeDistribution([]),
+		outputTokensPerSec: computeDistribution([]),
+		noteFiles: [],
+		noteDiffClippedCount: 0,
+		noteOmittedReadsCount: 0,
+		noteShownReadsCount: 0,
+		editedFiles: [],
+		bashMutatedFiles: [],
+		leadReaction: "unfinished",
+	};
+}
+
 const oneLinePreview = (value: string, maxLength = 100): string => {
 	const compact = value.replace(/\s+/g, " ").trim();
 	return compact.length > maxLength ? `${compact.slice(0, maxLength - 1)}…` : compact;
@@ -463,9 +497,9 @@ const parseLeadRunNote = (content: string) => {
 			removed: Number(match[4] ?? 0),
 		});
 	}
-	const noteDiffClippedCount = (content.match(/\[diff clipped — read /g) ?? []).length;
-	const noteOmittedReadsCount = (content.match(/\[omitted — read it yourself\]/g) ?? []).length;
-	const noteShownReadsCount = (content.match(/→ ok \(output below\)/g) ?? []).length;
+	const noteDiffClippedCount = 0;
+	const noteOmittedReadsCount = 0;
+	const noteShownReadsCount = 0;
 	return {
 		stopReason,
 		noteFiles,
@@ -610,8 +644,8 @@ export function analyzeSessionFile(sessionFilePath: string): SessionAnalysis {
 	const userPromptText = extractTextFromContent(userMessageEntry?.message?.content);
 	const userPromptPreview = oneLinePreview(userPromptText, 140);
 
-	const hasBatonMessages = lines.some((entry) => entry.type === "custom_message" && (entry.customType === "baton-helper" || entry.customType === "baton-lead"));
-	const hasBatonSystemPrompt = systemPromptText.includes("# Baton: speculative runs");
+	const hasBatonMessages = lines.some((entry) => entry.type === "custom_message" && (entry.customType === "baton-helper" || entry.customType === "baton-lead" || entry.customType === "baton-alert"));
+	const hasBatonSystemPrompt = systemPromptText.includes("speculative automation alert") || systemPromptText.includes("# Baton: speculative runs");
 	const withBaton = Boolean(hasBatonMessages || hasBatonSystemPrompt || companionRunner?.withBaton || companionJournal);
 
 	const toolResultsByCallId = new Map<string, RawSessionEntry>();
@@ -655,41 +689,11 @@ export function analyzeSessionFile(sessionFilePath: string): SessionAnalysis {
 			const runNumber = match ? Number(match[1]) : runsByNumber.size + 1;
 			activeRunNumber = runNumber;
 			const previousLeadTurn = [...turns].reverse().find((turn) => turn.role === "lead");
-			runsByNumber.set(runNumber, {
-				runNumber,
-				helperModel: helperModel ?? "helper",
-				startedAtIso: entry.timestamp ?? "",
-				wallDurationMs: 0,
-				finished: false,
-				stopReason: "in progress (session ended before run finished)",
-				triggerLeadTurnIndex: previousLeadTurn?.turnIndex,
-				triggerLeadCalls: previousLeadTurn?.toolCalls.map((call) => call.summary) ?? [],
-				turns: 0,
-				toolCalls: 0,
-				toolErrors: 0,
-				callsPerTurn: 0,
-				costUsd: 0,
-				inputTokens: 0,
-				outputTokens: 0,
-				cacheReadTokens: 0,
-				contextStartTokens: 0,
-				contextEndTokens: 0,
-				thinkingChars: 0,
-				textChars: 0,
-				turnLatencyMs: computeDistribution([]),
-				outputTokensPerSec: computeDistribution([]),
-				noteFiles: [],
-				noteDiffClippedCount: 0,
-				noteOmittedReadsCount: 0,
-				noteShownReadsCount: 0,
-				editedFiles: [],
-				bashMutatedFiles: [],
-				leadReaction: "unfinished",
-			});
+			runsByNumber.set(runNumber, blankRun(runNumber, helperModel ?? "helper", entry.timestamp ?? "", previousLeadTurn));
 			continue;
 		}
 
-		if (entry.type === "custom_message" && entry.customType === "baton-lead") {
+		if (entry.type === "custom_message" && (entry.customType === "baton-lead" || entry.customType === "baton-alert")) {
 			const match = entry.content?.match(/\[Baton\] Speculative run #(\d+)/);
 			const runNumber = match ? Number(match[1]) : activeRunNumber;
 			if (runNumber !== undefined && runsByNumber.has(runNumber)) {
@@ -715,6 +719,12 @@ export function analyzeSessionFile(sessionFilePath: string): SessionAnalysis {
 			const msg = entry.message;
 			const model = stripRouterPrefix(msg.model);
 			const role: "lead" | "helper" = activeRunNumber !== undefined || (helperModel && isSameNormalizedModel(model, helperModel)) ? "helper" : "lead";
+			if (role === "helper" && activeRunNumber === undefined) {
+				const previousLeadTurn = [...turns].reverse().find((turn) => turn.role === "lead");
+				const runNumber = runsByNumber.size + 1;
+				activeRunNumber = runNumber;
+				runsByNumber.set(runNumber, blankRun(runNumber, helperModel ?? model, entry.timestamp ?? "", previousLeadTurn));
+			}
 			const usage = msg.usage ?? {};
 			const cost = usage.cost ?? {};
 			const inputTokens = usage.input ?? 0;
@@ -868,16 +878,10 @@ export function analyzeSessionFile(sessionFilePath: string): SessionAnalysis {
 					runRecord.leadGapSincePrevLeadMs = Math.max(0, followupLeadTurn.startedAtMs - prevLeadTurn.startedAtMs);
 				}
 
-				const calledUndo = followupLeadTurn.toolCalls.some((call) => call.name === "baton_undo");
 				const touchedSameFiles = followupLeadTurn.toolCalls.some(
 					(call) => (call.name === "edit" || call.name === "write") && runRecord.editedFiles.includes(call.target),
 				);
-				runRecord.leadReaction = calledUndo ? "undone" : touchedSameFiles ? "fixed" : "kept";
-
-				const steeringMatch = followupLeadTurn.textContent.match(/Helper:\s*([^\n]+)/i);
-				if (steeringMatch?.[1]) {
-					runRecord.leadSteeringNote = steeringMatch[1].trim();
-				}
+				runRecord.leadReaction = touchedSameFiles ? "fixed" : "kept";
 			}
 		}
 	}
@@ -1165,14 +1169,7 @@ export function analyzeSessionFile(sessionFilePath: string): SessionAnalysis {
 			diagnostics.push({
 				severity: "warning",
 				category: "bash-file-mutation",
-				message: `Run #${runRecord.runNumber} modified files via bash (${runRecord.bashMutatedFiles.join(", ")}), which bypasses baton_undo and the run note diff.`,
-			});
-		}
-		if (runRecord.noteOmittedReadsCount > 0 || runRecord.noteDiffClippedCount > 0) {
-			diagnostics.push({
-				severity: "info",
-				category: "note-cap-pressure",
-				message: `Run #${runRecord.runNumber} note (${runRecord.noteChars?.toLocaleString()} chars) omitted ${runRecord.noteOmittedReadsCount} read output(s) and clipped ${runRecord.noteDiffClippedCount} diff(s).`,
+				message: `Run #${runRecord.runNumber} modified files via bash (${runRecord.bashMutatedFiles.join(", ")}).`,
 			});
 		}
 		if (runRecord.stopReason.includes("safety cap")) {
@@ -1189,7 +1186,7 @@ export function analyzeSessionFile(sessionFilePath: string): SessionAnalysis {
 		diagnostics.push({
 			severity: "info",
 			category: "piped-checks",
-			message: `${totalPipedChecks} test/build bash call(s) piped output through head/tail/grep despite Baton already showing the 2,000-char tail.`,
+			message: `${totalPipedChecks} test/build bash call(s) piped output through head/tail/grep, so the alert only has that clipped output.`,
 		});
 	}
 
@@ -1307,7 +1304,7 @@ export function renderHumanReport(analysis: SessionAnalysis, options: { showTurn
 			`══════════════════════════════════════════════════════════════════════════════`,
 			`File:          ${analysis.sessionFilePath} (${(analysis.sessionFileBytes / 1024).toFixed(1)} KB, ${analysis.totalJsonlEntries} JSONL entries)`,
 			`Working Dir:   ${analysis.cwd || "(unknown)"}`,
-			`Mode:          ${analysis.withBaton ? `Baton Speculative (Lead: ${analysis.leadModel}, Helper: ${analysis.helperModel ?? "none"})` : `Single-Model (${analysis.leadModel})`}`,
+			`Mode:          ${analysis.withBaton ? `Baton Speculative (Lead: ${analysis.leadModel}, Follower: ${analysis.helperModel ?? "none"})` : `Single-Model (${analysis.leadModel})`}`,
 			`Status:        ${analysis.completedCleanly ? "COMPLETED CLEANLY" : "INCOMPLETE / INTERRUPTED"} — ${analysis.terminationSummary}`,
 			`Time Window:   ${analysis.startedAtIso} → ${analysis.endedAtIso}`,
 			`Wall Duration: ${formatDuration(effectiveWallMs)}${analysis.runnerWallMs ? ` (transcript span: ${formatDuration(analysis.transcriptWallMs)})` : ""}`,
@@ -1429,20 +1426,12 @@ export function renderHumanReport(analysis: SessionAnalysis, options: { showTurn
 				`    Files (edit/write): ${r.noteFiles.length > 0 ? r.noteFiles.map((f) => `${f.kind} ${f.path} (+${f.added}/-${f.removed})`).join(", ") : r.editedFiles.join(", ") || "none"}`,
 			];
 			if (r.bashMutatedFiles.length > 0) {
-				lines.push(`    Bash File Writes:   ${r.bashMutatedFiles.join(", ")} (WARNING: not tracked by baton_undo)`);
-			}
-			if (r.noteChars !== undefined) {
-				lines.push(
-					`    Note Delivery:      ${formatInt(r.noteChars)} chars | ${r.noteShownReadsCount} verbatim read(s) shown | ${r.noteOmittedReadsCount} omitted | ${r.noteDiffClippedCount} diff(s) clipped`,
-				);
+				lines.push(`    Bash File Writes:   ${r.bashMutatedFiles.join(", ")}`);
 			}
 			if (r.leadFollowupTurnIndex !== undefined) {
 				lines.push(
 					`    Lead Follow-up:     Turn #${r.leadFollowupTurnIndex} → reaction=${r.leadReaction.toUpperCase()} | gapSincePrevLead=${r.leadGapSincePrevLeadMs ? formatDuration(r.leadGapSincePrevLeadMs) : "n/a"} | cacheRead=${formatInt(r.leadFollowupCacheReadTokens ?? 0)} | cacheWrite=${formatInt(r.leadFollowupCacheWriteTokens ?? 0)} | cost=${formatUsd(r.leadFollowupCostUsd ?? 0)}`,
 				);
-			}
-			if (r.leadSteeringNote) {
-				lines.push(`    Lead Steering:      "Helper: ${r.leadSteeringNote}"`);
 			}
 			return lines.join("\n");
 		});

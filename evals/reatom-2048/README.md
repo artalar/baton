@@ -57,7 +57,7 @@ bun evals/reatom-2048/prepare.mjs --name 2048-a
 bun evals/reatom-2048/harness/run.mjs --name 2048-a --cwd tmp/2048-a --prompt evals/reatom-2048/prompt.txt --budget 3 --baton 1
 ```
 
-`--baton 0` is bare Opus. `--baton 0 --delegate 1` is Opus that may call Flash: the runner appends `subagent` to `--tools`, loads `examples/extensions/subagent/index.ts` from the installed pi package, and copies `harness/agents/flash.md` to `<workspace>/.pi-agent/agents/flash.md` before start. The lead calls that tool with agent name `flash` (the example has no CLI flag for the agent name; the default scope `user` reads `PI_CODING_AGENT_DIR/agents`). `--baton 1` is Baton: Opus with the speculative helper. `--delegate` defaults to 0. The flags combine: `--baton 1 --delegate 1` loads both.
+`--baton 0` is bare Opus. `--baton 0 --delegate 1` is Opus that may call Flash: the runner appends `subagent` to `--tools`, loads `examples/extensions/subagent/index.ts` from the installed pi package, and copies `harness/agents/flash.md` to `<workspace>/.pi-agent/agents/flash.md` before start. The lead calls that tool with agent name `flash` (the example has no CLI flag for the agent name; the default scope `user` reads `PI_CODING_AGENT_DIR/agents`). `--baton 1` is Baton: after Opus makes tool calls, a cheaper follower continues in the same session with the lead's context, then hands back with one alert of its tool inputs and outputs. `--delegate` defaults to 0. The flags combine: `--baton 1 --delegate 1` loads both.
 
 The Flash child does not get the 60-second bash cap. The subagent example spawns its child without `--extension`, and passing the cap through would mean changing that example.
 
@@ -89,11 +89,11 @@ bun evals/reatom-2048/compare.mjs tmp/2048-a tmp/2048-b
 
 `compare.mjs` grades each workspace (cached in `.run/grade.json`; `--regrade` grades again, `--no-grade` only reads the cache) and prints one row per run: hidden tests, audit, cost (including Baton's cache keepalives, which pi's own cost leaves out), wall time, requests and tool calls of the lead and the helper, Baton runs, blocked writes and undos, the lead's share of the product code, and leftover files. Below the table it lists each run's stop reason, the stop reasons of its Baton runs, and failed test titles. `--json` prints the same data as JSON.
 
-The lead's share counts non-blank lines in `src/` at the end of the run. The script replays every successful `edit` and `write` from the session log over the starter files, keeping an author per line, then aligns the result with the files on disk: lines changed through `bash` count as unknown. A leftover is a file outside `src/` that the starter does not have, such as a smoke-test script left in the workspace root. Baton's scratch directory under `.pi/` is not counted.
+The lead's share counts non-blank lines in `src/` at the end of the run. The script replays every successful `edit` and `write` from the session log over the starter files, keeping an author per line, then aligns the result with the files on disk: lines changed through `bash` count as unknown. A leftover is a file outside `src/` that the starter does not have, such as a smoke-test script left in the workspace root. Paths under `.pi/` are not product files, so they are not counted.
 
 ## Session audit
 
-`hidden/audit-session.mjs` reads `<workspace>/.pi/sessions/*.jsonl` (complete across resumes) and `<workspace>/.run/events.jsonl` plus `events-continue.jsonl` when those files exist. Tool calls are deduped by id. The Baton helper model stays in the same pi session, so its calls are in these logs.
+`hidden/audit-session.mjs` reads `<workspace>/.pi/sessions/*.jsonl` (complete across resumes) and `<workspace>/.run/events.jsonl` plus `events-continue.jsonl` when those files exist. Tool calls are deduped by id. The Baton follower stays in the same pi session, so its calls are in these logs.
 
 A **violation** fails the audit, and therefore `grade.mjs`: a tool argument or tool result contains `reatom-2048/hidden`, `reatom-2048/oracle`, `e2e.test.ts`, `grade.mjs`, `audit-session`, `playwright.config.ts`, `window.__eval`, `__grade_`, or a Playwright test title from `hidden/e2e.test.ts`. A `read`, `edit`, `write`, `ls`, `find`, or `grep` path that resolves outside the workspace and inside `evals/reatom-2048` is also a violation.
 

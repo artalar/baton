@@ -1,7 +1,6 @@
 import { isSameModel } from "./config.ts";
 
-export const HELPER_INSTRUCTION_TYPE = "baton-helper";
-export const LEAD_NOTE_TYPE = "baton-lead";
+export const ALERT_TYPE = "baton-alert";
 
 export interface ContextMessage {
 	role: string;
@@ -10,58 +9,65 @@ export interface ContextMessage {
 	toolCallId?: string;
 	customType?: string;
 	timestamp?: number;
+	sections?: Record<string, string | null>;
 	[key: string]: unknown;
 }
 
 type ContentBlock = { type: string; id?: string; text?: string; thinking?: string };
 
-const originalLeadMessages = new WeakMap<ContextMessage, ContextMessage>();
+export type ViewRole = "lead" | "follower";
 
 const toolCallIds = (message: ContextMessage): string[] =>
 	((Array.isArray(message.content) ? message.content : []) as ContentBlock[]).flatMap((block) => (block.type === "toolCall" && block.id ? [block.id] : []));
 
-function extractLeadThinking<T extends ContextMessage>(message: T): T {
-	const source = (originalLeadMessages.get(message) as T | undefined) ?? message;
-	if (!Array.isArray(source.content)) return source;
-	const blocks = source.content as ContentBlock[];
-	if (!blocks.some((block) => block.type === "thinking")) return source;
-	const content = blocks.flatMap((block) => {
-		if (block.type !== "thinking") return [block];
-		return block.thinking?.trim() ? [{ type: "text", text: block.thinking }] : [];
-	});
-	const extracted = { ...source, content } as T;
-	originalLeadMessages.set(extracted, source);
-	return extracted;
-}
+const isFollowerTurn = (message: ContextMessage, helperModel: string) => message.role === "assistant" && isSameModel(message.model, helperModel);
 
-function restoreLeadThinking<T extends ContextMessage>(message: T): T {
-	return (originalLeadMessages.get(message) as T | undefined) ?? message;
+const isAlert = (message: ContextMessage) => message.role === "custom" && message.customType === ALERT_TYPE;
+
+function withoutThinking<T extends ContextMessage>(message: T): T {
+	if (!Array.isArray(message.content)) return message;
+	const blocks = message.content as ContentBlock[];
+	if (!blocks.some((block) => block.type === "thinking")) return message;
+	return { ...message, content: blocks.filter((block) => block.type !== "thinking") };
 }
 
 /**
- * Filters a transcript for one model.
- * - The lead sees no helper turns and no helper instructions: each finished run is one harness note instead.
- *   Removing whole messages only appends to what the lead saw before, so its prompt cache stays valid.
- * - The helper sees the lead's view (with lead thinking extracted to text) plus the turns and instruction of the current run (`currentRunStartedAt`).
+ * One stored transcript, filtered per model.
+ * The lead sees each alert where the follower's tool work sits, and not that work's raw messages or the follower's thinking.
+ * The follower sees the lead's messages, including thinking, the real tool calls and results, and user messages. Alerts and the follower's own thinking are left out.
+ * Filtering only drops or trims messages, so an alert stays at one index and later lead turns keep the same prefix.
  */
-export function viewFor<T extends ContextMessage>(messages: readonly T[], helperModel: string, currentRunStartedAt?: number): T[] {
-	const isCurrentRun = (message: ContextMessage) => currentRunStartedAt !== undefined && (message.timestamp ?? 0) >= currentRunStartedAt;
+export function viewFor<T extends ContextMessage>(messages: readonly T[], helperModel: string, role: ViewRole): T[] {
+	if (role === "follower") {
+		return messages.flatMap((message) => {
+			if (isAlert(message)) return [];
+			if (isFollowerTurn(message, helperModel)) return [withoutThinking(message)];
+			return [message];
+		});
+	}
 	const hiddenToolCalls = new Set<string>();
 	const visible: T[] = [];
 	for (const message of messages) {
-		const isHelperTurn = message.role === "assistant" && isSameModel(message.model, helperModel);
-		if (isHelperTurn && !isCurrentRun(message)) {
+		if (isFollowerTurn(message, helperModel)) {
 			for (const id of toolCallIds(message)) hiddenToolCalls.add(id);
 			continue;
 		}
-		if (message.role === "custom" && message.customType === HELPER_INSTRUCTION_TYPE && !isCurrentRun(message)) continue;
 		if (message.role === "toolResult" && message.toolCallId && hiddenToolCalls.has(message.toolCallId)) continue;
-		const isLeadTurn = message.role === "assistant" && !isHelperTurn;
-		if (isLeadTurn) {
-			visible.push(currentRunStartedAt !== undefined ? extractLeadThinking(message) : restoreLeadThinking(message));
-			continue;
-		}
 		visible.push(message);
 	}
 	return visible;
+}
+
+/** Appends the role's sentences as one system section, leaving the base prompt in place. */
+export function projectSystemPrompt<T extends ContextMessage>(messages: readonly T[], note: string): T[] {
+	let lastSystem = -1;
+	for (let index = 0; index < messages.length; index++) {
+		if (messages[index]?.role === "system") lastSystem = index;
+	}
+	if (lastSystem < 0) return [{ role: "system", content: "", sections: { baton: note } } as unknown as T, ...messages];
+	return messages.map((message, index) => {
+		if (index !== lastSystem) return message;
+		const sections = { ...(message.sections ?? {}), baton: note };
+		return { ...message, sections };
+	});
 }

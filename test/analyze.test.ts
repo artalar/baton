@@ -17,7 +17,7 @@ function createSyntheticSession(): string {
 			type: "message",
 			id: "sys-1",
 			timestamp: "2026-10-13T21:00:00.020Z",
-			message: { role: "system", content: "# Baton: speculative runs\nSystem prompt text." },
+			message: { role: "system", content: "A speculative automation alert means that work is already in the transcript." },
 		},
 		{
 			type: "message",
@@ -61,13 +61,6 @@ function createSyntheticSession(): string {
 				durationMs: 10,
 				content: [{ type: "text", text: '{"name":"demo"}' }],
 			},
-		},
-		{
-			type: "custom_message",
-			id: "helper-start-1",
-			customType: "baton-helper",
-			timestamp: "2026-10-13T21:00:05.020Z",
-			content: "[Baton] Speculative run #1. You are now the helper model, not the lead.",
 		},
 		{
 			type: "message",
@@ -143,20 +136,16 @@ function createSyntheticSession(): string {
 		{
 			type: "custom_message",
 			id: "lead-note-1",
-			customType: "baton-lead",
+			customType: "baton-alert",
 			timestamp: "2026-10-13T21:00:08.530Z",
 			content: [
-				"[Baton] Speculative run #1 by the helper model (glm-5.3-flash), not by you. Its file changes are already on disk.",
-				"It stopped because the helper ended its turn without tool calls: 2 turn(s), 2 tool call(s).",
-				"",
-				"Tool calls:",
-				"1. write src/index.ts → ok",
-				"2. bash `bun test 2>&1 | tail -5` → ok",
-				"",
-				"Files changed with edit/write (undo: baton_undo({run: 1})):",
-				"- created src/index.ts (+1 −0)",
-				"",
-				"Continue from here: keep the run, fix it, or undo it.",
+				"[speculative automation alert] Execution was switched automatically to a weaker, cheaper model to save cost. The tool calls below are the complete record of what it did. Do not re-read the files just to reconstruct that record. Judge the changes strictly and decide whether to accept them. Optimizing model tool calls:",
+				"1. write",
+				'input: {"path":"src/index.ts","content":"export const x = 1;"}',
+				"output: wrote src/index.ts",
+				"2. bash",
+				'input: {"command":"bun test 2>&1 | tail -5"}',
+				"output: 1 pass",
 			].join("\n"),
 		},
 		{
@@ -209,7 +198,7 @@ describe("session analyzer", () => {
 		expect(run.turns).toBe(2);
 		expect(run.toolCalls).toBe(2);
 		expect(run.leadReaction).toBe("kept");
-		expect(run.noteFiles).toEqual([{ kind: "created", path: "src/index.ts", added: 1, removed: 0 }]);
+		expect(run.noteFiles).toEqual([]);
 		expect(analysis.bashBreakdown.test.pipedChecks).toBe(1);
 
 		const report = renderHumanReport(analysis, { showTurns: true, showCalls: true });

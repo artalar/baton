@@ -1,5 +1,7 @@
 # The Baton experiment
 
+These runs used an older mechanism: automatic continuation after the lead's turn, Helper requests, undo, and a write boundary. The numbers below belong to that mechanism. They are not scores of the current design.
+
 Baton tested whether a cheap model (GLM 5.3 Flash) can continue work a lead (Claude Opus 5.5) already started, in the same pi session, and save money without losing quality.
 
 On the easy 2048 suite it matched 14/14 at lower cost and less time. On 21 and 30 hidden tests, speculation stayed cheaper, ran several times longer, and every finished run lost one test that bare Opus passed. The lead never undid a speculative run (undos: 0) and almost never wrote an explicit helper assignment. There is no artifact of Opus launching a Flash subagent with a brief. Only bare Opus, and automatic continuation after the lead's turn, were measured.
