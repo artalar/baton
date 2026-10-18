@@ -219,16 +219,9 @@ priority.setLow()
 priority.setMedium()
 priority.setHigh()
 
-// Countdown timer — ticks only while start() is running
-const otpTimer = reatomTimer({ interval: 1000, name: 'otpTimer' })
-const reason = await otpTimer.start(30_000) // 'complete' | 'stopped' | 'replaced'
-otpTimer.status() // 'idle' | 'running' | 'paused'
-otpTimer.remains() // ms left
-otpTimer.progress() // 0..1
-otpTimer.pause()
-otpTimer.resume()
-otpTimer.toggle()
-otpTimer.stop()
+// Countdown — e.g. block OTP resend for 30s
+const otpTimer = reatomTimer('otpTimer')
+await otpTimer.start(30_000)
 
 // Wall clock — ticks every second while subscribed (sibling of rAF)
 clock.subscribe((now) => console.log(new Date(now).toISOString()))
@@ -238,9 +231,8 @@ Notes
 
 - **reatomBoolean** adds **setTrue**, **setFalse**, and **toggle** to keep updates semantic.
 - **reatomEnum** is perfect for literal list union inference in TypeScript.
-- **reatomTimer** is a countdown with `status` / `pause` / `resume` / `toggle`; `start` resolves with a settle reason.
-- **clock** / **reatomClock** is absolute wall time; prefer **clock** unless you need a custom interval.
-  Pass `{ hot: true }` to keep ticking after disconnect (like **rAF**).
+- **reatomTimer** is for countdowns like an OTP resend or a session expiry. It ticks only while counting, and flows can `await` it to learn how it ended instead of polling.
+- **clock** is for "now"-dependent UI such as relative times or deadlines. One shared tick drives every reader and stops when nothing is shown. Use **reatomClock** for another interval, `hot` when logic must keep time with nothing subscribed, and `fresh` when a value one tick stale is visible, for example after reopening a panel.
 
 Good practice
 
@@ -453,7 +445,7 @@ Awaits the next atom update or action call inside an async action/effect. Resolv
 
 - `await wrap(take(someAtom))` — next state change
 - `await wrap(take(someAction))` — next call payload
-- Second arg is a filter: resolves only when it returns truthy. `throwAbort()` inside the filter cancels the wait if the action is aborted.
+- Second arg is a selector, not a filter: whatever it returns resolves the wait — `false` and `null` included — and if the current value already maps without throwing, `take` returns the result synchronously instead of a promise. Throw `throwAbort()` inside it to skip a value and keep waiting; `(x) => x !== null` never waits. Cancelling the wait when the action is aborted is `wrap`'s job, not the selector's.
 
 ```ts
 if (!formIsValid()) {
