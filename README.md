@@ -4,6 +4,16 @@ Baton is an extension for the [pi](https://github.com/earendil-works/pi-coding-a
 
 The harness makes no decisions about quality: it does not run checks, does not judge the helper's commands, and has no heuristics about when speculation pays off. It hands over, enforces one fixed authorship boundary (the helper may change only files the lead has written, plus scratch files), records facts, and offers an undo.
 
+## What the runs showed
+
+Baton tested whether GLM 5.3 Flash can continue work Claude Opus 5.5 already started, in the same pi session, and save money without losing quality. The run log is [docs/experiment.md](docs/experiment.md).
+
+- 14 hidden tests: both 14/14. Speculation $0.33 / 6.1 min; Opus $0.62 / 18.4 min.
+- 21 tests: Opus 21/21 in 187s for $0.92. Finished Baton runs 20/21, about half the cost, 3–4× slower. One Baton run hit the cap at 18/21.
+- 30 tests, dirty tree: finished Baton 29/30 ($0.87, 667s). Opus 30/30 on tests ($1.21, 240s), audit failed on a git leak. The other Baton run aborted on an Anthropic ToS stop before any edit ($0.30, 45s).
+
+Automatic same-session speculation was cheaper, and once the suite grew it was slower and one test short. The lead never undid a run. Opus delegating the key work to a Flash subagent was never measured. These runs are history: the code and the suite changed, and the 30-test pair is not current HEAD.
+
 ## How it works
 
 ```mermaid
@@ -111,6 +121,8 @@ pi -e ./dist/index.js
 ```
 
 The npm name `pi-baton` is not published yet. `BATON_SPEC=0` keeps the lead working alone, which is the baseline for comparing runs.
+
+The 2048 eval scripts `evals/reatom-2048/run-opus.sh`, `evals/reatom-2048/run-opus-subagent.sh`, and `evals/reatom-2048/run-baton.sh` each take a workspace name, prepare it, and start that variant. Harness flags are in [evals/reatom-2048/README.md](evals/reatom-2048/README.md).
 
 ## Configuration
 

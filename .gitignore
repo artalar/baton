@@ -1,6 +1,7 @@
 node_modules/
 .pi/baton/
 *.log
+!evals/reatom-2048/results/**/*.log
 .DS_Store
 coverage/
 dist/
