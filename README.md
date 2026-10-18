@@ -1,5 +1,11 @@
 # Baton
 
+A run of the current tree (HEAD around `53f2455`) graded three variants on 30 hidden tests, all audits ok. Quality matched and the billed cost did not fall. Baton took about three times as long. The cost did not drop because each handback appends the follower's full tool inputs and outputs, and the lead pays to write that new suffix into the cache. The prefix itself did not miss. Those bills used a 1-hour prompt-cache write ($8/MTok). The harness now uses the 5-minute tier ($5/MTok); the keepalive already targeted that tier. Recalculating the logged cache-write tokens at $5/MTok, leaving output and cache reads as billed, the two totals are about $1.05 for bare Opus and $1.00 for Baton. GLM had no cache writes, so its $0.13 is unchanged. This is arithmetic on the logs, not a second run. The log is [docs/experiment.md](docs/experiment.md).
+
+- Bare Opus: $1.29 billed, 288s, 30/30.
+- Opus with a Flash subagent available: $1.35, 257s, 30/30. The model never called the subagent tool, so this is not a measured delegation.
+- Baton (cheap follower continues after the lead's tool calls): $1.30 billed, 839s, 30/30. Split: 9 Opus requests $1.17 and 64 GLM requests $0.13.
+
 Baton is an extension for the [pi](https://github.com/earendil-works/pi-coding-agent) coding agent that runs **speculative execution** inside one session. The lead model (Opus by default) works as the normal model. When its turn contains tool calls, those calls run as usual. Baton then switches to a cheaper follower model (GLM by default) with the full accumulated context, especially the lead's thinking, plus the tool results. The follower continues the task. It is not given a named request, and it uses the normal tools.
 
 Control returns to the lead when the follower produces a turn with no tool calls, or when it hits its turn cap (10 turns, 5 on the first run). The handback is one comment, a speculative automation alert, listing every follower tool call's input and output from that run. That tool log is the complete record, like a diff. The lead does not re-read files just to reconstruct it, and does judge the changes and decide whether to accept them.
