@@ -19,7 +19,7 @@ Baton tested whether GLM 5.3 Flash can continue work Claude Opus 5.5 already sta
 - 21 tests: Opus 21/21 in 187s for $0.92. Finished Baton runs 20/21, about half the cost, 3–4× slower. One Baton run hit the cap at 18/21.
 - 30 tests, dirty tree: finished Baton 29/30 ($0.87, 667s). Opus 30/30 on tests ($1.21, 240s), audit failed on a git leak. The other Baton run aborted on an Anthropic ToS stop before any edit ($0.30, 45s).
 
-Automatic same-session speculation was cheaper, and once the suite grew it was slower and one test short. Opus delegating the key work to a Flash subagent was never measured. These runs are history: the code and the suite changed, and the 30-test pair is not current HEAD.
+Automatic same-session speculation was cheaper, and once the suite grew it was slower and one test short. Opus delegating the key work to a Flash subagent was never measured. These runs are history: the code and the suite changed, and the 30-test pair is not current HEAD. The 18 October r7 bills in that log paid for 1-hour cache writes; the same logged tokens at the 5-minute write price are a counterfactual in the same note, not a second paid run.
 
 ## How it works
 

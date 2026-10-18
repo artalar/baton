@@ -115,6 +115,31 @@ These three runs are the closest to the current prompt, and they are still a dir
 
 The afternoon build was `1a149b3` plus dirty `src`. The committed helper-write boundary (`da691759`) is later than the copy of that boundary already present in `src/run.ts` during h1 and h2.
 
+## 18 October — opus, flash delegate, baton
+
+Budget $3, wall 20 minutes. Preflight checked the budget alone. One run each. Baton loaded `dist/index.js` at `5de3960`, clean `src`. The hidden grade is 30 tests.
+
+| Run | Stop | Cost | Time | Tests | Audit |
+| --- | --- | --- | --- | --- | --- |
+| `2048-opus-r7` | completed | $1.29 | 288s | 30/30 | ok, 4 warnings |
+| `2048-flash-r7` | completed | $1.35 | 257s | 30/30 | ok, 6 warnings |
+| `2048-baton-r7` | completed | $1.30 | 839s | 30/30 | ok |
+
+Opus: 22 requests, all Opus. Flash: 24 requests, all Opus. The delegate flag was on, and the lead made zero `subagent` calls, so the bill has no GLM line. Baton: 9 Opus ($1.17) and 64 GLM ($0.13). The warnings are bash paths (`..`, or an absolute path outside the workspace), not hidden-test leaks.
+
+All three passed. Baton was not cheaper here. The Flash-subagent condition is still unmeasured: the script ran, the agent did the work itself.
+
+### 5-minute cache write, counterfactual
+
+Those bills are the 1-hour cache write. The harness set `PI_CACHE_RETENTION=long`, and pi maps only that value to Anthropic's 1-hour cache control. OpenRouter billed the writes at $8/MTok. The prices that matched `usage.cost` on the Opus requests were input $4/MTok, output $20/MTok, cache read $0.20/MTok, and cache write $8/MTok. A 5-minute write is 1.25× input, $5/MTok. This is arithmetic on the logged tokens, not a second paid run. For each Opus request the cache-write line becomes tokens × $5/MTok; output and cache-read dollars stay as billed.
+
+| Run | Billed | Cache-write tokens | Billed write at $8/MTok | Write at $5/MTok | 5-minute-write total |
+| --- | --- | --- | --- | --- | --- |
+| `2048-opus-r7` | $1.2908758 | 78,982 | $0.631856 | $0.394910 | $1.0539298 |
+| `2048-baton-r7` | $1.2973352176 | 98,840 | $0.790720 | $0.494200 | $1.0008152176 |
+
+`2048-opus-r7` is the 22 Opus requests in the session log. Their sum is the `status.json` cost, which the table above rounds to $1.29. `2048-baton-r7` is 9 Opus requests ($1.1659164 billed, all 98,840 write tokens) plus 64 GLM requests. GLM's `cacheWrite` is 0 in the session log, `status.json`, and the Baton summary, so the billed $0.1314188176 (the $0.13 above) is unchanged: the log has no write tokens and no 5-minute GLM write price. The Baton summary also has one cache keepalive, an Opus request at $0.00889 with `cacheWrite` 0 (44,070 cache-read tokens, 3 output tokens). It is not in `status.json`, which is the $1.30 row. Adding it raises both the billed and counterfactual Baton totals by $0.00889, to $1.3062252176 and $1.0097052176. `2048-flash-r7` stays at its billed $1.35; this arithmetic does not use that log.
+
 ## What is not comparable
 
 The code and the test suite changed. Older runs are history. They are not scores of the current tree.
@@ -129,9 +154,9 @@ The code and the test suite changed. Older runs are history. They are not scores
 
 ## Not yet measured
 
-The run still missing is three conditions on the same task: bare Opus, Opus calling a Flash subagent for the key work, and Baton's automatic same-session speculation.
+Bare Opus and Baton now have a graded run on this task (`2048-opus-r7`, `2048-baton-r7`, 18 October). `2048-flash-r7` was started with delegation enabled and never called `subagent`, so a brief from Opus to a Flash subagent is still missing.
 
-Only the first and the third were measured. There is no artifact of a brief from Opus to a Flash subagent. Explicit `Helper:` lines were rare (one on the Tetris Baton run, one on r4, one on h2, zero on the 14-test Baton run and on r2). The lead did not undo the speculative work it received.
+Before that date only bare Opus and automatic continuation were measured. Explicit `Helper:` lines were rare (one on the Tetris Baton run, one on r4, one on h2, zero on the 14-test Baton run and on r2). The lead did not undo the speculative work it received.
 
 ## Sources
 

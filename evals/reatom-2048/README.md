@@ -65,7 +65,7 @@ The Flash child does not get the 60-second bash cap. The subagent example spawns
 
 `--cwd` defaults to `tmp/<name>` when you run `bun evals/reatom-2048/harness/run.mjs` from the repo root, so it can be omitted when the prepared directory is `tmp/2048-a`.
 
-Before it starts pi, the runner asks OpenRouter how much the key has left and refuses to start when that is less than the budget plus $2.60, the most one Opus request can reserve (OpenRouter rejects a request whose `max_tokens` the key cannot pay for). `--skip-preflight` starts anyway. A run whose last request failed ends with `stopReason: "final request failed: …"` and exit code 1 in `.run/status.json`, not `completed`. `--baton-ext <path>` loads another Baton build, for example an older commit built in a git worktree, so two versions can be compared on the same prompt; `status.json` records the build's path, commit, and whether its `src/` had uncommitted changes.
+Before it starts pi, the runner asks OpenRouter how much the key has left and refuses to start when that is less than the remaining budget. This check only covers the run budget; OpenRouter can still reject a single call when the key cannot pay for max output tokens. `--skip-preflight` starts anyway. A run whose last request failed ends with `stopReason: "final request failed: …"` and exit code 1 in `.run/status.json`, not `completed`. `--baton-ext <path>` loads another Baton build, for example an older commit built in a git worktree, so two versions can be compared on the same prompt; `status.json` records the build's path, commit, and whether its `src/` had uncommitted changes.
 
 ## Grade
 

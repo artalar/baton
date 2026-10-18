@@ -13,8 +13,6 @@ const bashTimeoutExt = resolve(here, "bash-timeout-extension.js");
 const flashAgent = resolve(here, "agents/flash.md");
 const require = createRequire(import.meta.url);
 
-/** OpenRouter refuses a request unless the key can pay for max_tokens of output: 128k Opus tokens at $20/M, plus the prompt. */
-const LARGEST_LEAD_REQUEST_USD = 2.6;
 const leadTools = "read,bash,edit,write,grep,find,ls";
 
 const args = parseArgs(process.argv.slice(2));
@@ -53,9 +51,10 @@ const subagentExt = delegate ? subagentExtensionPath() : undefined;
 const prompt = readPrompt(promptPath);
 const apiKey = readApiKey(resolve(repoRoot, ".env"));
 const credit = await readOpenRouterCredit(apiKey);
-const requiredUsd = Math.max(budgetUsd - priorUsd, 0) + LARGEST_LEAD_REQUEST_USD;
+/** This check only covers the run budget; OpenRouter can still reject a single call when the key cannot pay for max output tokens. */
+const requiredUsd = Math.max(budgetUsd - priorUsd, 0);
 if (credit.remainingUsd !== undefined && credit.remainingUsd < requiredUsd && args["skip-preflight"] !== true) {
-	console.error(`OpenRouter key has $${credit.remainingUsd.toFixed(2)} left; this run needs about $${requiredUsd.toFixed(2)} (budget plus one ${LARGEST_LEAD_REQUEST_USD} USD lead request). Top up or pass --skip-preflight.`);
+	console.error(`OpenRouter key has $${credit.remainingUsd.toFixed(2)} left; this run needs $${requiredUsd.toFixed(2)}. Top up or pass --skip-preflight.`);
 	process.exit(2);
 }
 if (credit.error) console.warn(`OpenRouter credit check skipped: ${credit.error}`);
@@ -101,10 +100,11 @@ const env = {
 	API_KEY: apiKey,
 	PI_CODING_AGENT_DIR: resolve(cwd, ".pi-agent"),
 	PI_CODING_AGENT_SESSION_DIR: resolve(cwd, ".pi/sessions"),
-	PI_CACHE_RETENTION: "long",
 	RUN_BUDGET_USD: String(budgetUsd),
 	RUN_LIMIT_MS: String(limitMs),
 };
+/** Pi maps only `long` to the 1-hour write. Unset keeps the 5-minute tier the keepalive is built for. */
+delete env.PI_CACHE_RETENTION;
 if (withBaton) env.BATON_SPEC = "1";
 else env.BATON_SPEC = "0";
 
