@@ -2,13 +2,13 @@
 
 A $3 coding-agent task: implement 2048 with `@reatom/core` and `@reatom/jsx`. The agent starts from `starter/` (packages and Reatom skills already installed). `hidden/` grades the workspace. The agent never receives `hidden/` or `oracle/`.
 
-`tmp/run.mjs` and `tmp/budget-extension.js` are a local, gitignored runner. They are not part of the eval package.
+The runner is `harness/`: `run.mjs`, a 60-second cap on the lead's `bash` and `powershell` calls, and a budget stop at $3 or 20 minutes (`RUN_BUDGET_USD` and `RUN_LIMIT_MS`, which the runner sets from `--budget` and `--minutes`). It uses this repo's `node_modules/.bin/pi` from `@earendil-works/pi-coding-agent` 1.2.0, with `PI_CODING_AGENT_DIR` set to the workspace `.pi-agent` directory. Workspaces under `tmp/` stay gitignored.
 
 ```mermaid
 flowchart LR
   starter[starter] --> prepare[prepare.mjs]
   prepare --> workspace["tmp/name"]
-  prompt[prompt.txt] --> runner["tmp/run.mjs"]
+  prompt[prompt.txt] --> runner["harness/run.mjs"]
   workspace --> runner
   workspace --> grade[grade.mjs]
   grade --> copy[temp copy]
@@ -21,9 +21,10 @@ flowchart LR
 
 ## One-time setup
 
-From the repo root:
+Requires Node.js 22 or newer and bun, as the root README states. From the repo root, `bun install` installs `node_modules/.bin/pi`. Set `OPENROUTER_API_KEY` in the environment. A repo-root `.env` is an optional local fallback: when that variable is unset, the runner reads `API_KEY` from the file. Do not commit `.env`.
 
 ```bash
+bun install
 bun install --cwd evals/reatom-2048/starter
 bun install --cwd evals/reatom-2048
 bunx --cwd evals/reatom-2048 playwright install chromium
@@ -39,21 +40,30 @@ bun install --cwd evals/reatom-2048/oracle
 
 `prepare.mjs` copies `starter/` to `tmp/<name>`, including `node_modules` and `.agents/skills`, so the agent does not spend budget on install. It writes a `.prepared` marker and replaces that directory only when it is missing, empty, or already marked. It will not touch `tmp/baton` or `tmp/opus`. It also commits the starter to a new git repository in the workspace, so the agent's git commands stay there: without it, `git status` in the workspace lists this repository's uncommitted changes, including paths under `hidden/`, and fails the audit.
 
-```bash
-bun evals/reatom-2048/prepare.mjs --name 2048-a
-bun tmp/run.mjs --name 2048-a --cwd tmp/2048-a --prompt evals/reatom-2048/prompt.txt --budget 3 --baton 1
-```
-
-The same trial without Baton, in its own workspace:
+Three ways to run the same prompt, each in its own workspace:
 
 ```bash
 bun evals/reatom-2048/prepare.mjs --name 2048-b
-bun tmp/run.mjs --name 2048-b --cwd tmp/2048-b --prompt evals/reatom-2048/prompt.txt --budget 3 --baton 0
+bun evals/reatom-2048/harness/run.mjs --name 2048-b --cwd tmp/2048-b --prompt evals/reatom-2048/prompt.txt --budget 3 --baton 0
 ```
+
+```bash
+bun evals/reatom-2048/prepare.mjs --name 2048-flash
+bun evals/reatom-2048/harness/run.mjs --name 2048-flash --cwd tmp/2048-flash --prompt evals/reatom-2048/prompt.txt --budget 3 --baton 0 --delegate 1
+```
+
+```bash
+bun evals/reatom-2048/prepare.mjs --name 2048-a
+bun evals/reatom-2048/harness/run.mjs --name 2048-a --cwd tmp/2048-a --prompt evals/reatom-2048/prompt.txt --budget 3 --baton 1
+```
+
+`--baton 0` is bare Opus. `--baton 0 --delegate 1` is Opus that may call Flash: the runner appends `subagent` to `--tools`, loads `examples/extensions/subagent/index.ts` from the installed pi package, and copies `harness/agents/flash.md` to `<workspace>/.pi-agent/agents/flash.md` before start. The lead calls that tool with agent name `flash` (the example has no CLI flag for the agent name; the default scope `user` reads `PI_CODING_AGENT_DIR/agents`). `--baton 1` is Baton: Opus with the speculative helper. `--delegate` defaults to 0. The flags combine: `--baton 1 --delegate 1` loads both.
+
+The Flash child does not get the 60-second bash cap. The subagent example spawns its child without `--extension`, and passing the cap through would mean changing that example.
 
 `--budget` defaults to $3 in the runner. `--prompt` defaults to `tmp/prompt.txt` (the Tetris prompt). `--session-name` defaults to `--name`.
 
-`--cwd` defaults to `tmp/<name>` when you run `bun tmp/run.mjs` from the repo root, so it can be omitted when the prepared directory is `tmp/2048-a`.
+`--cwd` defaults to `tmp/<name>` when you run `bun evals/reatom-2048/harness/run.mjs` from the repo root, so it can be omitted when the prepared directory is `tmp/2048-a`.
 
 Before it starts pi, the runner asks OpenRouter how much the key has left and refuses to start when that is less than the budget plus $2.60, the most one Opus request can reserve (OpenRouter rejects a request whose `max_tokens` the key cannot pay for). `--skip-preflight` starts anyway. A run whose last request failed ends with `stopReason: "final request failed: …"` and exit code 1 in `.run/status.json`, not `completed`. `--baton-ext <path>` loads another Baton build, for example an older commit built in a git worktree, so two versions can be compared on the same prompt; `status.json` records the build's path, commit, and whether its `src/` had uncommitted changes.
 
