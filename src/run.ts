@@ -1,12 +1,15 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
+import { isInside } from "./config.ts";
 
 export interface RunCall {
 	id: string;
 	name: string;
 	args: Record<string, unknown>;
 	isError?: boolean;
+	/** The harness refused to run the call. */
+	blocked?: boolean;
 	output?: string;
 }
 
@@ -24,6 +27,10 @@ export interface ActiveRun {
 	calls: RunCall[];
 	/** Content of each file before the helper first touched it with edit/write, by absolute path. */
 	originals: Map<string, Buffer | undefined>;
+	/** Tool call ids the harness refused to run. */
+	blocked: Set<string>;
+	/** The file the helper tried to change without being allowed to, relative to cwd. */
+	blockedWrite?: string;
 	stopRequested?: string;
 }
 
@@ -33,6 +40,7 @@ export interface FinishedRun {
 	turns: number;
 	callCount: number;
 	changes: FileChange[];
+	blockedWrite?: string;
 	undone: Set<string>;
 }
 
@@ -46,7 +54,7 @@ export interface UndoResult {
 
 export const FILE_TOOLS = new Set(["edit", "write"]);
 
-export const startRun = (number: number, startedAt: number): ActiveRun => ({ number, startedAt, turns: 0, calls: [], originals: new Map() });
+export const startRun = (number: number, startedAt: number): ActiveRun => ({ number, startedAt, turns: 0, calls: [], originals: new Map(), blocked: new Set() });
 
 /** Mirrors pi's path handling: a leading `@` is dropped, `~` is the home directory, relative paths start at cwd. */
 export function resolveToolPath(cwd: string, rawPath: string): string {
@@ -54,6 +62,15 @@ export function resolveToolPath(cwd: string, rawPath: string): string {
 	const expanded = withoutAt === "~" || withoutAt.startsWith("~/") ? homedir() + withoutAt.slice(1) : withoutAt;
 	return resolve(cwd, expanded);
 }
+
+/** Absolute path of the file an edit/write call targets. */
+export function fileToolTarget(cwd: string, call: Pick<RunCall, "name" | "args">): string | undefined {
+	if (!FILE_TOOLS.has(call.name) || typeof call.args.path !== "string") return undefined;
+	return resolveToolPath(cwd, call.args.path);
+}
+
+/** The helper may change files the lead changed with edit/write in this session, and anything under the scratch directory. */
+export const helperMayWrite = (absolutePath: string, leadFiles: ReadonlySet<string>, scratchDir: string) => leadFiles.has(absolutePath) || isInside(scratchDir, absolutePath);
 
 function readContent(absolutePath: string): Buffer | undefined {
 	try {
@@ -64,9 +81,8 @@ function readContent(absolutePath: string): Buffer | undefined {
 }
 
 export function rememberOriginal(run: ActiveRun, cwd: string, call: Pick<RunCall, "name" | "args">): void {
-	if (!FILE_TOOLS.has(call.name) || typeof call.args.path !== "string") return;
-	const absolutePath = resolveToolPath(cwd, call.args.path);
-	if (!run.originals.has(absolutePath)) run.originals.set(absolutePath, readContent(absolutePath));
+	const absolutePath = fileToolTarget(cwd, call);
+	if (absolutePath && !run.originals.has(absolutePath)) run.originals.set(absolutePath, readContent(absolutePath));
 }
 
 export function recordTurn(run: ActiveRun, calls: RunCall[]): void {

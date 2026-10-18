@@ -1,12 +1,24 @@
-import { isAbsolute, join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { isAbsolute, join, relative } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { type BatonConfig, FIRST_RUN_MAX_TURNS, isSameModel, loadConfig, parseModelRef } from "./config.ts";
+import { type BatonConfig, FIRST_RUN_MAX_TURNS, isSameModel, loadConfig, parseModelRef, type ThinkingLevel } from "./config.ts";
 import { type ContextMessage, HELPER_INSTRUCTION_TYPE, LEAD_NOTE_TYPE, viewFor } from "./context.ts";
 import { type Journal, openJournal } from "./journal.ts";
 import { keepWarm, type SentRequest } from "./keepalive.ts";
-import { describeCall, helperInstruction, LEAD_SYSTEM_NOTE, renderRunNote, renderUndoResult } from "./notes.ts";
-import { type ActiveRun, collectChanges, type FinishedRun, type RunCall, recordTurn, rememberOriginal, startRun, undoRun } from "./run.ts";
+import { blockedWriteReason, blockedWriteStop, describeCall, HANDBACK_REASON, helperInstruction, leadSystemNote, renderRunNote, renderUndoResult } from "./notes.ts";
+import {
+	type ActiveRun,
+	collectChanges,
+	type FinishedRun,
+	fileToolTarget,
+	helperMayWrite,
+	type RunCall,
+	recordTurn,
+	rememberOriginal,
+	startRun,
+	undoRun,
+} from "./run.ts";
 
 interface Usage {
 	input?: number;
@@ -29,6 +41,7 @@ interface SessionStats {
 	runs: number;
 	helperTurns: number;
 	helperCalls: number;
+	blockedWrites: number;
 	undos: number;
 	cacheKeepalives: number;
 	stopReasons: Record<string, number>;
@@ -44,9 +57,11 @@ const textOf = (content: unknown) =>
 		.flatMap((block) => (block.type === "text" && block.text ? [block.text] : []))
 		.join("\n");
 
-const emptyStats = (): SessionStats => ({ runs: 0, helperTurns: 0, helperCalls: 0, undos: 0, cacheKeepalives: 0, stopReasons: {} });
+const emptyStats = (): SessionStats => ({ runs: 0, helperTurns: 0, helperCalls: 0, blockedWrites: 0, undos: 0, cacheKeepalives: 0, stopReasons: {} });
 
 const stopReasonKey = (reason: string) => reason.replace(/\s*\(.*$/, "").replace(/\d+/g, "N");
+
+const BLOCKED_WRITE_KEY = "it tried to change a file the lead has not written";
 
 export default function baton(pi: ExtensionAPI) {
 	let config: BatonConfig | undefined;
@@ -60,19 +75,38 @@ export default function baton(pi: ExtensionAPI) {
 	let startedAt = Date.now();
 	let lastLeadRequest: SentRequest | undefined;
 	let stopKeepalive = () => {};
+	/** Absolute paths of the files the lead changed with edit/write in this session. */
+	let leadFiles = new Set<string>();
+	let scratchDir = "";
+	/** The lead's thinking level while the helper runs with its own. */
+	let leadThinking: ThinkingLevel | undefined;
 
 	const notify = (ctx: ExtensionContext, message: string) => {
 		if (ctx.hasUI) ctx.ui.notify(message, "warning");
 		else console.warn(message);
 	};
 
+	const shownPath = (absolutePath: string) => relative(cwd, absolutePath) || absolutePath;
+
 	const init = (ctx: ExtensionContext) => {
 		if (config) return;
 		cwd = ctx.cwd;
 		config = loadConfig(cwd, (message) => notify(ctx, message));
 		const journalRoot = isAbsolute(config.journalDir) ? config.journalDir : join(cwd, config.journalDir);
+		scratchDir = join(journalRoot, "scratch");
 		journal = openJournal(journalRoot, ctx.sessionManager?.getSessionId?.());
 		journal.log("session", { config });
+	};
+
+	/** pi's setModel resets the thinking level to the settings default, so every switch sets it explicitly. */
+	const applyThinking = (role: "lead" | "helper", levelBeforeSwitch: ThinkingLevel) => {
+		if (role === "lead") {
+			pi.setThinkingLevel(leadThinking ?? levelBeforeSwitch);
+			leadThinking = undefined;
+			return;
+		}
+		leadThinking = levelBeforeSwitch;
+		pi.setThinkingLevel(config!.helperThinking === "inherit" ? levelBeforeSwitch : config!.helperThinking);
 	};
 
 	const switchModel = async (ctx: ExtensionContext, role: "lead" | "helper"): Promise<boolean> => {
@@ -85,12 +119,23 @@ export default function baton(pi: ExtensionAPI) {
 			return false;
 		}
 		if (ctx.model?.id === model.id && ctx.model?.provider === model.provider) return true;
-		return pi.setModel(model);
+		const levelBeforeSwitch = pi.getThinkingLevel();
+		if (!(await pi.setModel(model))) return false;
+		applyThinking(role, levelBeforeSwitch);
+		return true;
 	};
 
 	const writeSummary = () => {
 		if (!config || !journal) return;
-		const runs = finishedRuns.map((run) => ({ number: run.number, stopReason: run.stopReason, turns: run.turns, calls: run.callCount, changedFiles: run.changes.map((change) => change.path), undone: [...run.undone] }));
+		const runs = finishedRuns.map((run) => ({
+			number: run.number,
+			stopReason: run.stopReason,
+			turns: run.turns,
+			calls: run.callCount,
+			changedFiles: run.changes.map((change) => change.path),
+			blockedWrite: run.blockedWrite,
+			undone: [...run.undone],
+		}));
 		journal.writeSummary({ lead: config.lead, helper: config.helper, wallSeconds: Math.round((Date.now() - startedAt) / 1000), costs, stats, runs });
 	};
 
@@ -127,10 +172,18 @@ export default function baton(pi: ExtensionAPI) {
 		stopKeepalive();
 		const changes = collectChanges(run, cwd);
 		const note = renderRunNote({ runNumber: run.number, helperModel: config!.helper, stopReason, turns: run.turns, calls: run.calls, changes, noteChars: config!.noteChars });
-		finishedRuns.push({ number: run.number, stopReason, turns: run.turns, callCount: run.calls.length, changes, undone: new Set() });
-		const reasonKey = stopReasonKey(stopReason);
+		finishedRuns.push({ number: run.number, stopReason, turns: run.turns, callCount: run.calls.length, changes, blockedWrite: run.blockedWrite, undone: new Set() });
+		const reasonKey = run.blockedWrite && stopReason === run.stopRequested ? BLOCKED_WRITE_KEY : stopReasonKey(stopReason);
 		stats.stopReasons[reasonKey] = (stats.stopReasons[reasonKey] ?? 0) + 1;
-		journal?.log("run_end", { run: run.number, stopReason, turns: run.turns, calls: run.calls.length, changedFiles: changes.map((change) => change.path), noteChars: note.length });
+		journal?.log("run_end", {
+			run: run.number,
+			stopReason,
+			turns: run.turns,
+			calls: run.calls.length,
+			changedFiles: changes.map((change) => change.path),
+			blockedWrite: run.blockedWrite,
+			noteChars: note.length,
+		});
 		await switchModel(ctx, "lead");
 		writeSummary();
 		return note;
@@ -146,6 +199,8 @@ export default function baton(pi: ExtensionAPI) {
 		stats = emptyStats();
 		startedAt = Date.now();
 		lastLeadRequest = undefined;
+		leadFiles = new Set();
+		leadThinking = undefined;
 		init(ctx);
 	});
 
@@ -158,15 +213,27 @@ export default function baton(pi: ExtensionAPI) {
 		const interruptedRunNote = activeRun ? await finishRun(ctx, "a new prompt arrived") : undefined;
 		if (event.messageType === "user") journal?.log("prompt", { prompt: event.prompt.slice(0, 400) });
 		await switchModel(ctx, "lead");
-		const systemPrompt = event.systemPrompt + LEAD_SYSTEM_NOTE;
+		const systemPrompt = event.systemPrompt + leadSystemNote(shownPath(scratchDir));
 		if (!interruptedRunNote) return { systemPrompt };
 		return { systemPrompt, message: { customType: LEAD_NOTE_TYPE, content: interruptedRunNote, display: true } };
 	});
 
 	pi.on("tool_call", (event) => {
 		if (!activeRun) return undefined;
-		if (activeRun.stopRequested) return { block: true, terminate: true, reason: "Baton: the lead model takes over now. Reply with one short line and no tool call." };
-		rememberOriginal(activeRun, cwd, { name: event.toolName, args: (event.input ?? {}) as Record<string, unknown> });
+		if (activeRun.stopRequested) {
+			activeRun.blocked.add(event.toolCallId);
+			return { block: true, terminate: true, reason: HANDBACK_REASON };
+		}
+		const call = { name: event.toolName, args: (event.input ?? {}) as Record<string, unknown> };
+		const target = fileToolTarget(cwd, call);
+		if (target && !helperMayWrite(target, leadFiles, scratchDir)) {
+			activeRun.blocked.add(event.toolCallId);
+			activeRun.blockedWrite = shownPath(target);
+			activeRun.stopRequested = blockedWriteStop(call.name, activeRun.blockedWrite);
+			stats.blockedWrites++;
+			return { block: true, terminate: true, reason: blockedWriteReason(activeRun.blockedWrite) };
+		}
+		rememberOriginal(activeRun, cwd, call);
 		return undefined;
 	});
 
@@ -208,7 +275,14 @@ export default function baton(pi: ExtensionAPI) {
 			.filter((block) => block.type === "toolCall" && block.id)
 			.map((block) => {
 				const result = results.get(block.id!);
-				return { id: block.id!, name: block.name ?? "", args: block.arguments ?? {}, isError: result?.isError, output: result ? textOf(result.content).slice(0, MAX_OUTPUT_CHARS) : undefined };
+				return {
+					id: block.id!,
+					name: block.name ?? "",
+					args: block.arguments ?? {},
+					isError: result?.isError,
+					blocked: activeRun?.blocked.has(block.id!),
+					output: result ? textOf(result.content).slice(0, MAX_OUTPUT_CHARS) : undefined,
+				};
 			});
 
 		if (activeRun) {
@@ -231,16 +305,23 @@ export default function baton(pi: ExtensionAPI) {
 			return { entries: [leadNote(await finishRun(ctx, stopReason))], continue: true };
 		}
 
-		if (!config.speculate || isSameModel(message.model, config.helper)) return undefined;
+		if (isSameModel(message.model, config.helper)) return undefined;
+		for (const call of calls) {
+			const target = fileToolTarget(cwd, call);
+			if (target && !call.isError) leadFiles.add(target);
+		}
+		if (!config.speculate) return undefined;
 		if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
 		if (!calls.length || calls.some((call) => call.name === UNDO_TOOL)) return undefined;
 		if (!(await switchModel(ctx, "helper"))) return undefined;
 		runCounter++;
 		stats.runs++;
 		activeRun = startRun(runCounter, Date.now());
+		mkdirSync(scratchDir, { recursive: true });
 		journal?.log("run_start", { run: runCounter, after: calls.map((call) => describeCall(call, 120)) });
 		startKeepalive(ctx, message.usage);
-		return { entries: [{ type: "custom_message", customType: HELPER_INSTRUCTION_TYPE, content: helperInstruction(runCounter), display: true }] };
+		const scope = { leadFiles: [...leadFiles].map(shownPath), scratchDir: shownPath(scratchDir) };
+		return { entries: [{ type: "custom_message", customType: HELPER_INSTRUCTION_TYPE, content: helperInstruction(runCounter, scope), display: true }] };
 	});
 
 	pi.on("agent_end", () => {

@@ -37,6 +37,7 @@ function mount(cwd: string) {
 	const handlers = new Map<string, Handler[]>();
 	const tools = new Map<string, Tool>();
 	const pings: Ping[] = [];
+	const thinking = { level: "medium", history: [] as string[] };
 	const ctx = {
 		cwd,
 		hasUI: true,
@@ -67,9 +68,16 @@ function mount(cwd: string) {
 		registerTool(tool: Tool & { name: string }) {
 			tools.set(tool.name, tool);
 		},
+		/** Like pi, a model switch resets the thinking level to the settings default. */
 		async setModel(model: { id: string; provider: string }) {
 			ctx.model = model;
+			thinking.level = "high";
 			return true;
+		},
+		getThinkingLevel: () => thinking.level,
+		setThinkingLevel(level: string) {
+			thinking.level = level;
+			thinking.history.push(level);
 		},
 	};
 	baton(pi as never);
@@ -112,7 +120,7 @@ function mount(cwd: string) {
 		return Object.assign(result ?? {}, { blocked, isEmpty: result === undefined });
 	};
 	const undo = (params: Record<string, unknown>) => tools.get("baton_undo")!.execute("t", params).then((reply) => reply.content[0]!.text);
-	return { ctx, emit, turn, undo, pings };
+	return { ctx, emit, turn, undo, pings, thinking };
 }
 
 async function startTask(h: ReturnType<typeof mount>, prompt = "Build tetris") {
@@ -127,27 +135,31 @@ describe("speculative runs in a pi session", () => {
 		const cwd = project();
 		const h = mount(cwd);
 		const start = await startTask(h);
-		expect(start.systemPrompt).toMatch(/^BASE PROMPT\n\n# Baton: speculative runs[\s\S]*baton_undo[\s\S]*The harness runs no checks for you/);
+		expect(start.systemPrompt).toMatch(/^BASE PROMPT\n\n# Baton: speculative runs[\s\S]*only files you have changed with edit\/write in this session, plus scratch files under \.pi\/baton\/scratch\/[\s\S]*baton_undo[\s\S]*The harness runs no checks for you/);
 		expect(h.ctx.model?.id).toBe(LEAD);
 
-		const handoff = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "export const model = 1;\n" }]);
+		const handoff = await h.turn(LEAD, [{ name: "edit", args: { path: "src/model.ts", edits: [] }, output: "Edited" }]);
 		expect(handoff.entries).toHaveLength(1);
 		expect(handoff.entries[0]).toMatchObject({ customType: HELPER_INSTRUCTION_TYPE });
 		expect(handoff.entries[0].content).toMatch(/Speculative run #1\. You are now the helper model/);
+		expect(handoff.entries[0].content).toContain("You may change only the files the lead has written (src/model.ts) and files under .pi/baton/scratch/;");
 		expect(handoff.continue).toBeUndefined();
 		expect(h.ctx.model?.id).toBe(HELPER);
+		expect(h.thinking.level).toBe("low");
 
+		const scratchTest = ".pi/baton/scratch/model.test.ts";
 		const first = await h.turn(
 			HELPER,
 			[
 				{ name: "read", args: { path: "src/model.ts" }, output: "MODEL SOURCE" },
 				{ name: "edit", args: { path: "src/model.ts", edits: [] }, output: "Edited", effect: write(cwd, "src/model.ts", "export const model = 2;\n") },
-				{ name: "write", args: { path: "src/model.test.ts", content: "test" }, output: "Wrote", effect: write(cwd, "src/model.test.ts", "test('x')\n") },
+				{ name: "write", args: { path: scratchTest, content: "test" }, output: "Wrote", effect: write(cwd, scratchTest, "test('x')\n") },
 				{ name: "bash", args: { command: "npm test" }, isError: true, output: "FAIL model.test.ts\nTests: 1 failed" },
 			],
 			{ text: "Updating the model." },
 		);
 		expect(first.isEmpty).toBe(true);
+		expect(first.blocked).toEqual([]);
 		const leadMessageWithThinking = {
 			role: "assistant",
 			model: LEAD,
@@ -168,12 +180,13 @@ describe("speculative runs in a pi session", () => {
 		const back = await h.turn(HELPER, [], { text: "All checks are green, the model is done." });
 		expect(back.continue).toBe(true);
 		expect(h.ctx.model?.id).toBe(LEAD);
+		expect(h.thinking).toEqual({ level: "medium", history: ["medium", "low", "medium"] });
 		const note: string = back.entries[0].content;
 		expect(back.entries[0].customType).toBe(LEAD_NOTE_TYPE);
 		expect(note).toMatch(/Speculative run #1 by the helper model \(glm-5\.3-flash\), not by you/);
 		expect(note).toMatch(/It stopped because the helper ended its turn without tool calls: 2 turn\(s\), 4 tool call\(s\)/);
 		expect(note).toContain("- modified src/model.ts (+1 −1)");
-		expect(note).toContain("- created src/model.test.ts (+1 −0)");
+		expect(note).toContain(`- created ${scratchTest} (+1 −0)`);
 		expect(note).toContain("+export const model = 2;");
 		expect(note).toMatch(/bash `npm test` → error\n {3}FAIL model\.test\.ts/);
 		expect(note).toMatch(/--- read src\/model\.ts ---\nMODEL SOURCE/);
@@ -194,9 +207,9 @@ describe("speculative runs in a pi session", () => {
 			{ type: "toolCall", id: "l" },
 		]);
 
-		expect(await h.undo({ run: 1, paths: ["src/model.test.ts"] })).toBe("baton_undo run #1: deleted src/model.test.ts (created by the run).");
-		expect(existsSync(join(cwd, "src/model.test.ts"))).toBe(false);
-		expect(await h.undo({ run: 1 })).toBe("baton_undo run #1: restored src/model.ts; src/model.test.ts already undone.");
+		expect(await h.undo({ run: 1, paths: [scratchTest] })).toBe(`baton_undo run #1: deleted ${scratchTest} (created by the run).`);
+		expect(existsSync(join(cwd, scratchTest))).toBe(false);
+		expect(await h.undo({ run: 1 })).toBe(`baton_undo run #1: restored src/model.ts; ${scratchTest} already undone.`);
 		expect(readFileSync(join(cwd, "src/model.ts"), "utf8")).toBe("export const model = 1;\n");
 		expect(await h.undo({ run: 9 })).toMatch(/no run #9/);
 
@@ -211,10 +224,65 @@ describe("speculative runs in a pi session", () => {
 		await h.emit("message_end", { message: { role: "assistant", model: LEAD, usage: { cost: { total: 0.5 }, cacheWrite: 100 } } });
 		await h.emit("agent_end", {});
 		const summary = JSON.parse(readFileSync(join(cwd, ".pi/baton/sessions/session-1/summary.json"), "utf8"));
-		expect(summary.stats).toMatchObject({ runs: 2, helperTurns: 3, helperCalls: 4, undos: 2 });
+		expect(summary.stats).toMatchObject({ runs: 2, helperTurns: 3, helperCalls: 4, blockedWrites: 0, undos: 2 });
 		expect(summary.costs[LEAD]).toMatchObject({ requests: 1, usd: 0.5, cacheWrite: 100 });
-		expect(summary.runs[0]).toMatchObject({ number: 1, changedFiles: ["src/model.ts", "src/model.test.ts"], undone: ["src/model.test.ts", "src/model.ts"] });
+		expect(summary.runs[0]).toMatchObject({ number: 1, changedFiles: ["src/model.ts", scratchTest], undone: [scratchTest, "src/model.ts"] });
 		expect(readFileSync(join(cwd, ".pi/baton/.gitignore"), "utf8")).toBe("*\n");
+	});
+
+	it("blocks helper writes outside the lead's files and the scratch directory, and hands back at once", async () => {
+		const cwd = project();
+		const h = mount(cwd);
+		await startTask(h);
+
+		const handoff = await h.turn(LEAD, [{ name: "read", args: { path: "src/model.ts" }, output: "x" }]);
+		expect(handoff.entries[0].content).toContain("You may change no project file yet (the lead has written none), only files under .pi/baton/scratch/;");
+
+		const refused = await h.turn(HELPER, [
+			{ name: "read", args: { path: "src/model.ts" }, output: "x" },
+			{ name: "write", args: { path: "src/store.ts", content: "x" }, output: "blocked", isError: true, effect: write(cwd, "src/store.ts", "x") },
+			{ name: "edit", args: { path: "src/model.ts", edits: [] }, output: "blocked", isError: true, effect: write(cwd, "src/model.ts", "y") },
+		]);
+		expect(refused.blocked).toEqual([
+			"Baton: blocked. Only the lead may create or change src/store.ts. Reply with one short line and no tool call.",
+			expect.stringMatching(/lead model takes over/),
+		]);
+		expect(existsSync(join(cwd, "src/store.ts"))).toBe(false);
+		expect(readFileSync(join(cwd, "src/model.ts"), "utf8")).toBe("export const model = 1;\n");
+		expect(refused.continue).toBe(true);
+		expect(h.ctx.model?.id).toBe(LEAD);
+		const note: string = refused.entries[0].content;
+		expect(note).toContain("It stopped because it tried to write src/store.ts, a file you have not changed with edit/write in this session (blocked, not run): 1 turn(s), 3 tool call(s).");
+		expect(note).toContain("2. write src/store.ts → blocked, not run\n3. edit src/model.ts → blocked, not run");
+		expect(note).toContain("Files changed with edit/write: none.");
+
+		await h.turn(LEAD, [{ name: "write", args: { path: "src/store.ts", content: "x" }, output: "Wrote", effect: write(cwd, "src/store.ts", "export const store = 1;\n") }]);
+		const allowed = await h.turn(HELPER, [{ name: "edit", args: { path: "./src/../src/store.ts", edits: [] }, output: "Edited", effect: write(cwd, "src/store.ts", "export const store = 2;\n") }]);
+		expect(allowed.blocked).toEqual([]);
+		const escaped = await h.turn(HELPER, [{ name: "write", args: { path: ".pi/baton/scratch/../../../src/other.ts", content: "x" }, output: "blocked", isError: true }]);
+		expect(escaped.blocked[0]).toBe("Baton: blocked. Only the lead may create or change src/other.ts. Reply with one short line and no tool call.");
+		expect(escaped.entries[0].content).toContain("- modified src/store.ts (+1 −1)");
+
+		await h.emit("agent_end", {});
+		const summary = JSON.parse(readFileSync(join(cwd, ".pi/baton/sessions/session-1/summary.json"), "utf8"));
+		expect(summary.stats).toMatchObject({ runs: 2, blockedWrites: 2, stopReasons: { "it tried to change a file the lead has not written": 2 } });
+		expect(summary.runs.map((run: { blockedWrite?: string }) => run.blockedWrite)).toEqual(["src/store.ts", "src/other.ts"]);
+	});
+
+	it("keeps the lead's thinking level for the helper when helperThinking is inherit", async () => {
+		process.env.BATON_HELPER_THINKING = "inherit";
+		try {
+			const h = mount(project());
+			await startTask(h);
+			await h.turn(LEAD, [READ]);
+			expect(h.ctx.model?.id).toBe(HELPER);
+			expect(h.thinking.level).toBe("medium");
+			await h.turn(HELPER, []);
+			expect(h.ctx.model?.id).toBe(LEAD);
+			expect(h.thinking.level).toBe("medium");
+		} finally {
+			delete process.env.BATON_HELPER_THINKING;
+		}
 	});
 
 	it("ends the run on a helper error, an abort, a user message, or the turn cap", async () => {

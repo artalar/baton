@@ -55,6 +55,17 @@ describe("config", () => {
 		expect(warnings.join("\n")).toMatch(/outside the working directory/);
 	});
 
+	it("the helper thinks at low by default; files or BATON_HELPER_THINKING set another level or inherit, unknown levels fall back", () => {
+		expect(DEFAULT_CONFIG.helperThinking).toBe("low");
+		const { cwd, env } = dirs({ helperThinking: "minimal" }, { helperThinking: "medium" });
+		expect(loadConfig(cwd, () => {}, env).helperThinking).toBe("medium");
+		expect(loadConfig(cwd, () => {}, { ...env, BATON_HELPER_THINKING: " Inherit " }).helperThinking).toBe("inherit");
+
+		const warnings: string[] = [];
+		expect(loadConfig(cwd, (message) => warnings.push(message), { ...env, BATON_HELPER_THINKING: "deep" }).helperThinking).toBe("low");
+		expect(warnings).toEqual(['baton: helperThinking "deep" is none of inherit, off, minimal, low, medium, high, xhigh, max; using low']);
+	});
+
 	it("turns speculation off when lead and helper are the same model", () => {
 		const { cwd, env } = dirs({ helper: "anthropic/claude-opus-5.5" });
 		const warnings: string[] = [];

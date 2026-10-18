@@ -7,6 +7,8 @@ export interface BatonConfig {
 	lead: string;
 	/** Cheap model that continues the lead's work during a speculative run. */
 	helper: string;
+	/** Thinking level of the helper during a run; "inherit" keeps the lead's level. */
+	helperThinking: HelperThinking;
 	/** Speculation on or off. Off = the lead works alone. */
 	speculate: boolean;
 	/** Safety cap of helper turns per later run; the first run uses FIRST_RUN_MAX_TURNS. */
@@ -20,9 +22,16 @@ export interface BatonConfig {
 
 export const FIRST_RUN_MAX_TURNS = 5;
 
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+export type HelperThinking = ThinkingLevel | "inherit";
+
+const isHelperThinking = (value: unknown): value is HelperThinking => value === "inherit" || (THINKING_LEVELS as readonly unknown[]).includes(value);
+
 export const DEFAULT_CONFIG: BatonConfig = {
 	lead: "openrouter/anthropic/claude-opus-5.5",
 	helper: "openrouter/z-ai/glm-5.3-flash",
+	helperThinking: "low",
 	speculate: true,
 	maxHelperTurns: 10,
 	noteChars: 80_000,
@@ -116,6 +125,7 @@ export function loadConfig(cwd: string, warn: (message: string) => void = () => 
 
 	if (env.BATON_LEAD) config.lead = env.BATON_LEAD;
 	if (env.BATON_HELPER) config.helper = env.BATON_HELPER;
+	if (env.BATON_HELPER_THINKING) config.helperThinking = env.BATON_HELPER_THINKING.trim().toLowerCase() as HelperThinking;
 	const speculate = envFlag("BATON_SPEC", env);
 	if (speculate !== undefined) config.speculate = speculate;
 	const maxHelperTurns = envInteger("BATON_MAX_TURNS", 1, env, warn);
@@ -127,6 +137,10 @@ export function loadConfig(cwd: string, warn: (message: string) => void = () => 
 	if (!isCacheKeepaliveMs(config.cacheKeepaliveMs)) {
 		warn(`baton: cacheKeepaliveMs ${JSON.stringify(config.cacheKeepaliveMs)} is neither 0 (off) nor ${CACHE_KEEPALIVE_MIN_MS}–${CACHE_KEEPALIVE_MAX_MS}; using ${DEFAULT_CONFIG.cacheKeepaliveMs}`);
 		config.cacheKeepaliveMs = DEFAULT_CONFIG.cacheKeepaliveMs;
+	}
+	if (!isHelperThinking(config.helperThinking)) {
+		warn(`baton: helperThinking ${JSON.stringify(config.helperThinking)} is none of inherit, ${THINKING_LEVELS.join(", ")}; using ${DEFAULT_CONFIG.helperThinking}`);
+		config.helperThinking = DEFAULT_CONFIG.helperThinking;
 	}
 	if (!isInside(cwd, config.journalDir)) {
 		warn(`baton: journalDir ${config.journalDir} is outside the working directory; using ${DEFAULT_CONFIG.journalDir}`);

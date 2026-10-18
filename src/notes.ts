@@ -6,30 +6,48 @@ export const HARNESS = "[Baton]";
 const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const OUTPUT_TAIL_CHARS = 2_000;
 
-export const LEAD_SYSTEM_NOTE = `
+const LISTED_FILES_MAX = 30;
+
+export function leadSystemNote(scratchDir: string): string {
+	return `
 
 # Baton: speculative runs
-You are the lead model in this session. To save cost, after each of your turns that ends with tool calls, a cheaper helper model continues your work in this same session (a speculative run): it sees everything you see and makes the next tool calls of your current plan until it reaches a point that needs you.
-You never see the helper's messages. After a run you get a message starting with "${HARNESS} Speculative run #N". The harness builds it from facts only: the helper's tool calls in order, read outputs verbatim, the status and output tail of other calls, and the exact diff of the files it changed with edit/write. Those changes are already on disk.
-Decide what to do with each run as part of your next step:
-- Keep it: continue from where it stopped. Do not redo or re-read what the note already shows.
-- Fix it: edit the files yourself, as with your own work.
-- Undo it: baton_undo({run: N}) restores every file the run changed with edit/write; add paths: [...] to undo only some files. File changes made through bash are not undone.
-The helper reads your messages. To steer later runs, say it in one sentence in your reply, e.g. "Helper: do not touch the tests" or "Helper: stop after this edit".
-The work is yours: run whatever verification (tests, typecheck, build) the task needs before your final answer. The harness runs no checks for you.`;
+You are the lead model in this session and the author of the work. After each of your turns that ends with tool calls, a cheaper helper model continues in this same session (a speculative run). It sees everything you see and takes the next steps you have already decided, until a step needs you.
+The helper may read anything and run commands, but it may change only files you have changed with edit/write in this session, plus scratch files under ${scratchDir}/. Any other edit or write is blocked and ends its run. So every product file is yours: you create it and decide its design and API; after that the helper may make targeted edits to it.
+Hand the helper mechanical steps you have already decided: reads you plan, running checks and fixing what they report, edits you have spelled out, scratch tests of behavior you describe. Name such a step in one sentence of your reply, e.g. "Helper: run the typecheck and the build, fix type errors" or "Helper: write a scratch test for … and run it". Otherwise it takes only the next steps you have already announced.
+You never see the helper's messages. After a run you get a message starting with "${HARNESS} Speculative run #N", built from facts only: its tool calls in order, read outputs verbatim, the status and output tail of other calls, and the exact diff of the files it changed with edit/write. Those changes are already on disk. Review the diff as your own code before you build on it: keep what is right, fix what is not with your own edits, or undo it with baton_undo({run: N}) (add paths: [...] to undo only some files; file changes made through bash are not undone). Do not redo or re-read what the note already shows.
+The harness runs no checks for you: run the verification the task needs before your final answer.`;
+}
 
-export function helperInstruction(runNumber: number): string {
+export interface HelperScope {
+	/** Files the lead changed with edit/write, relative to cwd. */
+	leadFiles: string[];
+	scratchDir: string;
+}
+
+function listFiles(paths: string[]): string {
+	const listed = paths.slice(0, LISTED_FILES_MAX).join(", ");
+	return paths.length > LISTED_FILES_MAX ? `${listed} and ${paths.length - LISTED_FILES_MAX} more` : listed;
+}
+
+export function helperInstruction(runNumber: number, { leadFiles, scratchDir }: HelperScope): string {
+	const writable = leadFiles.length ? `only the files the lead has written (${listFiles(leadFiles)}) and files under ${scratchDir}/` : `no project file yet (the lead has written none), only files under ${scratchDir}/`;
 	return [
 		`${HARNESS} Speculative run #${runNumber}. You are now the helper model, not the lead. The "Baton" section of the system prompt describes the lead's side.`,
-		"Continue the lead's current work from exactly where it stopped: make the next tool calls the lead would make for its current plan. The lead reviews everything you do and can keep, fix or undo it.",
-		`- Follow the lead's plan, names and interfaces. Do not redesign, do not start work the lead has not planned, and follow any "Helper:" instructions in the lead's messages.`,
-		"- Never delete, skip or weaken tests, and never rewrite code you did not write in this run; make targeted edits.",
-		"- Read with read/grep/find/ls. Change files only with edit/write: the lead reviews their diff, and file changes made through bash are invisible to it. Use bash to run commands; do not pipe checks through tail/grep, the lead sees the output tail anyway. Batch independent calls in one turn.",
-		"- Running the checks the plan calls for and fixing what they report is welcome.",
-		"- Stop, with one short line and no tool call, when the planned step is done, when the next step needs a design decision, the user, or anything the lead has not decided, or when you are unsure. Stopping early is cheap; going the wrong way is expensive.",
+		`Take only steps the lead has already decided: "Helper:" requests in its messages, what its messages and reasoning say it will do next, and the obvious follow-up of its last tool calls. The lead reviews everything you do and keeps, fixes or undoes it.`,
+		`- You may read anything and run commands. You may change ${writable}; scratch tests, scripts and logs go there and nowhere else. Any other edit or write is blocked and ends your run: new files, designs and APIs are the lead's.`,
+		"- Make targeted edits that keep the lead's names and interfaces. Never delete, skip or weaken tests.",
+		"- Read with read/grep/find/ls. Change files only with edit/write: the lead reviews their diff, and file changes made through bash are invisible to it. Do not pipe checks through tail/grep: the lead sees the output tail anyway. Batch independent calls in one turn.",
+		"- Stop, with one short line and no tool call, when the decided steps are done, when the next step needs a decision, or when you are unsure. Stopping early is cheap; going the wrong way is expensive.",
 		"- Do not write a final answer for the user. The lead does not see your messages, only your tool calls and their results.",
 	].join("\n");
 }
+
+export const HANDBACK_REASON = "Baton: the lead model takes over now. Reply with one short line and no tool call.";
+
+export const blockedWriteReason = (path: string) => `Baton: blocked. Only the lead may create or change ${path}. Reply with one short line and no tool call.`;
+
+export const blockedWriteStop = (toolName: string, path: string) => `it tried to ${toolName} ${path}, a file you have not changed with edit/write in this session (blocked, not run)`;
 
 export const oneLine = (text: string, maxChars = 200) => {
 	const flattened = text.replace(/\s+/g, " ").trim();
@@ -62,10 +80,10 @@ function patchOf(change: FileChange): { patch: string; added: number; removed: n
 }
 
 function callLine(call: RunCall, index: number, outputShown: boolean): string {
-	const status = call.output === undefined ? "no result" : call.isError ? "error" : "ok";
+	const status = call.blocked ? "blocked, not run" : call.output === undefined ? "no result" : call.isError ? "error" : "ok";
 	const line = `${index + 1}. ${describeCall(call)} → ${status}`;
 	const output = call.output?.trim();
-	if (!output) return line;
+	if (!output || call.blocked) return line;
 	if (READ_TOOLS.has(call.name) && !call.isError) return outputShown ? `${line} (output below)` : line;
 	if (FILE_TOOLS.has(call.name) && !call.isError) return line;
 	return `${line}\n${tail(output, OUTPUT_TAIL_CHARS).replace(/^/gm, "   ")}`;
