@@ -1,7 +1,7 @@
 import { effect, onEvent } from '@reatom/core'
 import { h, mount } from '@reatom/jsx'
 import { App } from './ui'
-import { newGame, play, undo, type Dir } from './model'
+import { newGame, play, redo, status, undo, type Dir } from './model'
 
 const arrowDirs: Record<string, Dir> = {
   ArrowLeft: 'left',
@@ -23,13 +23,18 @@ const onKeyDown = (event: Event) => {
     undo()
     return
   }
+  if (keyEvent.code === 'KeyR') {
+    keyEvent.preventDefault()
+    redo()
+    return
+  }
   const dir = arrowDirs[keyEvent.key]
   if (!dir) return
   keyEvent.preventDefault()
   play(dir)
 }
 
-newGame()
+if (status() === 'idle') newGame()
 
 const root = document.getElementById('app')
 if (!root) throw new Error('missing #app')

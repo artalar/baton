@@ -3,9 +3,13 @@ import {
   SIZE,
   best,
   board,
+  future,
   history,
+  leaderboard,
+  leaderboardState,
   newGame,
   play,
+  redo,
   retrySubmit,
   score,
   status,
@@ -79,6 +83,30 @@ const Board = () => {
   )
 }
 
+const Leaderboard = () => {
+  const entries = () =>
+    leaderboard.data().map((entry, index) => (
+      <li>
+        #{index + 1} <strong data-leader>{String(entry.score)}</strong> (tile {String(entry.maxTile)})
+      </li>
+    ))
+  const retryButton = () =>
+    leaderboardState() === 'error' ? (
+      <button type="button" data-leaderboard-retry on:click={() => leaderboard.retry()}>
+        Reload leaderboard
+      </button>
+    ) : null
+  return (
+    <section data-leaderboard={leaderboardState} css="display: flex; flex-direction: column; gap: 4px;">
+      <h2 css="margin: 0; font-size: 20px;">
+        Top scores <small>{leaderboardState}</small>
+      </h2>
+      <ol css="margin: 0; padding-left: 0; list-style: none;">{entries}</ol>
+      {retryButton}
+    </section>
+  )
+}
+
 const directions: Array<{ dir: Dir; label: string }> = [
   { dir: 'up', label: 'Up' },
   { dir: 'left', label: 'Left' },
@@ -96,6 +124,9 @@ export const App = () => {
     <button type="button" data-undo disabled={() => history().length === 0} on:click={() => undo()}>
       Undo
     </button>,
+    <button type="button" data-redo disabled={() => future().length === 0} on:click={() => redo()}>
+      Redo
+    </button>,
     <button type="button" data-new-game on:click={() => newGame()}>
       New game
     </button>,
@@ -109,7 +140,7 @@ export const App = () => {
   return (
     <main css={shellStyle}>
       <h1 css="margin: 0; font-size: 40px;">2048</h1>
-      <p css="margin: 0;">Arrow keys move tiles. u or Undo steps back. n or New game restarts.</p>
+      <p css="margin: 0;">Arrow keys move tiles. u or Undo steps back, r or Redo steps forward. n or New game restarts.</p>
       <p css="margin: 0; display: flex; gap: 16px; align-items: baseline;">
         <span>
           Score <strong data-score={() => String(score())}>{() => String(score())}</strong>
@@ -127,6 +158,7 @@ export const App = () => {
       </p>
       <Board />
       <div css="display: flex; gap: 8px;">{controls}</div>
+      <Leaderboard />
     </main>
   )
 }

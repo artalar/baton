@@ -10,7 +10,7 @@ import { auditSession } from './audit-session.mjs'
 
 const hiddenDir = dirname(fileURLToPath(import.meta.url))
 const evalRoot = resolve(hiddenDir, '..')
-const skipTopLevel = new Set(['.pi', '.pi-agent', '.run', 'dist', 'test-results'])
+const skipTopLevel = new Set(['.git', '.pi', '.pi-agent', '.run', 'dist', 'test-results'])
 
 const args = parseArgs(process.argv.slice(2))
 if (args.help === true) {
@@ -70,7 +70,7 @@ try {
       const playwright = resolve(evalRoot, 'node_modules/.bin/playwright')
       const tested = await run(playwright, ['test', '--config', resolve(hiddenDir, 'playwright.config.ts')], {
         cwd: hiddenDir,
-        timeoutMs: 240_000,
+        timeoutMs: 360_000,
         env: {
           ...process.env,
           BASE_URL: baseUrl,

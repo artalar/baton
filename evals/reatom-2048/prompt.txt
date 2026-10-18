@@ -1,14 +1,19 @@
-Build a playable 2048 game in this directory with Reatom: the classic rules plus undo, a persisted best score, and score submission.
+Build a playable 2048 game in this directory with Reatom: the classic rules plus undo and redo, a persisted best score, a game that survives a page reload, score submission, and a leaderboard.
 
 Use the installed `@reatom/core` and `@reatom/jsx` (native DOM JSX, not React). Do not install packages and do not add `@reatom/vite`. Keep `vite.config.ts`; it uses the classic `h` / `hf` JSX pragma, so import `h` from `@reatom/jsx` wherever you use JSX. `bun run dev` must start the game and `bun run build` must succeed. Reatom skills are in `.agents/skills`. Work only in this directory.
 
 Game:
-- Classic 4x4 2048, played with the arrow keys and on-screen direction controls. After each player move that changes the board, a 2 or 4 appears in a random empty cell. A fresh game has score 0, two tiles, and status `playing`, and one starts on page load.
+- Classic 4x4 2048, played with the arrow keys and on-screen direction controls. After each player move that changes the board, a 2 or 4 appears in a random empty cell. A fresh game has score 0, two tiles, and status `playing`.
 - Reaching 2048 wins, and play continues. The status stays `won` from then on, even if no moves remain.
 - The game is lost when no move can change the board. After that, moves do nothing.
-- Undo steps back through the last 3 player moves, restoring board, score, and status. Undoing a loss counts. A new game clears the undo history.
-- The best score is the highest score ever reached in this browser. Undo, a new game, and a page reload all keep it.
-- When a player move loses the game, submit the result to the server once. Show the submission state, offer a retry when it fails, and cancel an in-flight submission on new game or undo. There is no backend here: the host serves the endpoint, so it fails locally.
+- Undo steps back through the last 3 player moves, restoring board, score, and status. Undoing a loss counts.
+- Redo steps forward again through the moves you undid, restoring board, score, and status as they were after each of them. A player move that changes the board drops whatever could be redone. If redo brings back a lost game, that counts as losing again.
+- A new game clears both undo and redo history.
+- The best score is the highest score ever reached in this browser. Undo, redo, a new game, and a page reload all keep it.
+- The current game (board, score, and status) is saved in this browser. On page load the saved game resumes; without one, a fresh game starts. Undo and redo history do not survive a reload, and a resumed game is never submitted again.
+- When a player move or a redo loses the game, submit the result to the server once. Show the submission state, offer a retry when it fails, and cancel an in-flight submission on new game or undo.
+- Show a leaderboard of the top 5 scores from the server, highest first. Load it on page load, show loading and failure states with a retry, and load it again after each submission the server accepts. When loads overlap, only the latest one counts.
+- There is no backend here: the host serves both endpoints, so they fail locally.
 
 Interface (keep exactly):
 - Reatom names, set with the `name` argument:
@@ -17,12 +22,14 @@ Interface (keep exactly):
   - `status`: atom holding `idle`, `playing`, `won`, or `lost`.
   - `move(dir)`: action. `dir` is `'left' | 'right' | 'up' | 'down'`. It slides and merges only (no spawn) and returns whether the board changed.
   - `newGame()`: action.
-- Keys: listen for `keydown` on `document` or `window`. Arrow keys move, `n` starts a new game, `u` undoes.
+- Keys: listen for `keydown` on `document` or `window`. Arrow keys move, `n` starts a new game, `u` undoes, `r` redoes.
 - DOM:
   - `[data-board]` contains 16 cells `[data-cell="r-c"]` (r and c are 0..3). Cell text is the tile value, or empty for 0.
   - `[data-score]` and `[data-best]` text is the integer and nothing else.
   - `[data-status]` attribute is the status.
   - `[data-move="left"|"right"|"up"|"down"]` controls act like the arrow keys.
-  - `[data-new-game]` acts like `n`. `[data-undo]` acts like `u` and has the `disabled` attribute when there is nothing to undo.
+  - `[data-new-game]` acts like `n`. `[data-undo]` acts like `u` and `[data-redo]` acts like `r`; each has the `disabled` attribute when there is nothing to undo or redo.
   - `[data-submit]` attribute is `idle` (nothing sent for this game, or cancelled), `pending`, `saved` (2xx), or `error` (network failure or non-2xx). `[data-retry]` exists only while it is `error`, and it resends the same request.
+  - `[data-leaderboard]` attribute is `loading` (a load is in flight), `ready` (the latest load succeeded), or `error` (network failure, non-2xx, or a body that is not the expected JSON). Inside it, one `[data-leader]` element per entry of the latest successful load, in order; its text is the score integer and nothing else. `[data-leaderboard-retry]` exists only while it is `error`, and it loads again.
 - Submission: `POST /api/scores` on the same origin with `content-type: application/json` and body `{"score": <score>, "maxTile": <largest tile>}`.
+- Leaderboard: `GET /api/scores` on the same origin responds with a JSON array of `{"score": <number>, "maxTile": <number>}` objects in no particular order.

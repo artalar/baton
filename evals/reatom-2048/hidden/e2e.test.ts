@@ -175,30 +175,23 @@ function spawnDelta(before: number[][], after: number[][]) {
   return changes
 }
 
-async function pressArrow(page: Page, key: 'ArrowLeft' | 'ArrowRight' | 'ArrowUp' | 'ArrowDown') {
-  await page.evaluate((key) => {
-    document.dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key,
-        code: key,
-        bubbles: true,
-        cancelable: true,
-      }),
-    )
-  }, key)
+/** Like a browser, targets the focused element (the body when nothing is focused), never the document itself. */
+async function pressKey(page: Page, key: string, code: string) {
+  await page.evaluate(
+    ({ key, code }) => {
+      const target = document.activeElement ?? document.body
+      target.dispatchEvent(new KeyboardEvent('keydown', { key, code, bubbles: true, cancelable: true }))
+    },
+    { key, code },
+  )
 }
 
-async function pressLetter(page: Page, letter: 'n' | 'u') {
-  await page.evaluate((letter) => {
-    document.dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: letter,
-        code: `Key${letter.toUpperCase()}`,
-        bubbles: true,
-        cancelable: true,
-      }),
-    )
-  }, letter)
+async function pressArrow(page: Page, key: 'ArrowLeft' | 'ArrowRight' | 'ArrowUp' | 'ArrowDown') {
+  await pressKey(page, key, key)
+}
+
+async function pressLetter(page: Page, letter: 'n' | 'u' | 'r') {
+  await pressKey(page, letter, `Key${letter.toUpperCase()}`)
 }
 
 type ScoreReply = { delayMs?: number; status?: number; networkError?: boolean }
@@ -227,7 +220,35 @@ async function mockScores(page: Page, replies: ScoreReply[]) {
   return bodies
 }
 
+type LeaderboardReply = { delayMs?: number; status?: number; networkError?: boolean; body?: unknown }
+
+async function mockLeaderboard(page: Page, replies: LeaderboardReply[]) {
+  const requests = { count: 0 }
+  await page.route('**/api/scores', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    const reply = replies[Math.min(requests.count, replies.length - 1)] ?? {}
+    requests.count += 1
+    if (reply.delayMs) await new Promise((done) => setTimeout(done, reply.delayMs))
+    try {
+      if (reply.networkError) await route.abort('failed')
+      else {
+        await route.fulfill({
+          status: reply.status ?? 200,
+          contentType: 'application/json',
+          body: JSON.stringify(reply.body ?? []),
+        })
+      }
+    } catch {
+      // The page aborted the request while the reply was delayed.
+    }
+  })
+  return requests
+}
+
 const submitAttr = (page: Page) => page.locator('[data-submit]')
+const leaderboardAttr = (page: Page) => page.locator('[data-leaderboard]')
+const leaders = (page: Page) => page.locator('[data-leaderboard] [data-leader]')
+const entry = (score: number, maxTile = 64) => ({ score, maxTile })
 
 test('startup deals score 0, status playing, and two tiles', async ({ page }) => {
   await open(page)
@@ -440,16 +461,7 @@ test('newGame and the new-game control reset score and deal two tiles', async ({
 test('n key starts a fresh game', async ({ page }) => {
   await open(page)
   await setGrid(page, dirtyBoard, 40)
-  await page.evaluate(() => {
-    document.dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: 'n',
-        code: 'KeyN',
-        bubbles: true,
-        cancelable: true,
-      }),
-    )
-  })
+  await pressLetter(page, 'n')
   const after = await readState(page)
   const tiles = countTiles(after.board)
   expect(after.score).toBe(0)
@@ -613,7 +625,7 @@ test('best score survives undo, reload, and new game', async ({ page }) => {
 
   await page.reload()
   await open(page)
-  expect((await readState(page)).score).toBe(0)
+  expect(await readState(page)).toEqual({ board: slideRightStart, score: 10, status: 'playing' })
   await expect(bestText).toHaveText('46')
   await page.locator('[data-new-game]').click()
   await expect(bestText).toHaveText('46')
@@ -690,4 +702,199 @@ test('new game and undo abort a pending submission', async ({ page }) => {
   await pressArrow(page, 'ArrowLeft')
   await expect(submitAttr(page)).toHaveAttribute('data-submit', 'saved')
   expect(bodies).toHaveLength(3)
+})
+
+test('redo replays undone moves through the control and the r key', async ({ page }) => {
+  await open(page)
+  const redoButton = page.locator('[data-redo]')
+  await expect(redoButton).toHaveCount(1)
+  await expect(redoButton).toBeDisabled()
+  await setGrid(page, [
+    [2, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+  ])
+  const states = [await readState(page)]
+  for (const key of ['ArrowRight', 'ArrowLeft', 'ArrowRight'] as const) {
+    await pressArrow(page, key)
+    states.push(await readState(page))
+  }
+  await pressLetter(page, 'u')
+  await pressLetter(page, 'u')
+  expect(await readState(page)).toEqual(states[1])
+  await expect(redoButton).toBeEnabled()
+
+  await redoButton.click()
+  expect(await readState(page)).toEqual(states[2])
+  await pressLetter(page, 'r')
+  expect(await readState(page)).toEqual(states[3])
+  await expect(redoButton).toBeDisabled()
+  await pressLetter(page, 'r')
+  expect(await readState(page)).toEqual(states[3])
+
+  await pressLetter(page, 'u')
+  expect(await readState(page)).toEqual(states[2])
+  await expect(page.locator('[data-best]')).toHaveText(String(Math.max(...states.map((state) => state.score))))
+})
+
+test('a board-changing move or a new game drops the redo history', async ({ page }) => {
+  await open(page)
+  const redoButton = page.locator('[data-redo]')
+  await setGrid(page, slideRightStart, 10)
+  await pressArrow(page, 'ArrowRight')
+  await pressLetter(page, 'u')
+  await expect(redoButton).toBeEnabled()
+  await pressArrow(page, 'ArrowLeft')
+  await expect(redoButton).toBeDisabled()
+  const afterMove = await readState(page)
+  await pressLetter(page, 'r')
+  expect(await readState(page)).toEqual(afterMove)
+
+  await pressLetter(page, 'u')
+  await expect(redoButton).toBeEnabled()
+  await pressLetter(page, 'n')
+  await expect(redoButton).toBeDisabled()
+  await expect(page.locator('[data-undo]')).toBeDisabled()
+  const fresh = await readState(page)
+  await pressLetter(page, 'r')
+  expect(await readState(page)).toEqual(fresh)
+})
+
+test('redo into a lost game submits the result again', async ({ page }) => {
+  const bodies = await mockScores(page, [{}])
+  await open(page)
+  await setGrid(page, nearLostBoard, 7)
+  await pressArrow(page, 'ArrowLeft')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'saved')
+  const lost = await readState(page)
+  expect(lost.status).toBe('lost')
+
+  await page.locator('[data-undo]').click()
+  expect(await readState(page)).toEqual({ board: nearLostBoard, score: 7, status: 'playing' })
+  await page.locator('[data-redo]').click()
+  expect(await readState(page)).toEqual(lost)
+  await expect.poll(() => bodies.length).toBe(2)
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'saved')
+  expect(bodies).toEqual([
+    { score: 7, maxTile: 1024 },
+    { score: 7, maxTile: 1024 },
+  ])
+})
+
+test('reload resumes the saved game without undo or redo history', async ({ page }) => {
+  await open(page)
+  await setGrid(page, slideRightStart, 10)
+  await pressArrow(page, 'ArrowRight')
+  await pressArrow(page, 'ArrowLeft')
+  const afterLeft = await readState(page)
+  await pressLetter(page, 'u')
+  const saved = await readState(page)
+  await expect(page.locator('[data-redo]')).toBeEnabled()
+
+  await page.reload()
+  await open(page)
+  expect(await readState(page)).toEqual(saved)
+  await expectDom(page)
+  await expect(page.locator('[data-best]')).toHaveText(String(afterLeft.score))
+  await expect(page.locator('[data-undo]')).toBeDisabled()
+  await expect(page.locator('[data-redo]')).toBeDisabled()
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'idle')
+})
+
+test('a lost game stays lost after reload and is not submitted again', async ({ page }) => {
+  const bodies = await mockScores(page, [{}])
+  await open(page)
+  await setGrid(page, nearLostBoard, 7)
+  await pressArrow(page, 'ArrowLeft')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'saved')
+  const lost = await readState(page)
+  expect(lost.status).toBe('lost')
+
+  await page.reload()
+  await open(page)
+  expect(await readState(page)).toEqual(lost)
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'idle')
+  await expect(page.locator('[data-undo]')).toBeDisabled()
+  await pressArrow(page, 'ArrowRight')
+  expect(await readState(page)).toEqual(lost)
+  await page.waitForTimeout(300)
+  expect(bodies).toHaveLength(1)
+
+  await pressLetter(page, 'n')
+  const fresh = await readState(page)
+  expect(fresh.score).toBe(0)
+  expect(fresh.status).toBe('playing')
+  expect(countTiles(fresh.board)).toHaveLength(2)
+})
+
+test('leaderboard loads on startup and shows the top five scores, highest first', async ({ page }) => {
+  await mockLeaderboard(page, [
+    {
+      delayMs: 600,
+      body: [entry(120, 16), entry(4000, 512), entry(64, 8), entry(2500, 256), entry(900), entry(3100, 256), entry(16, 4)],
+    },
+  ])
+  await open(page)
+  await expect(leaderboardAttr(page)).toHaveAttribute('data-leaderboard', 'loading')
+  await expect(leaderboardAttr(page)).toHaveAttribute('data-leaderboard', 'ready')
+  await expect(leaders(page)).toHaveText(['4000', '3100', '2500', '900', '120'])
+  await expect(page.locator('[data-leaderboard-retry]')).toHaveCount(0)
+})
+
+test('leaderboard failures show a retry that loads again', async ({ page }) => {
+  const requests = await mockLeaderboard(page, [
+    { status: 500 },
+    { networkError: true },
+    { body: { scores: [entry(50)] } },
+    { body: [entry(50, 8)] },
+  ])
+  await open(page)
+  const retry = page.locator('[data-leaderboard-retry]')
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await expect(leaderboardAttr(page)).toHaveAttribute('data-leaderboard', 'error')
+    await expect(retry).toHaveCount(1)
+    expect(requests.count).toBe(attempt)
+    await retry.click()
+    await expect.poll(() => requests.count).toBe(attempt + 1)
+  }
+  await expect(leaderboardAttr(page)).toHaveAttribute('data-leaderboard', 'ready')
+  await expect(retry).toHaveCount(0)
+  await expect(leaders(page)).toHaveText(['50'])
+})
+
+test('only an accepted submission reloads the leaderboard', async ({ page }) => {
+  const requests = await mockLeaderboard(page, [{ body: [entry(300, 32)] }, { body: [entry(7, 1024), entry(300, 32)] }])
+  await mockScores(page, [{ status: 500 }, { status: 200 }])
+  await open(page)
+  await expect(leaders(page)).toHaveText(['300'])
+  const loadsBefore = requests.count
+
+  await setGrid(page, nearLostBoard, 7)
+  await pressArrow(page, 'ArrowLeft')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'error')
+  await page.waitForTimeout(300)
+  expect(requests.count).toBe(loadsBefore)
+
+  await page.locator('[data-retry]').click()
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'saved')
+  await expect.poll(() => requests.count).toBe(loadsBefore + 1)
+  await expect(leaders(page)).toHaveText(['300', '7'])
+  await expect(leaderboardAttr(page)).toHaveAttribute('data-leaderboard', 'ready')
+})
+
+test('overlapping leaderboard loads keep only the latest response', async ({ page }) => {
+  const requests = await mockLeaderboard(page, [{ delayMs: 1500, body: [entry(111)] }, { body: [entry(222)] }])
+  await mockScores(page, [{}])
+  await open(page)
+  await expect(leaderboardAttr(page)).toHaveAttribute('data-leaderboard', 'loading')
+
+  await setGrid(page, nearLostBoard, 7)
+  await pressArrow(page, 'ArrowLeft')
+  await expect(submitAttr(page)).toHaveAttribute('data-submit', 'saved')
+  await expect.poll(() => requests.count).toBeGreaterThanOrEqual(2)
+  await expect(leaders(page)).toHaveText(['222'])
+  await page.waitForTimeout(1800)
+  await expect(leaders(page)).toHaveText(['222'])
+  await expect(leaderboardAttr(page)).toHaveAttribute('data-leaderboard', 'ready')
 })

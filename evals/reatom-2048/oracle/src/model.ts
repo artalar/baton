@@ -2,9 +2,11 @@ import {
   abortVar,
   action,
   atom,
+  computed,
   isAbort,
   reatomEnum,
   withAbort,
+  withAsyncData,
   withLocalStorage,
   wrap,
 } from '@reatom/core'
@@ -13,6 +15,7 @@ export const SIZE = 4
 const WIN_TILE = 2048
 const SPAWN_TWO_PROBABILITY = 0.9
 const UNDO_LIMIT = 3
+const LEADERBOARD_SIZE = 5
 
 export type Dir = 'left' | 'right' | 'up' | 'down'
 type Status = 'idle' | 'playing' | 'won' | 'lost'
@@ -22,13 +25,35 @@ type ScorePayload = { score: number; maxTile: number }
 const emptyGrid = (): number[][] =>
   Array.from({ length: SIZE }, () => Array<number>(SIZE).fill(0))
 
-export const board = atom(emptyGrid(), 'game.board')
-export const score = atom(0, 'game.score')
-export const status = reatomEnum(['idle', 'playing', 'won', 'lost'], 'game.status')
+export const board = atom(emptyGrid(), 'game.board').extend(withLocalStorage('reatom-2048.board'))
+export const score = atom(0, 'game.score').extend(withLocalStorage('reatom-2048.score'))
+export const status = reatomEnum(['idle', 'playing', 'won', 'lost'], 'game.status').extend(
+  withLocalStorage('reatom-2048.status'),
+)
 export const best = atom(0, 'game.best').extend(withLocalStorage('reatom-2048.best'))
 export const history = atom<Snapshot[]>([], 'game.history')
+export const future = atom<Snapshot[]>([], 'game.future')
 export const submission = reatomEnum(['idle', 'pending', 'saved', 'error'], 'game.submission')
 const lastPayload = atom<ScorePayload | null>(null, 'game.lastPayload')
+
+const isScorePayload = (value: unknown): value is ScorePayload =>
+  typeof value === 'object' &&
+  value !== null &&
+  typeof (value as ScorePayload).score === 'number' &&
+  typeof (value as ScorePayload).maxTile === 'number'
+
+export const leaderboard = computed(async () => {
+  const response = await wrap(fetch('/api/scores', { signal: abortVar.require().signal }))
+  if (!response.ok) throw new Error(`leaderboard failed: ${response.status}`)
+  const body: unknown = await wrap(response.json())
+  if (!Array.isArray(body) || !body.every(isScorePayload)) throw new Error('leaderboard: unexpected body')
+  return [...body].sort((left, right) => right.score - left.score).slice(0, LEADERBOARD_SIZE)
+}, 'game.leaderboard').extend(withAsyncData({ initState: [] as ScorePayload[] }))
+
+export const leaderboardState = computed(() => {
+  if (!leaderboard.ready()) return 'loading'
+  return leaderboard.error() ? 'error' : 'ready'
+}, 'game.leaderboardState')
 
 const cloneGrid = (grid: number[][]): number[][] => grid.map((row) => row.slice())
 
@@ -171,6 +196,7 @@ export const submitScore = action(async (payload: ScorePayload) => {
     )
     if (!response.ok) throw new Error(`score submit failed: ${response.status}`)
     submission.setSaved()
+    leaderboard.retry()
   } catch (error) {
     if (isAbort(error)) return
     submission.setError()
@@ -188,14 +214,27 @@ const resetSubmission = () => {
   submission.setIdle()
 }
 
+const snapshot = (): Snapshot => ({ board: board(), score: score(), status: status() })
+
+const restore = (target: Snapshot) => {
+  board.set(cloneGrid(target.board))
+  score.set(target.score)
+  status.set(target.status)
+}
+
+const submitIfLost = () => {
+  if (status() === 'lost') submitScore({ score: score(), maxTile: maxTile(board()) })
+}
+
 export const play = action((dir: Dir): boolean => {
-  const before: Snapshot = { board: board(), score: score(), status: status() }
+  const before = snapshot()
   const changed = move(dir)
   if (!changed) return false
   spawnRandom()
   history.set((stack) => [...stack, before].slice(-UNDO_LIMIT))
+  future.set([])
   best.set((current) => Math.max(current, score()))
-  if (status() === 'lost') submitScore({ score: score(), maxTile: maxTile(board()) })
+  submitIfLost()
   return true
 }, 'game.play')
 
@@ -204,16 +243,27 @@ export const undo = action((): boolean => {
   const previous = stack.at(-1)
   if (!previous) return false
   history.set(stack.slice(0, -1))
-  board.set(cloneGrid(previous.board))
-  score.set(previous.score)
-  status.set(previous.status)
+  future.set((redoStack) => [...redoStack, snapshot()])
+  restore(previous)
   resetSubmission()
   return true
 }, 'game.undo')
 
+export const redo = action((): boolean => {
+  const redoStack = future()
+  const next = redoStack.at(-1)
+  if (!next) return false
+  future.set(redoStack.slice(0, -1))
+  history.set((stack) => [...stack, snapshot()].slice(-UNDO_LIMIT))
+  restore(next)
+  submitIfLost()
+  return true
+}, 'game.redo')
+
 export const newGame = action(() => {
   resetSubmission()
   history.set([])
+  future.set([])
   board.set(emptyGrid())
   score.set(0)
   status.setPlaying()
