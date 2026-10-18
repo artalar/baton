@@ -35,11 +35,14 @@ interface SessionStats {
 type MessageBlock = { type: string; id?: string; name?: string; arguments?: Record<string, unknown>; text?: string };
 
 const MAX_OUTPUT_CHARS = 200_000;
+const OUTPUT_CUT_MARKER = "\n[output cut]";
 
 const textOf = (content: unknown) =>
 	((Array.isArray(content) ? content : []) as MessageBlock[])
 		.flatMap((block) => (block.type === "text" && block.text ? [block.text] : []))
 		.join("\n");
+
+const outputWithinLimit = (text: string) => (text.length > MAX_OUTPUT_CHARS ? `${text.slice(0, MAX_OUTPUT_CHARS)}${OUTPUT_CUT_MARKER}` : text);
 
 const emptyStats = (): SessionStats => ({ runs: 0, helperTurns: 0, helperCalls: 0, cacheKeepalives: 0, stopReasons: {} });
 
@@ -234,7 +237,7 @@ export default function baton(pi: ExtensionAPI) {
 					name: block.name ?? "",
 					args: block.arguments ?? {},
 					isError: result?.isError,
-					output: result ? textOf(result.content).slice(0, MAX_OUTPUT_CHARS) : undefined,
+					output: result ? outputWithinLimit(textOf(result.content)) : undefined,
 				};
 			});
 

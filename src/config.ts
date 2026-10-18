@@ -69,11 +69,15 @@ export function parseModelRef(ref: string): { provider: string; id: string } | u
 	return { provider: ref.slice(0, slash), id: ref.slice(slash + 1) };
 }
 
-/** The same model across a provider prefix (`openrouter/anthropic/x` and `anthropic/x`). */
+/** Same model, or one name with a single leading `provider/` segment (`anthropic/claude-haiku` and `claude-haiku`, `openrouter/anthropic/x` and `anthropic/x`). */
 export function isSameModel(model: string | undefined, ref: string | undefined): boolean {
 	if (!model || !ref) return false;
-	const withoutRouter = (value: string) => (value.startsWith("openrouter/") ? value.slice("openrouter/".length) : value);
-	return withoutRouter(model) === withoutRouter(ref);
+	if (model === ref) return true;
+	const idAfterProvider = (value: string) => {
+		const slash = value.indexOf("/");
+		return slash > 0 ? value.slice(slash + 1) : undefined;
+	};
+	return idAfterProvider(model) === ref || idAfterProvider(ref) === model;
 }
 
 export function isInside(cwd: string, path: string): boolean {

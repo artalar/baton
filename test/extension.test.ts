@@ -180,6 +180,20 @@ describe("speculative runs in a pi session", () => {
 		expect(await systemSection(h)).toBe(leadSystemNote());
 	});
 
+	it("marks follower output that the alert had to cut", async () => {
+		const h = mount(project());
+		await startTask(h);
+		await h.turn(LEAD, [READ]);
+		const output = "y".repeat(200_000 + 1);
+		await h.turn(HELPER, [{ name: "bash", args: { command: "cat big" }, output }]);
+		const back = await h.turn(HELPER, []);
+		const alert = back.entries[0].content as string;
+		const recorded = alert.slice(alert.indexOf("output: ") + "output: ".length);
+		expect(recorded.startsWith("y".repeat(200_000))).toBe(true);
+		expect(recorded.endsWith("\n[output cut]")).toBe(true);
+		expect(recorded.includes("y".repeat(200_001))).toBe(false);
+	});
+
 	it("keeps a user message from the follower run in the lead view, beside the alert", async () => {
 		const h = mount(project());
 		await startTask(h);

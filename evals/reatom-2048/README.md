@@ -87,7 +87,7 @@ bun evals/reatom-2048/hidden/grade.mjs --cwd evals/reatom-2048/oracle
 bun evals/reatom-2048/compare.mjs tmp/2048-a tmp/2048-b
 ```
 
-`compare.mjs` grades each workspace (cached in `.run/grade.json`; `--regrade` grades again, `--no-grade` only reads the cache) and prints one row per run: hidden tests, audit, cost (including Baton's cache keepalives, which pi's own cost leaves out), wall time, requests and tool calls of the lead and the helper, Baton runs, blocked writes and undos, the lead's share of the product code, and leftover files. Below the table it lists each run's stop reason, the stop reasons of its Baton runs, and failed test titles. `--json` prints the same data as JSON.
+`compare.mjs` grades each workspace (cached in `.run/grade.json`; `--regrade` grades again, `--no-grade` only reads the cache) and prints one row per run: hidden tests, audit, cost (including Baton's cache keepalives, which pi's own cost leaves out), wall time, requests and tool calls of the lead and the helper, Baton runs (blocked-write and undo counts come from older journals), the lead's share of the product code, and leftover files. Below the table it lists each run's stop reason, the stop reasons of its Baton runs, and failed test titles. `--json` prints the same data as JSON.
 
 The lead's share counts non-blank lines in `src/` at the end of the run. The script replays every successful `edit` and `write` from the session log over the starter files, keeping an author per line, then aligns the result with the files on disk: lines changed through `bash` count as unknown. A leftover is a file outside `src/` that the starter does not have, such as a smoke-test script left in the workspace root. Paths under `.pi/` are not product files, so they are not counted.
 

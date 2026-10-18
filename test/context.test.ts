@@ -93,6 +93,26 @@ describe("context views", () => {
 		expect(JSON.stringify(secondRun)).not.toContain("THIRD FOLLOWER THINKING");
 	});
 
+	it("treats a non-openrouter helper id as the follower, so the lead sees the alert instead of that tool call", () => {
+		const helper = "anthropic/claude-haiku-4-5";
+		const messages: ContextMessage[] = [
+			{
+				role: "assistant",
+				model: "claude-haiku-4-5",
+				content: [
+					{ type: "thinking", thinking: "FOLLOWER THINKING" },
+					{ type: "toolCall", id: "h1" },
+				],
+			},
+			{ role: "toolResult", toolCallId: "h1", content: [{ type: "text", text: "HELPER RESULT" }] },
+			alert("ALERT", 2),
+		];
+		const view = viewFor(messages, helper, "lead");
+		expect(view.map((message) => message.role)).toEqual(["custom"]);
+		expect(JSON.stringify(view)).toContain("ALERT");
+		expect(JSON.stringify(view)).not.toMatch(/FOLLOWER THINKING|HELPER RESULT|"h1"/);
+	});
+
 	it("keeps messages from other models, e.g. before Baton was enabled", () => {
 		const view = viewFor([{ role: "assistant", model: "anthropic/claude-sonnet-5", content: [], timestamp: 1 }], HELPER, "lead");
 		expect(view).toHaveLength(1);

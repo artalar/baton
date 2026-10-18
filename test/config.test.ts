@@ -77,5 +77,8 @@ describe("config", () => {
 		expect(envFlag("X", { X: "Yes" })).toBe(true);
 		expect(envFlag("X", { X: "maybe" })).toBeUndefined();
 		expect(isSameModel("anthropic/claude-opus-5.5", "openrouter/anthropic/claude-opus-5.5")).toBe(true);
+		expect(isSameModel("claude-haiku-4-5", "anthropic/claude-haiku-4-5")).toBe(true);
+		expect(isSameModel("anthropic/claude-haiku-4-5", "claude-haiku-4-5")).toBe(true);
+		expect(isSameModel("claude-opus-5.5", "openrouter/anthropic/claude-opus-5.5")).toBe(false);
 	});
 });
